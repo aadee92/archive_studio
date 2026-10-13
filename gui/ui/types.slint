@@ -1,0 +1,31 @@
+// Data shapes exchanged with the Rust side.
+
+export enum DeviceState { idle, previewing, acquiring, error }
+
+// One connected capture device (FF-680 scanner, VHS capture card, 8mm reel digitizer, ...).
+export struct DeviceTile {
+    id: string,
+    name: string,
+    kind-label: string,
+    is-video: bool,
+    state: DeviceState,
+    detail: string,
+    preview: image,
+    has-preview: bool,
+    captured: int,
+}
+
+export enum MediaKind { image, video, audio }
+
+export struct MediaTile {
+    index: int,        // stable entry id in the Rust-side index
+    name: string,
+    kind: MediaKind,
+    detail: string,
+    thumb: image,
+    thumb-ready: bool,
+    selected: bool,
+}
+
+// The review grid is a ListView of rows; each row carries `columns` tiles.
+export struct MediaRow { tiles: [MediaTile] }

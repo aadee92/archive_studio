@@ -1,0 +1,218 @@
+import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { MediaRow, MediaTile, MediaKind } from "types.slint";
+
+export global ReviewBridge {
+    // Virtual model: rows are produced on demand by Rust, only for what is on screen.
+    in property <[MediaRow]> rows;
+    in property <string> root-path;
+    in property <string> status-text;
+    in property <bool> indexing;
+    in property <bool> empty;
+    in-out property <length> tile-size: 160px;
+
+    callback columns-changed(int);
+    // query, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
+    callback filter-changed(string, int, int);
+    callback select(int);
+    callback open(int);
+}
+
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+
+    height: 28px;
+    width: label.preferred-width + 24px;
+    border-radius: self.height / 2;
+    border-width: 1px;
+    border-color: active ? Theme.accent-soft : Theme.border;
+    background: active ? Theme.accent-soft : ta.has-hover ? Theme.hover : Theme.surface;
+
+    label := Text {
+        text: root.text;
+        font-size: 12px;
+        color: root.active ? Theme.accent : Theme.text;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component MediaCell inherits Rectangle {
+    in property <MediaTile> tile;
+    in property <length> size;
+
+    width: size;
+
+    thumb := Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        clip: true;
+        background: Theme.well;
+
+        if root.tile.thumb-ready: Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.tile.thumb;
+            image-fit: cover;
+        }
+        if !root.tile.thumb-ready: Image {
+            width: 28px;
+            height: 28px;
+            colorize: Theme.placeholder;
+            source: root.tile.kind == MediaKind.video ? @image-url("icons/video.svg")
+                : root.tile.kind == MediaKind.audio ? @image-url("icons/audio.svg")
+                : @image-url("icons/image.svg");
+        }
+        if root.tile.kind == MediaKind.video && root.tile.thumb-ready: Rectangle {
+            x: 6px;
+            y: parent.height - self.height - 6px;
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            background: #000000a0;
+            Image { source: @image-url("icons/video.svg"); width: 14px; height: 14px; colorize: white; }
+        }
+    }
+
+    // Selection ring drawn on top of the thumbnail.
+    Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        border-width: root.tile.selected ? 2px : ta.has-hover ? 1px : 0px;
+        border-color: root.tile.selected ? Theme.accent : Theme.border;
+    }
+
+    Text {
+        x: 2px;
+        y: root.size + 6px;
+        width: root.size - 4px;
+        text: root.tile.name;
+        font-size: 12px;
+        color: Theme.text;
+        overflow: elide;
+    }
+    Text {
+        x: 2px;
+        y: root.size + 22px;
+        width: root.size - 4px;
+        text: root.tile.detail;
+        font-size: 11px;
+        color: Theme.text-muted;
+        overflow: elide;
+    }
+
+    ta := TouchArea {
+        clicked => { ReviewBridge.select(root.tile.index); }
+        double-clicked => { ReviewBridge.open(root.tile.index); }
+    }
+}
+
+export component ReviewPage inherits Rectangle {
+    property <int> kind-filter: 0;
+    property <length> gap: 14px;
+    property <length> row-height: ReviewBridge.tile-size + 44px;
+    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (ReviewBridge.tile-size + root.gap)));
+
+    changed columns => { ReviewBridge.columns-changed(self.columns); }
+    init => { ReviewBridge.columns-changed(self.columns); }
+
+    function apply() {
+        ReviewBridge.filter-changed(search.text, root.kind-filter, sort.current-index);
+    }
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        padding: 20px;
+        padding-bottom: 0px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Text { text: "Review"; font-size: 20px; font-weight: 600; color: Theme.text; }
+                Text { text: ReviewBridge.root-path; color: Theme.text-muted; overflow: elide; }
+            }
+            VerticalLayout {
+                alignment: center;
+                search := LineEdit {
+                    width: 280px;
+                    placeholder-text: "Search by name…";
+                    edited => { root.apply(); }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            Chip { text: "All";    active: root.kind-filter == 0; clicked => { root.kind-filter = 0; root.apply(); } }
+            Chip { text: "Images"; active: root.kind-filter == 1; clicked => { root.kind-filter = 1; root.apply(); } }
+            Chip { text: "Video";  active: root.kind-filter == 2; clicked => { root.kind-filter = 2; root.apply(); } }
+            Chip { text: "Audio";  active: root.kind-filter == 3; clicked => { root.kind-filter = 3; root.apply(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: "Sort"; color: Theme.text-muted; vertical-alignment: center; }
+            sort := ComboBox {
+                width: 150px;
+                model: ["Name", "Date modified", "Size", "Type"];
+                selected => { root.apply(); }
+            }
+            Rectangle { width: 12px; }
+            Text { text: "Size"; color: Theme.text-muted; vertical-alignment: center; }
+            Slider {
+                width: 120px;
+                minimum: 96;
+                maximum: 320;
+                value: 160;
+                changed(v) => { ReviewBridge.tile-size = v * 1px; }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+
+            // ListView only instantiates delegates for rows in the viewport, so the
+            // cost of scrolling is O(visible tiles), independent of library size.
+            list := ListView {
+                for row in ReviewBridge.rows: Rectangle {
+                    height: root.row-height;
+                    HorizontalLayout {
+                        padding-left: root.gap;
+                        padding-top: root.gap;
+                        spacing: root.gap;
+                        alignment: start;
+                        for t in row.tiles: MediaCell { tile: t; size: ReviewBridge.tile-size; }
+                    }
+                }
+            }
+
+            if ReviewBridge.empty: Text {
+                text: ReviewBridge.indexing ? "Indexing…" : "No matching media";
+                color: Theme.text-muted;
+            }
+        }
+
+        HorizontalLayout {
+            height: 34px;
+            Text {
+                vertical-alignment: center;
+                text: ReviewBridge.status-text;
+                color: Theme.text-muted;
+                font-size: 12px;
+            }
+        }
+    }
+}

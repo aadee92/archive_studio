@@ -1,0 +1,82 @@
+import { Theme } from "theme.slint";
+
+component NavButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> active;
+    callback clicked;
+
+    height: 58px;
+
+    Rectangle {
+        x: 8px;
+        width: parent.width - 16px;
+        border-radius: Theme.radius;
+        background: root.active ? Theme.accent-soft : ta.has-hover ? Theme.hover : transparent;
+        animate background { duration: 120ms; }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 4px;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: 22px;
+                height: 22px;
+                colorize: root.active ? Theme.accent : Theme.text-muted;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 11px;
+            horizontal-alignment: center;
+            color: root.active ? Theme.accent : Theme.text-muted;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in property <int> active;
+    callback navigate(int);
+
+    width: 76px;
+    background: Theme.sidebar;
+
+    VerticalLayout {
+        padding-top: 14px;
+        spacing: 6px;
+        alignment: start;
+
+        HorizontalLayout {
+            alignment: center;
+            padding-bottom: 10px;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 8px;
+                background: Theme.text;
+                Text { text: "AS"; color: Theme.surface; font-weight: 700; font-size: 12px; }
+            }
+        }
+
+        NavButton {
+            icon: @image-url("icons/acquire.svg");
+            label: "Acquire";
+            active: root.active == 0;
+            clicked => { root.navigate(0); }
+        }
+        NavButton {
+            icon: @image-url("icons/review.svg");
+            label: "Review";
+            active: root.active == 1;
+            clicked => { root.navigate(1); }
+        }
+    }
+}

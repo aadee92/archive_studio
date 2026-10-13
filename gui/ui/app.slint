@@ -1,0 +1,36 @@
+import { Theme } from "theme.slint";
+import { Sidebar } from "sidebar.slint";
+import { AcquirePage, AcquireBridge } from "acquire.slint";
+import { ReviewPage, ReviewBridge } from "review.slint";
+
+// Re-export the bridges and data types so the Rust side can reach them.
+export { AcquireBridge, ReviewBridge }
+export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
+
+export component AppWindow inherits Window {
+    in-out property <int> page: 0;
+
+    title: "Archive Studio";
+    preferred-width: 1280px;
+    preferred-height: 820px;
+    min-width: 820px;
+    min-height: 540px;
+    background: Theme.bg;
+    default-font-size: Theme.font-size;
+
+    HorizontalLayout {
+        Sidebar {
+            active: root.page;
+            navigate(i) => { root.page = i; }
+        }
+        Rectangle { width: 1px; background: Theme.border; }
+
+        // Both pages stay alive so device previews keep running and the review
+        // scroll position survives switching tabs.
+        Rectangle {
+            horizontal-stretch: 1;
+            AcquirePage { visible: root.page == 0; }
+            ReviewPage { visible: root.page == 1; }
+        }
+    }
+}
