@@ -1,9 +1,6 @@
 //! Standalone driver for the Epson GT-X980 / Perfection V850: waits for the scanner's
 //! front button and saves a full-bed colour scan as PNG each time it is pressed.
 
-mod escil;
-mod usb;
-
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,10 +8,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use escil::{Identity, ScanParams, Scanner};
-use usb::{Result, Usb};
+use x980::{Identity, Result, ScanParams, Scanner};
 
-const BUTTON_POLL: Duration = Duration::from_millis(250);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "\
@@ -84,7 +79,7 @@ fn main() -> ExitCode {
 }
 
 fn run(opts: &Opts) -> Result<()> {
-    let mut scanner = Scanner::new(connect()?);
+    let mut scanner = x980::connect()?;
     scanner.reset()?;
     let id = scanner.identity()?;
     eprintln!(
@@ -109,18 +104,11 @@ fn run(opts: &Opts) -> Result<()> {
     // Read once to clear a press latched before we started.
     scanner.button()?;
     loop {
-        // Parameters must go in before the wait. After a press the scanner expects FS G
-        // directly; resetting and configuring at that point makes FS G report a fatal error.
+        // Parameters must go in before the wait (see `x980::wait_for_button`).
         scanner.configure(&params)?;
         eprintln!("ready: press the scan button");
-        loop {
-            let button = scanner.button()?;
-            if button != 0 {
-                eprintln!("button pressed (value {button})");
-                break;
-            }
-            thread::sleep(BUTTON_POLL);
-        }
+        let button = x980::wait_for_button(&mut scanner)?;
+        eprintln!("button pressed (value {button})");
         scan_to_file(&mut scanner, &params, opts)?;
         // Ignore presses made while the scan was running.
         scanner.button()?;
@@ -137,20 +125,6 @@ fn scan_params(id: &Identity, opts: &Opts) -> Result<ScanParams> {
         return Err("scan area is empty".into());
     }
     Ok(ScanParams { dpi: opts.dpi, left: 0, top: 0, width, height })
-}
-
-fn connect() -> Result<Usb> {
-    let mut announced = false;
-    loop {
-        if let Some(usb) = Usb::open()? {
-            return Ok(usb);
-        }
-        if !announced {
-            eprintln!("waiting for scanner {:04x}:{:04x}", usb::VENDOR_ID, usb::PRODUCT_ID);
-            announced = true;
-        }
-        thread::sleep(RECONNECT_DELAY);
-    }
 }
 
 /// Runs the scan already set up with `Scanner::configure` and writes it out as PNG.

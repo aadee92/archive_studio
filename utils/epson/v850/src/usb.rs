@@ -39,12 +39,30 @@ impl Usb {
         };
         let device = info.open().wait()?;
         let interface = device.detach_and_claim_interface(INTERFACE).wait()?;
-        Ok(Some(Self {
+        let mut usb = Self {
             out: interface.endpoint::<Bulk, Out>(EP_OUT)?,
             inp: interface.endpoint::<Bulk, In>(EP_IN)?,
             pending: Vec::new(),
             trace: std::env::var_os("X980_TRACE").is_some(),
-        }))
+        };
+        usb.drain();
+        Ok(Some(usb))
+    }
+
+    /// Throws away whatever the scanner still has queued. A process killed between a
+    /// command and its reply leaves that reply behind, which would otherwise shift every
+    /// later reply by its length.
+    fn drain(&mut self) {
+        let packet = self.inp.max_packet_size();
+        loop {
+            let c = self.inp.transfer_blocking(Buffer::new(packet), Duration::from_millis(200));
+            if c.status.is_err() {
+                break;
+            }
+            if self.trace {
+                eprintln!("RX (stale) {}", hex(&c.buffer[..c.actual_len]));
+            }
+        }
     }
 
     pub fn write(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
