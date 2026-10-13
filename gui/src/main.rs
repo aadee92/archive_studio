@@ -24,5 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _acquire = acquire::install(&ui, &root);
     review::install(&ui, root);
     ui.run()?;
+    review::shutdown();
     Ok(())
 }

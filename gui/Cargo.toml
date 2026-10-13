@@ -8,7 +8,19 @@ name = "archive-studio"
 path = "src/main.rs"
 
 [dependencies]
+fast_image_resize = { version = "6.1.0", features = ["image"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp", "bmp"] }
+jpeg-decoder = { version = "0.3.2", default-features = false }
+libc = "0.2"
+nusb = "0.2.7"
+png = "0.18.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 slint = "1.8"
+tiff = "0.11.3"
+x980 = { version = "0.1.0", path = "../utils/epson/v850" }
 
 [build-dependencies]
 slint-build = "1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"

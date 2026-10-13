@@ -12,6 +12,8 @@ export global ReviewBridge {
     in-out property <length> tile-size: 160px;
 
     callback columns-changed(int);
+    // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
+    callback viewport-changed(int, int);
     // query, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
     callback filter-changed(string, int, int);
     callback select(int);
@@ -53,7 +55,8 @@ component MediaCell inherits Rectangle {
         height: root.size;
         border-radius: 6px;
         clip: true;
-        background: Theme.well;
+        // Until the thumbnail arrives: its average color (softened), else the neutral well.
+        background: root.tile.color.alpha > 0 ? root.tile.color.mix(Theme.well, 0.5) : Theme.well;
 
         if root.tile.thumb-ready: Image {
             width: parent.width;
@@ -61,7 +64,7 @@ component MediaCell inherits Rectangle {
             source: root.tile.thumb;
             image-fit: cover;
         }
-        if !root.tile.thumb-ready: Image {
+        if !root.tile.thumb-ready && root.tile.color.alpha == 0: Image {
             width: 28px;
             height: 28px;
             colorize: Theme.placeholder;
@@ -121,8 +124,20 @@ export component ReviewPage inherits Rectangle {
     property <length> row-height: ReviewBridge.tile-size + 44px;
     property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (ReviewBridge.tile-size + root.gap)));
 
+    // Tile size also picks the thumbnail resolution tier on the Rust side.
+    property <length> tile-size: ReviewBridge.tile-size;
     changed columns => { ReviewBridge.columns-changed(self.columns); }
-    init => { ReviewBridge.columns-changed(self.columns); }
+    changed tile-size => { ReviewBridge.columns-changed(self.columns); }
+    init => {
+        ReviewBridge.columns-changed(self.columns);
+        ReviewBridge.viewport-changed(self.first-row, self.last-row);
+    }
+
+    // Visible row range, as ints so scrolling within a row costs nothing on the Rust side.
+    property <int> first-row: Math.max(0, Math.floor(-list.content-y / root.row-height));
+    property <int> last-row: Math.max(0, Math.floor((-list.content-y + list.visible-height - 1px) / root.row-height));
+    changed first-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
+    changed last-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
 
     function apply() {
         ReviewBridge.filter-changed(search.text, root.kind-filter, sort.current-index);

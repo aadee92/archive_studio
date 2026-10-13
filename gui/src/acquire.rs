@@ -15,10 +15,14 @@ use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer
 
 use crate::{AcquireBridge, AppWindow, DeviceState, DeviceTile};
 
+mod v850;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
     /// Epson FastFoto FF-680W and similar sheet-fed photo scanners.
     PhotoScanner,
+    /// Flatbed scanner, e.g. Epson Perfection V850.
+    Flatbed,
     /// Composite / S-Video USB capture card fed by a VCR.
     VhsCapture,
     /// Kodak Reels 8mm / Super 8 film digitizer.
@@ -31,6 +35,7 @@ impl DeviceKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::PhotoScanner => "Photo scanner",
+            Self::Flatbed => "Flatbed scanner",
             Self::VhsCapture => "VHS capture",
             Self::FilmReel => "8mm film reel",
             Self::Camcorder => "Hi8 camcorder",
@@ -38,7 +43,7 @@ impl DeviceKind {
     }
 
     pub fn is_video(self) -> bool {
-        self != Self::PhotoScanner
+        !matches!(self, Self::PhotoScanner | Self::Flatbed)
     }
 }
 
@@ -49,7 +54,10 @@ pub enum DeviceEvent {
     Preview(Frame),
     /// Free-form status line, e.g. "600 dpi · feeder loaded" or "00:12:31".
     Status(String),
+    /// Acquisition began on the device itself, e.g. from the scanner's own button.
+    Started,
     Captured(u32),
+    /// Back to idle; also clears an earlier error once the device recovers.
     Finished,
     Error(String),
 }
@@ -59,6 +67,10 @@ pub type EventSink = Arc<dyn Fn(DeviceEvent) + Send + Sync>;
 
 /// Implemented by each device backend. Methods are called on the UI thread and
 /// must not block. Dropping a device must stop its threads and release the hardware.
+///
+/// After writing each still capture to disk, call
+/// [`thumbs::store_for_new_file`](crate::thumbs::store_for_new_file) with the in-memory
+/// image (from the backend's thread), so the review grid never decodes the full scan.
 pub trait CaptureDevice {
     fn name(&self) -> &str;
     fn kind(&self) -> DeviceKind;
@@ -71,15 +83,27 @@ pub trait CaptureDevice {
 
 /// Probes every backend for connected hardware.
 ///
+/// Implemented: Epson Perfection V850 (`v850.rs`, via `utils/epson/v850`); its scans go to
+/// `<out_dir>/epson-v850/`.
+///
 /// Backends to implement:
 /// - FF-680W: SANE `epsonds` (or Epson's SDK), matched by USB VID/PID.
 /// - VHS / Hi8 analog: V4L2 capture cards (`/dev/video*`) + ALSA audio, encoded via ffmpeg/GStreamer.
 /// - Hi8 / Digital8 over FireWire: `dvgrab`.
 /// - Kodak Reels: enumerates as a UVC camera, so V4L2 again.
 ///
+/// Every backend that saves stills must seed thumbnails via `thumbs::store_for_new_file`.
+/// Scanner stills saved as TIFF should be written with `thumbs::write_tiff_with_reduced_page`
+/// (full scan + a ≤1024 px NewSubfileType=1 page), so a cold thumbnail cache reads only the
+/// small page (~2 ms instead of ~80–220 ms for a 600 dpi scan). Compressed or multi-page
+/// output would need the same reduced page added via the `tiff` encoder.
+///
 /// `ARCHIVE_STUDIO_MOCK=ff680,ff680,vhs,reel,hi8` adds simulated devices.
-pub fn discover() -> Vec<Box<dyn CaptureDevice>> {
+pub fn discover(out_dir: &Path) -> Vec<Box<dyn CaptureDevice>> {
     let mut found: Vec<Box<dyn CaptureDevice>> = Vec::new();
+    if v850::present() {
+        found.push(Box::new(v850::V850::new(out_dir.join("epson-v850"))));
+    }
     if let Ok(spec) = std::env::var("ARCHIVE_STUDIO_MOCK") {
         found.extend(mock::from_spec(&spec));
     }
@@ -125,7 +149,7 @@ impl Acquire {
     fn rescan(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut devices = self.devices.borrow_mut();
-        *devices = discover();
+        *devices = discover(&self.out_dir);
 
         let tiles: Vec<DeviceTile> = devices
             .iter()
@@ -216,6 +240,7 @@ fn apply(ui: &AppWindow, row: usize, event: DeviceEvent) {
             tile.captured = n as i32;
             tile.detail = format!("{n} captured").into();
         }
+        DeviceEvent::Started => tile.state = DeviceState::Acquiring,
         DeviceEvent::Finished => tile.state = DeviceState::Previewing,
         DeviceEvent::Error(text) => {
             tile.state = DeviceState::Error;
