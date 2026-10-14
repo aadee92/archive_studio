@@ -25,12 +25,12 @@ install -Dm644 ui/icons/app.svg ~/.local/share/icons/hicolor/scalable/apps/archi
 | `ui/app.slint` | Window: sidebar + page host (pages stay alive when hidden) |
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
 | `ui/review.slint` | Search, kind chips, sort, virtualized thumbnail grid, size slider in the bottom bar |
-| `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops |
+| `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops: click / Shift / Ctrl / drag to select, name box (with matching names) and Ignore above the list. A person's suggested faces come first, highlighted |
 | `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review or a face in People. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes |
 | `ui/pipeline.slint` | `PipelineStatus`: the pipeline's status line with Pause / Resume (in Review's bottom bar) |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
 | `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
-| `src/people.rs` | Reads people and faces from the catalog on a worker; decodes crops for the rows on screen |
+| `src/people.rs` | Reads people and faces from the catalog on a worker; decodes crops for the rows on screen. Named / ignored faces are masked in place (no reflow until the grid is reloaded) while a writer thread saves them and refreshes the suggestions |
 | `src/details.rs` | Decodes the opened item off the UI thread (up to 4096 px), "Open externally"; asks the engine to rotate / accept / keep on a worker, reloads when the file is rotated |
 | `src/pipeline.rs` | Hosts the pipeline `Engine` while the window is open: relay thread (coalesced reports → review-grid updates, status counts), capture priority, status line |
 | `src/review.rs` | Background indexer, `GridModel` (rows sliced on demand, incremental merges while indexing and of pipeline updates), filter thread, batched thumbnail delivery |

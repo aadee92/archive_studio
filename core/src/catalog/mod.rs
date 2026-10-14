@@ -354,6 +354,18 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The tags of `kind` with no tags under them (`People|Alice`, not the `People` that
+    /// [`tag`](Self::tag) made on the way), by path.
+    pub fn leaf_tags(&self, kind: TagKind) -> Result<Vec<(TagId, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT g.id, g.path FROM tags g WHERE g.kind = ?1
+                 AND NOT EXISTS (SELECT 1 FROM tags c WHERE lower(substr(c.path, 1, length(g.path) + 1)) = lower(g.path || '|'))
+             ORDER BY g.path COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([kind.name()], |row| Ok((TagId(row.get(0)?), row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Returns all distinct tags applied to at least one asset.
     pub fn applied_tag_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare_cached(

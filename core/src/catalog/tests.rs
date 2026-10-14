@@ -205,6 +205,22 @@ fn tags_are_case_insensitive_and_typed() {
 }
 
 #[test]
+fn leaf_tags_skip_ancestors_and_other_kinds() {
+    let lib = Lib::new();
+    lib.cat.tag("People|Family", TagKind::Person).unwrap();
+    // Paths match ignoring case, so this is under "People|Family" too.
+    let alice = lib.cat.tag("people|FAMILY|Alice", TagKind::Person).unwrap();
+    let bob = lib.cat.tag("People|Bob", TagKind::Person).unwrap();
+    // A sibling sharing the prefix doesn't make "Family" an ancestor of it.
+    let friends = lib.cat.tag("People|Family friends", TagKind::Person).unwrap();
+    lib.cat.tag("Scenes|Beach", TagKind::Scene).unwrap();
+    assert_eq!(
+        lib.cat.leaf_tags(TagKind::Person).unwrap(),
+        [(bob, "People|Bob".into()), (friends, "People|Family friends".into()), (alice, "people|FAMILY|Alice".into())]
+    );
+}
+
+#[test]
 fn rename_tag_moves_its_subtree() {
     let mut lib = sample();
     // Ancestors exist as tags of their own.

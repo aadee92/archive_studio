@@ -1,6 +1,5 @@
-import { ListView } from "std-widgets.slint";
+import { ListView, LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { MediaRow, MediaTile } from "types.slint";
 
 // A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
 export struct PersonItem {
@@ -9,27 +8,61 @@ export struct PersonItem {
     count: int,
 }
 
+// One face crop in the grid.
+export struct FaceTile {
+    thumb: image,
+    thumb-ready: bool,
+    // File name, or for a face only suggested as this person, how sure the suggestion is.
+    detail: string,
+    // Suggested rather than confirmed: highlighted, and listed before the confirmed faces.
+    suggested: bool,
+    selected: bool,
+    // Named (or ignored) since the grid was loaded: the face stays where it is, masked
+    // and labelled, until the grid is reloaded.
+    assigned: string,
+    ignored: bool,
+}
+
+export struct FaceRow { tiles: [FaceTile] }
+
 export global PeopleBridge {
     in property <[PersonItem]> people;
     in-out property <int> selected: -1;
-    // Face crops, `columns` per row; `MediaTile.index` is the face id, `detail` says
-    // whether a face is confirmed or only suggested.
-    in property <[MediaRow]> rows;
+    // Face crops, `columns` per row; a face is addressed by (row, column).
+    in property <[FaceRow]> rows;
     in property <string> title;
     in property <string> status-text;
     in property <bool> empty;
     in property <bool> loading;
     in property <length> tile-size: 120px;
+    // Faces selected in the grid.
+    in property <int> selection: 0;
+    // The person on screen ("" for Unknown): what the name box starts with.
+    in property <string> person-name;
+    // Person names matching the name box.
+    in property <[string]> name-matches;
 
     callback refresh();
     callback columns-changed(int);
     callback select(int);
-    callback open(int);
+    // (row, column); -1 for neither when the click missed every face.
+    callback open(int, int);
+    callback click(int, int, /* extend */ bool, /* toggle */ bool);
+    // A drag starts: `keep` adds to the current selection instead of replacing it.
+    callback drag-begin(bool);
+    // The faces in rows `r0..=r1`, columns `c0..=c1` (unclamped), plus what drag-begin kept.
+    callback drag-to(int, int, int, int);
+    callback select-all();
+    callback clear-selection();
+    callback name-edited(string);
+    callback assign(string);
+    callback ignore();
 }
 
 component FaceCell inherits Rectangle {
-    in property <MediaTile> tile;
+    in property <FaceTile> tile;
     in property <length> size;
+    in property <bool> hover;
 
     width: size;
 
@@ -46,41 +79,120 @@ component FaceCell inherits Rectangle {
             source: root.tile.thumb;
             image-fit: cover;
         }
+        if root.tile.assigned != "": Rectangle {
+            background: root.tile.ignored ? #ffffffc0 : #1f2328a8;
+            Text {
+                x: 6px;
+                width: parent.width - 12px;
+                text: root.tile.assigned;
+                font-size: 13px;
+                font-weight: 600;
+                color: root.tile.ignored ? Theme.text-muted : #ffffff;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
     }
     Rectangle {
         y: 0;
         width: root.size;
         height: root.size;
         border-radius: 6px;
-        border-width: ta.has-hover ? 1px : 0px;
-        border-color: Theme.border;
+        border-width: root.tile.selected ? 3px : root.hover ? 1px : 0px;
+        border-color: root.tile.selected ? Theme.accent : Theme.border;
     }
-    Text {
-        x: 2px;
-        y: root.size + 4px;
-        width: root.size - 4px;
-        text: root.tile.detail;
-        font-size: 11px;
-        color: Theme.text-muted;
-        overflow: elide;
-    }
-
-    ta := TouchArea {
-        double-clicked => { PeopleBridge.open(root.tile.index); }
+    // Under a suggested face: a highlighted label.
+    Rectangle {
+        x: 0;
+        y: root.size + 2px;
+        width: root.size;
+        height: 16px;
+        border-radius: 4px;
+        background: root.tile.suggested ? Theme.accent-soft : transparent;
+        Text {
+            x: 4px;
+            width: parent.width - 8px;
+            text: root.tile.detail;
+            font-size: 11px;
+            color: root.tile.suggested ? Theme.accent : Theme.text-muted;
+            overflow: elide;
+        }
     }
 }
 
 export component PeoplePage inherits Rectangle {
     property <length> gap: 12px;
     property <length> row-height: PeopleBridge.tile-size + 22px;
-    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (PeopleBridge.tile-size + root.gap)));
+    property <length> pitch: PeopleBridge.tile-size + root.gap;
+    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / root.pitch));
+
+    // Face under the pointer, for the hover border.
+    property <int> hover-row: -1;
+    property <int> hover-col: -1;
+
+    // Rubber band, in content coordinates (scrolling moves the grid, not the band's anchor).
+    property <bool> dragging;
+    property <length> press-x;
+    property <length> press-y;
+    property <bool> press-keep;
+
+    // The name box's match highlighted with Up / Down (-1: the typed text).
+    property <int> match-index: -1;
 
     changed columns => { PeopleBridge.columns-changed(self.columns); }
     // Faces get named elsewhere (and by scans): re-read the catalog whenever the page is shown.
-    changed visible => { if (self.visible) { PeopleBridge.refresh(); } }
+    // `init` runs before Rust handles columns-changed, so the count is sent again here.
+    changed visible => {
+        if (self.visible) {
+            PeopleBridge.columns-changed(self.columns);
+            PeopleBridge.refresh();
+        }
+    }
     init => { PeopleBridge.columns-changed(self.columns); }
 
     background: Theme.bg;
+
+    pure function row-at(y: length) -> int {
+        return y < 0 || Math.mod(y / 1px, root.row-height / 1px) < root.gap / 1px ? -1 : Math.floor(y / root.row-height);
+    }
+    pure function col-at(x: length) -> int {
+        return x < root.gap || Math.floor((x - root.gap) / root.pitch) >= root.columns
+            || Math.mod((x - root.gap) / 1px, root.pitch / 1px) > PeopleBridge.tile-size / 1px
+            ? -1 : Math.floor((x - root.gap) / root.pitch);
+    }
+
+    function drag-update() {
+        // Pointer in content coordinates.
+        PeopleBridge.drag-to(
+            Math.floor(Math.min(root.press-y, overlay.mouse-y - list.content-y) / root.row-height),
+            Math.floor((Math.max(root.press-y, overlay.mouse-y - list.content-y) - root.gap) / root.row-height),
+            Math.ceil((Math.min(root.press-x, overlay.mouse-x) - root.gap - PeopleBridge.tile-size) / root.pitch),
+            Math.floor((Math.max(root.press-x, overlay.mouse-x) - root.gap) / root.pitch));
+    }
+
+    function scroll-by(dy: length) {
+        list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height), Math.min(0px, list.content-y + dy));
+    }
+
+    function assign-typed() {
+        if (PeopleBridge.selection > 0) {
+            PeopleBridge.assign(root.match-index >= 0 && root.match-index < PeopleBridge.name-matches.length
+                ? PeopleBridge.name-matches[root.match-index] : name-box.text);
+            name-box.text = "";
+            root.match-index = -1;
+            PeopleBridge.name-edited("");
+        }
+    }
+
+    // A new selection: offer the person on screen, so Enter confirms their suggestions.
+    function selection-started() {
+        if (name-box.text == "" && PeopleBridge.person-name != "") {
+            name-box.text = PeopleBridge.person-name;
+            PeopleBridge.name-edited(name-box.text);
+        }
+        name-box.focus();
+        name-box.select-all();
+    }
 
     HorizontalLayout {
         Rectangle {
@@ -92,6 +204,64 @@ export component PeoplePage inherits Rectangle {
                 spacing: 12px;
 
                 Text { text: "People"; font-size: 15px; font-weight: 600; color: Theme.text; }
+
+                // Naming the selected faces.
+                VerticalLayout {
+                    vertical-stretch: 0;
+                    spacing: 6px;
+                    Text {
+                        text: PeopleBridge.selection == 0 ? "Name"
+                            : PeopleBridge.selection == 1 ? "Name 1 face" : "Name \{PeopleBridge.selection} faces";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: Theme.text-muted;
+                    }
+                    name-box := LineEdit {
+                        enabled: PeopleBridge.selection > 0;
+                        placeholder-text: PeopleBridge.selection > 0 ? "Who is this?" : "Select faces to name them";
+                        edited(text) => {
+                            root.match-index = -1;
+                            PeopleBridge.name-edited(text);
+                        }
+                        accepted => { root.assign-typed(); }
+                        key-pressed(event) => {
+                            if (event.text == Key.DownArrow) {
+                                root.match-index = Math.min(root.match-index + 1, PeopleBridge.name-matches.length - 1);
+                                return accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                root.match-index = Math.max(root.match-index - 1, -1);
+                                return accept;
+                            }
+                            if (event.text == Key.Escape) {
+                                self.text = "";
+                                root.match-index = -1;
+                                PeopleBridge.name-edited("");
+                                PeopleBridge.clear-selection();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Assign";
+                            primary: true;
+                            enabled: PeopleBridge.selection > 0 && (name-box.text != "" || root.match-index >= 0);
+                            clicked => { root.assign-typed(); }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: "Ignore";
+                            enabled: PeopleBridge.selection > 0;
+                            clicked => { PeopleBridge.ignore(); }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: Theme.border; }
 
                 Rectangle {
                     vertical-stretch: 1;
@@ -130,7 +300,10 @@ export component PeoplePage inherits Rectangle {
 
                             person-ta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { PeopleBridge.select(person.key); }
+                                clicked => {
+                                    name-box.text = "";
+                                    PeopleBridge.select(person.key);
+                                }
                             }
                         }
                     }
@@ -160,16 +333,97 @@ export component PeoplePage inherits Rectangle {
                     clip: true;
 
                     list := ListView {
-                        for row in PeopleBridge.rows: Rectangle {
+                        for row[r] in PeopleBridge.rows: Rectangle {
                             height: root.row-height;
                             HorizontalLayout {
                                 padding-left: root.gap;
                                 padding-top: root.gap;
                                 spacing: root.gap;
                                 alignment: start;
-                                for t in row.tiles: FaceCell { tile: t; size: PeopleBridge.tile-size; }
+                                for t[c] in row.tiles: FaceCell {
+                                    tile: t;
+                                    size: PeopleBridge.tile-size;
+                                    hover: r == root.hover-row && c == root.hover-col;
+                                }
                             }
                         }
+                    }
+
+                    // All pointer input over the faces (not the scroll bar): click, shift-click
+                    // for a range, ctrl-click to toggle, drag for a rubber band, double-click
+                    // to open. Faces are found from the grid's geometry.
+                    overlay := TouchArea {
+                        x: list.x;
+                        y: list.y;
+                        width: list.visible-width;
+                        height: list.visible-height;
+
+                        changed mouse-x => { root.track(); }
+                        changed mouse-y => { root.track(); }
+                        changed has-hover => { root.track(); }
+
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                root.press-x = self.mouse-x;
+                                root.press-y = self.mouse-y - list.content-y;
+                                root.press-keep = event.modifiers.shift || event.modifiers.control;
+                                root.dragging = false;
+                            }
+                            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                if (root.dragging) {
+                                    root.dragging = false;
+                                } else {
+                                    PeopleBridge.click(
+                                        root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x),
+                                        event.modifiers.shift, event.modifiers.control);
+                                }
+                                if (PeopleBridge.selection > 0) {
+                                    root.selection-started();
+                                }
+                            }
+                        }
+                        moved => {
+                            if (self.pressed && !root.dragging
+                                && Math.abs(self.mouse-x - root.press-x) + Math.abs(self.mouse-y - list.content-y - root.press-y) > 6px) {
+                                root.dragging = true;
+                                PeopleBridge.drag-begin(root.press-keep);
+                            }
+                            if (root.dragging) {
+                                root.drag-update();
+                            }
+                        }
+                        double-clicked => {
+                            PeopleBridge.open(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
+                        }
+                        scroll-event(event) => {
+                            root.scroll-by(event.delta-y);
+                            if (root.dragging) {
+                                root.drag-update();
+                            }
+                            accept
+                        }
+                    }
+
+                    // Dragging past the top or bottom edge scrolls.
+                    Timer {
+                        interval: 30ms;
+                        running: root.dragging && (overlay.mouse-y < 0 || overlay.mouse-y > overlay.height);
+                        triggered => {
+                            root.scroll-by(overlay.mouse-y < 0
+                                ? Math.min(40px, -overlay.mouse-y / 2)
+                                : -Math.min(40px, (overlay.mouse-y - overlay.height) / 2));
+                            root.drag-update();
+                        }
+                    }
+
+                    if root.dragging: Rectangle {
+                        x: overlay.x + Math.min(root.press-x, overlay.mouse-x);
+                        y: overlay.y + Math.max(0px, Math.min(root.press-y + list.content-y, overlay.mouse-y));
+                        width: Math.abs(overlay.mouse-x - root.press-x);
+                        height: Math.min(overlay.height, Math.max(root.press-y + list.content-y, overlay.mouse-y)) - self.y + overlay.y;
+                        background: #2563eb1f;
+                        border-width: 1px;
+                        border-color: Theme.accent;
                     }
 
                     if PeopleBridge.empty: Text {
@@ -180,14 +434,86 @@ export component PeoplePage inherits Rectangle {
 
                 HorizontalLayout {
                     height: 34px;
+                    spacing: 12px;
                     Text {
+                        horizontal-stretch: 1;
                         vertical-alignment: center;
                         text: PeopleBridge.status-text;
                         color: Theme.text-muted;
                         font-size: 12px;
                     }
+                    if PeopleBridge.rows.length > 0: Text {
+                        vertical-alignment: center;
+                        text: "Click, Shift-click or drag to select · Ctrl-click to add";
+                        color: Theme.placeholder;
+                        font-size: 11px;
+                    }
+                    if PeopleBridge.rows.length > 0: Text {
+                        vertical-alignment: center;
+                        text: PeopleBridge.selection > 0 ? "Clear selection" : "Select all";
+                        color: Theme.accent;
+                        font-size: 12px;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if (PeopleBridge.selection > 0) {
+                                    PeopleBridge.clear-selection();
+                                } else {
+                                    PeopleBridge.select-all();
+                                    root.selection-started();
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    // Matches for the name box, floating under it.
+    if PeopleBridge.selection > 0 && PeopleBridge.name-matches.length > 0: Rectangle {
+        x: name-box.absolute-position.x - root.absolute-position.x;
+        y: name-box.absolute-position.y - root.absolute-position.y + name-box.height + 2px;
+        width: name-box.width;
+        height: matches.preferred-height;
+        background: Theme.surface;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #0000001f;
+        matches := VerticalLayout {
+            padding: 3px;
+            for name[i] in PeopleBridge.name-matches: Rectangle {
+                height: 26px;
+                border-radius: 4px;
+                background: i == root.match-index ? Theme.accent-soft : match-ta.has-hover ? Theme.hover : transparent;
+                Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    text: name;
+                    font-size: 12px;
+                    color: i == root.match-index ? Theme.accent : Theme.text;
+                    overflow: elide;
+                }
+                match-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.match-index = i;
+                        root.assign-typed();
+                    }
+                }
+            }
+        }
+    }
+
+    function track() {
+        if (overlay.has-hover && !overlay.pressed) {
+            root.hover-row = root.row-at(overlay.mouse-y - list.content-y);
+            root.hover-col = root.col-at(overlay.mouse-x);
+        } else if (!overlay.has-hover) {
+            root.hover-row = -1;
+            root.hover-col = -1;
         }
     }
 }
