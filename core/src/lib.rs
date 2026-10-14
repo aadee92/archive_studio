@@ -5,11 +5,13 @@
 //!   [`CaptureDevice`](device::CaptureDevice) and receives [`DeviceEvent`](device::DeviceEvent)s
 //!   from the backend's own threads.
 //! - [`devices`]: the backends and [`discover`](devices::discover).
+//! - [`media`]: media kinds and file classification.
 //!
 //! See `ARCHITECTURE.md` at the repository root for the layering rule.
 
 pub mod device;
 pub mod devices;
+pub mod media;
 mod resize;
 
 /// The `image` version [`device::Frame`] comes from.

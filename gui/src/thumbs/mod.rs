@@ -43,7 +43,7 @@ use std::time::Duration;
 use image::{DynamicImage, RgbImage};
 use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 
-use crate::MediaKind;
+use archive_core::media::MediaKind;
 use cache::{DiskCache, DiskConn, Fingerprint, Lru};
 use sched::{Key, Sched};
 use writer::{Produced, Writer};

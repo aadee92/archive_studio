@@ -30,7 +30,9 @@ use std::{fs, thread};
 use slint::{ComponentHandle, Model, ModelNotify, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel};
 
 use crate::thumbs::{self, sched, Delivery, ThumbCache, Threads, Tier};
-use crate::{AppWindow, MediaKind, MediaRow, MediaTile, ReviewBridge};
+use archive_core::media::{classify, MediaKind};
+
+use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge};
 
 #[cfg_attr(test, derive(Clone))]
 struct Entry {
@@ -54,16 +56,6 @@ impl Entry {
         let mtime = modified.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos().min(u64::MAX as u128) as u64);
         Self { path, name: name.into(), name_lc, name_prefix: u128::from_be_bytes(prefix), kind, size, mtime }
     }
-}
-
-fn classify(path: &Path) -> Option<MediaKind> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "bmp" | "dng" => MediaKind::Image,
-        "mp4" | "mkv" | "mov" | "avi" | "m4v" | "mts" | "dv" | "mpg" | "mpeg" | "webm" => MediaKind::Video,
-        "wav" | "flac" | "mp3" | "m4a" | "aac" | "ogg" => MediaKind::Audio,
-        _ => return None,
-    })
 }
 
 /// The indexed files, append-only, as shared chunks (one per indexer batch): a snapshot for
@@ -706,7 +698,7 @@ impl GridModel {
         MediaTile {
             index: id as i32,
             name: entry.name.clone(),
-            kind: entry.kind,
+            kind: ui_kind(entry.kind),
             detail: human_size(entry.size).into(),
             thumb_ready: thumb.is_some(),
             thumb: thumb.unwrap_or_default(),
@@ -773,6 +765,14 @@ impl Model for GridModel {
 
     fn model_tracker(&self) -> &dyn ModelTracker {
         &self.notify.inner
+    }
+}
+
+fn ui_kind(kind: MediaKind) -> crate::MediaKind {
+    match kind {
+        MediaKind::Image => crate::MediaKind::Image,
+        MediaKind::Video => crate::MediaKind::Video,
+        MediaKind::Audio => crate::MediaKind::Audio,
     }
 }
 

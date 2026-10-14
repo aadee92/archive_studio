@@ -19,7 +19,7 @@ use jpeg_decoder::PixelFormat;
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 use tiff::tags::{IfdPointer, Tag};
 
-use crate::MediaKind;
+use archive_core::media::MediaKind;
 
 /// Longest edge of the reduced page written by [`write_tiff_with_reduced_page`]: room for
 /// the 384 px tier on HiDPI growth, yet ~2 MB uncompressed.
