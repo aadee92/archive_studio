@@ -22,19 +22,47 @@ ARCHIVE_STUDIO_MOCK=ff680,vhs,reel,hi8 cargo run        # mixed scanners + video
 
 ## Acquire
 
-Backends implement `CaptureDevice` (`name`, `kind`, `start_preview`, `start_acquire`, `stop`)
-and report through an `EventSink` from their own threads. Preview frames are coalesced per
-device (latest wins, one UI update in flight), so N devices at 30 fps can't flood the event loop.
+Backends implement `CaptureDevice` (`name`, `kind`, `start_preview`, `start_acquire`, `stop`,
+optionally `start_alt` for a secondary action such as "Scan backs") and report through an
+`EventSink` from their own threads. Preview frames are coalesced per device (latest wins, one UI
+update in flight), so N devices at 30 fps can't flood the event loop. Each saved capture is
+reported with a small thumbnail (`DeviceEvent::Saved`); every panel shows its last five under
+the preview.
 Real backends to add in `acquire::discover()`: SANE/Epson SDK for FF-680W, V4L2 + ALSA for
-VHS/Hi8 analog capture and the Kodak Reels (UVC), `dvgrab` for FireWire camcorders.
+VHS/Hi8 analog capture and the Kodak Reels (UVC).
 
-**Epson Perfection V850** (`src/acquire/v850.rs`, driver in `utils/epson/v850`): detected by USB
-id on launch/Rescan. A scan starts from the panel's Scan button or the scanner's own button;
-it streams to `<dir>/epson-v850/scan-NNNN.png` (full bed, 600 dpi; `ARCHIVE_STUDIO_V850_DPI`
-overrides) with a live preview that also seeds the review thumbnail. Stop cancels mid-scan; USB
-errors and unplugging reconnect automatically. While the GUI runs it holds the scanner
-exclusively (the standalone `x980` CLI and SANE can't use it). Hardware check:
+**Epson Perfection V850** (`src/acquire/v850.rs`, driver in `utils/epson/v850`, photo detection
+in `utils/photo-duplex`): detected by USB id on launch/Rescan. It scans several photos at once
+against the white document mat (which must be in the lid). Scan, or one press of the scanner
+button, scans the whole bed (600 dpi; `ARCHIVE_STUDIO_V850_DPI` overrides) and saves each photo,
+straightened, as `<dir>/epson-v850/photo-NNNN-front.png`. Scan backs, or two presses about a
+second apart, scans again after the double-sided photos of that batch were flipped over in place
+and saves `photo-NNNN-back.png` beside each front. The whole bed appears only in the live preview
+and is never saved; the recent strip and review grid show the cut-out photos, whose thumbnails
+are seeded from memory. Stop cancels mid-scan; USB errors and unplugging reconnect automatically
+(the last batch of fronts is kept). While the GUI runs it holds the scanner exclusively (the
+standalone `x980` / `photo-duplex` CLIs and SANE can't use it). Hardware check:
 `V850_OUT=/tmp/x cargo test --release -- --ignored --nocapture v850_hardware_scan`.
+
+**DV / Digital8 camcorders over FireWire** (`src/acquire/dv.rs`; needs
+`sudo apt install dvgrab libavc1394-tools`): the first AV/C unit in `/sys/bus/firewire/devices`
+is detected on launch/Rescan, and within ~2 s when switched on or plugged in later, without
+disturbing other devices. E.g. a Sony DCR-TRV240, which plays Hi8/Video8 tapes and digitizes
+them to DV itself. Put the camera on AC power in PLAY/EDIT (VCR) mode. The panel shows the live
+picture and tape state. Record rewinds and captures the whole tape; Record from here starts where
+the tape is. Each capture is the camera's DV stream, bit for bit, as
+`<dir>/<model>/tape-NNNN.dv` (~13 GB/hour), and ends at the end of the tape, on Stop, after 2 min
+of blank picture or at 250 min. `ARCHIVE_STUDIO_DV_AUTO=1` starts a whole-tape capture whenever a
+tape is inserted, so a tape swap is the only step. `dvgrab` streams continuously into a reader
+thread (file writes, previews); a controller thread drives the transport with short-lived `dvcont`
+calls, each killed after 3 s, so a hung camera, a stalled stream or a pulled cable shows up as an
+error on the panel (any open file is closed and kept) and recovers by itself, never blocking the
+UI. The preview is decoded in Rust from the DC coefficients alone (90×60, no ffmpeg) and doubles as
+blank detection; the poster frame seeds the review thumbnail. Check that the camera's on-screen
+display goes to the LCD only: anything it draws on the video output is in the DV stream. Tests:
+`simulated::capture_hang_and_unplug` runs the controller against fake tools; with the camera
+attached, `cargo test --release -- --ignored --nocapture dv_hardware_stream`.
+`utils/dv-tape-capture.sh` is the same capture loop as a standalone script.
 
 ## Review performance
 

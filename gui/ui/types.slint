@@ -13,6 +13,9 @@ export struct DeviceTile {
     preview: image,
     has-preview: bool,
     captured: int,
+    recent: [image],     // newest first, at most 5 small thumbnails of saved captures
+    alt-action: string,  // secondary action's label (e.g. "Scan backs"); empty = none
+    alt-enabled: bool,
 }
 
 export enum MediaKind { image, video, audio }

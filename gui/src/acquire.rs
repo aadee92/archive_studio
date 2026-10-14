@@ -7,14 +7,16 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
 
 use crate::{AcquireBridge, AppWindow, DeviceState, DeviceTile};
 
+mod dv;
 mod v850;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +40,7 @@ impl DeviceKind {
             Self::Flatbed => "Flatbed scanner",
             Self::VhsCapture => "VHS capture",
             Self::FilmReel => "8mm film reel",
-            Self::Camcorder => "Hi8 camcorder",
+            Self::Camcorder => "DV / Hi8 camcorder",
         }
     }
 
@@ -50,6 +52,12 @@ impl DeviceKind {
 /// A downscaled preview frame (~640px wide), never a full-resolution capture.
 pub type Frame = SharedPixelBuffer<Rgb8Pixel>;
 
+/// How many recent captures each device panel shows.
+pub const RECENT: usize = 5;
+
+/// How often to look for hardware plugged in after launch (see [`Acquire::hotplug`]).
+const HOTPLUG_POLL: Duration = Duration::from_secs(2);
+
 pub enum DeviceEvent {
     Preview(Frame),
     /// Free-form status line, e.g. "600 dpi · feeder loaded" or "00:12:31".
@@ -57,6 +65,12 @@ pub enum DeviceEvent {
     /// Acquisition began on the device itself, e.g. from the scanner's own button.
     Started,
     Captured(u32),
+    /// A small thumbnail (≤192 px) of a capture just saved: for a flatbed, each photo cut
+    /// out of the bed, never the whole bed. Shown in the panel's strip of recent captures.
+    Saved(Frame),
+    /// Label of the device's secondary action (e.g. "Scan backs") and whether it can run
+    /// now. Devices that never send this have none.
+    AltAction(String, bool),
     /// Back to idle; also clears an earlier error once the device recovers.
     Finished,
     Error(String),
@@ -77,19 +91,23 @@ pub trait CaptureDevice {
     fn start_preview(&mut self, sink: EventSink);
     /// Scanners: run the feeder until empty. Video: record until [`stop`](Self::stop).
     fn start_acquire(&mut self, out_dir: &Path, sink: EventSink);
+    /// The secondary action announced with [`DeviceEvent::AltAction`].
+    fn start_alt(&mut self, _out_dir: &Path, _sink: EventSink) {}
     /// Stops acquiring; the preview keeps running.
     fn stop(&mut self);
 }
 
 /// Probes every backend for connected hardware.
 ///
-/// Implemented: Epson Perfection V850 (`v850.rs`, via `utils/epson/v850`); its scans go to
-/// `<out_dir>/epson-v850/`.
+/// Implemented:
+/// - Epson Perfection V850 (`v850.rs`, via `utils/epson/v850` and `utils/photo-duplex`); the
+///   photos it cuts out of each scan go to `<out_dir>/epson-v850/`.
+/// - DV / Digital8 camcorders over FireWire (`dv.rs`, via `dvgrab` and `dvcont`); tapes go to
+///   `<out_dir>/<model>/tape-NNNN.dv`, e.g. `sony-dcr-trv240/`.
 ///
 /// Backends to implement:
 /// - FF-680W: SANE `epsonds` (or Epson's SDK), matched by USB VID/PID.
 /// - VHS / Hi8 analog: V4L2 capture cards (`/dev/video*`) + ALSA audio, encoded via ffmpeg/GStreamer.
-/// - Hi8 / Digital8 over FireWire: `dvgrab`.
 /// - Kodak Reels: enumerates as a UVC camera, so V4L2 again.
 ///
 /// Every backend that saves stills must seed thumbnails via `thumbs::store_for_new_file`.
@@ -104,10 +122,18 @@ pub fn discover(out_dir: &Path) -> Vec<Box<dyn CaptureDevice>> {
     if v850::present() {
         found.push(Box::new(v850::V850::new(out_dir.join("epson-v850"))));
     }
+    if let Some(unit) = dv::find() {
+        found.push(camcorder(unit, out_dir));
+    }
     if let Ok(spec) = std::env::var("ARCHIVE_STUDIO_MOCK") {
         found.extend(mock::from_spec(&spec));
     }
     found
+}
+
+fn camcorder(unit: dv::Unit, out_dir: &Path) -> Box<dyn CaptureDevice> {
+    let dir = out_dir.join(unit.slug());
+    Box::new(dv::Camcorder::new(unit, dir))
 }
 
 pub struct Acquire {
@@ -117,6 +143,7 @@ pub struct Acquire {
     out_dir: PathBuf,
     /// Bumped on rescan so late events from dropped devices can't land on new tiles.
     epoch: Arc<AtomicU64>,
+    hotplug: Timer,
 }
 
 pub fn install(ui: &AppWindow, out_dir: &Path) -> Rc<Acquire> {
@@ -126,6 +153,7 @@ pub fn install(ui: &AppWindow, out_dir: &Path) -> Rc<Acquire> {
         tiles: Rc::new(VecModel::default()),
         out_dir: out_dir.to_path_buf(),
         epoch: Arc::default(),
+        hotplug: Timer::default(),
     });
 
     let bridge = ui.global::<AcquireBridge>();
@@ -137,11 +165,19 @@ pub fn install(ui: &AppWindow, out_dir: &Path) -> Rc<Acquire> {
     let t = this.clone();
     bridge.on_start(move |row| t.start(row as usize));
     let t = this.clone();
+    bridge.on_start_alt(move |row| t.start_alt(row as usize));
+    let t = this.clone();
     bridge.on_stop(move |row| t.stop(row as usize));
     let t = this.clone();
     bridge.on_start_all(move || (0..t.tiles.row_count()).for_each(|row| t.start(row)));
 
     this.rescan();
+    let weak: Weak<Acquire> = Rc::downgrade(&this);
+    this.hotplug.start(TimerMode::Repeated, HOTPLUG_POLL, move || {
+        if let Some(t) = weak.upgrade() {
+            t.hotplug();
+        }
+    });
     this
 }
 
@@ -151,21 +187,28 @@ impl Acquire {
         let mut devices = self.devices.borrow_mut();
         *devices = discover(&self.out_dir);
 
-        let tiles: Vec<DeviceTile> = devices
-            .iter()
-            .map(|d| DeviceTile {
-                name: d.name().into(),
-                kind_label: d.kind().label().into(),
-                is_video: d.kind().is_video(),
-                state: DeviceState::Previewing,
-                ..Default::default()
-            })
-            .collect();
+        let tiles: Vec<DeviceTile> = devices.iter().map(|d| tile_for(d.as_ref())).collect();
         self.tiles.set_vec(tiles);
 
         for (row, device) in devices.iter_mut().enumerate() {
             device.start_preview(self.sink_for(row));
         }
+    }
+
+    /// Adds a DV camcorder that was switched on or plugged in after the last scan, leaving
+    /// the other devices (and anything they're capturing) alone. Only reads sysfs. Once
+    /// added, the camcorder's own controller copes with it going away and coming back.
+    fn hotplug(&self) {
+        let Some(unit) = dv::find() else { return };
+        let mut devices = self.devices.borrow_mut();
+        if devices.iter().any(|d| d.kind() == DeviceKind::Camcorder && d.name() == unit.name()) {
+            return;
+        }
+        let row = devices.len();
+        let mut device = camcorder(unit, &self.out_dir);
+        self.tiles.push(tile_for(device.as_ref()));
+        device.start_preview(self.sink_for(row));
+        devices.push(device);
     }
 
     fn start(&self, row: usize) {
@@ -178,6 +221,19 @@ impl Acquire {
         }
         // TODO: output layout / naming, e.g. <out>/<date>/<device>/<seq>.tif
         device.start_acquire(&self.out_dir, self.sink_for(row));
+        tile.state = DeviceState::Acquiring;
+        self.tiles.set_row_data(row, tile);
+    }
+
+    fn start_alt(&self, row: usize) {
+        let mut devices = self.devices.borrow_mut();
+        let (Some(device), Some(mut tile)) = (devices.get_mut(row), self.tiles.row_data(row)) else {
+            return;
+        };
+        if tile.state != DeviceState::Previewing || !tile.alt_enabled {
+            return;
+        }
+        device.start_alt(&self.out_dir, self.sink_for(row));
         tile.state = DeviceState::Acquiring;
         self.tiles.set_row_data(row, tile);
     }
@@ -227,6 +283,16 @@ impl Acquire {
     }
 }
 
+fn tile_for(device: &dyn CaptureDevice) -> DeviceTile {
+    DeviceTile {
+        name: device.name().into(),
+        kind_label: device.kind().label().into(),
+        is_video: device.kind().is_video(),
+        state: DeviceState::Previewing,
+        ..Default::default()
+    }
+}
+
 fn apply(ui: &AppWindow, row: usize, event: DeviceEvent) {
     let tiles = ui.global::<AcquireBridge>().get_devices();
     let Some(mut tile) = tiles.row_data(row) else { return };
@@ -239,6 +305,15 @@ fn apply(ui: &AppWindow, row: usize, event: DeviceEvent) {
         DeviceEvent::Captured(n) => {
             tile.captured = n as i32;
             tile.detail = format!("{n} captured").into();
+        }
+        DeviceEvent::Saved(thumb) => {
+            let mut recent: Vec<Image> = tile.recent.iter().take(RECENT - 1).collect();
+            recent.insert(0, Image::from_rgb8(thumb));
+            tile.recent = ModelRc::new(VecModel::from(recent));
+        }
+        DeviceEvent::AltAction(label, enabled) => {
+            tile.alt_action = label.into();
+            tile.alt_enabled = enabled;
         }
         DeviceEvent::Started => tile.state = DeviceState::Acquiring,
         DeviceEvent::Finished => tile.state = DeviceState::Previewing,
@@ -306,11 +381,16 @@ mod mock {
             let video = self.kind.is_video();
             thread::spawn(move || {
                 let (mut tick, mut recorded, mut captured) = (0u32, 0u32, 0u32);
+                let mut was_recording = false;
                 while alive.load(Ordering::Acquire) {
                     // Video streams at 10 fps; scanners show the last scanned photo.
                     if video || tick % 10 == 0 {
                         sink(DeviceEvent::Preview(test_pattern(tick)));
                     }
+                    if video && was_recording && !acquiring.load(Ordering::Acquire) {
+                        sink(DeviceEvent::Saved(test_pattern(tick)));
+                    }
+                    was_recording = acquiring.load(Ordering::Acquire);
                     if tick % 10 == 0 {
                         if !acquiring.load(Ordering::Acquire) {
                             recorded = 0;
@@ -321,6 +401,7 @@ mod mock {
                         } else {
                             captured += 1;
                             sink(DeviceEvent::Captured(captured));
+                            sink(DeviceEvent::Saved(test_pattern(tick)));
                             if captured % 24 == 0 {
                                 acquiring.store(false, Ordering::Release);
                                 sink(DeviceEvent::Finished);

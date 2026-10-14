@@ -1,32 +1,44 @@
-//! Epson Perfection V850 / GT-X980 flatbed, via the `x980` userspace driver.
+//! Epson Perfection V850 / GT-X980 flatbed, via the `x980` userspace driver, scanning
+//! several photos at a time with `photo-duplex`.
 //!
 //! One thread owns the scanner. It keeps a full-bed scan configured and polls the front
-//! button, so a scan starts from either the scanner's button or the panel's Scan button.
-//! Image blocks stream straight into a PNG while a box-filtered ~640 px preview is built
-//! from them; the preview is shown live and seeds the review thumbnail cache, so the full
-//! scan is never held in memory.
+//! button. Scan (or one press of the button) saves each photo on the glass as a new front,
+//! `photo-NNNN-front.png`; Scan backs (or two presses about a second apart) pairs the
+//! photos of that batch that were flipped over in place with their fronts,
+//! `photo-NNNN-back.png`. The whole bed is shown only as the live preview, built from the
+//! image blocks as they stream in; it is held in memory for the cut-out (~110 MB at
+//! 600 dpi) but never saved. Each saved photo seeds the review thumbnail cache and is
+//! reported as a recent capture.
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use image::RgbImage;
 use nusb::MaybeFuture;
+use photo_duplex::detect::{DETECT_DPI, Rgb};
+use photo_duplex::session::{Duplex, Event};
 use slint::Rgb8Pixel;
 use x980::{ScanParams, Scanner};
 
-use super::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, Frame};
+use super::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, Frame, RECENT};
+use crate::thumbs;
 
 const DEFAULT_DPI: u32 = 600;
 const PREVIEW_WIDTH: u32 = 640;
 const BUTTON_POLL: Duration = Duration::from_millis(250);
+/// A second press within this long of the first makes a double press. The scanner ignores
+/// a press that comes less than about 0.9 s after the last one, so the two presses need
+/// to be about a second apart.
+const DOUBLE_PRESS_WINDOW: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(300);
 /// Matches `Theme.well`, so the unscanned part of the preview blends with the panel.
 const UNSCANNED: Rgb8Pixel = Rgb8Pixel::new(238, 240, 243);
+const SCAN_BACKS: &str = "Scan backs";
 
 /// True if a V850 is plugged in. Only lists USB devices; doesn't open or claim it.
 pub fn present() -> bool {
@@ -39,6 +51,7 @@ pub fn present() -> bool {
 struct Control {
     alive: AtomicBool,
     start: AtomicBool,
+    start_backs: AtomicBool,
     cancel: AtomicBool,
 }
 
@@ -50,8 +63,8 @@ pub struct V850 {
 }
 
 impl V850 {
-    /// Scans are saved as `<out_dir>/scan-NNNN.png`. `ARCHIVE_STUDIO_V850_DPI` overrides the
-    /// default 600 dpi (clamped to the scanner's maximum).
+    /// Photos are saved in `out_dir`. `ARCHIVE_STUDIO_V850_DPI` overrides the default
+    /// 600 dpi (clamped to the scanner's maximum).
     pub fn new(out_dir: PathBuf) -> Self {
         let dpi = std::env::var("ARCHIVE_STUDIO_V850_DPI").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_DPI);
         Self {
@@ -60,6 +73,7 @@ impl V850 {
             control: Arc::new(Control {
                 alive: AtomicBool::new(true),
                 start: AtomicBool::new(false),
+                start_backs: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
             }),
             started: false,
@@ -99,6 +113,10 @@ impl CaptureDevice for V850 {
         self.control.start.store(true, Ordering::Release);
     }
 
+    fn start_alt(&mut self, _out_dir: &Path, _sink: EventSink) {
+        self.control.start_backs.store(true, Ordering::Release);
+    }
+
     fn stop(&mut self) {
         self.control.cancel.store(true, Ordering::Release);
     }
@@ -106,10 +124,14 @@ impl CaptureDevice for V850 {
 
 /// Reconnects after any USB or protocol error (unplug, power cycle, scanner busy).
 fn run(control: &Control, out_dir: &Path, dpi: u32, sink: &EventSink) {
+    show_recent(out_dir, sink);
+    sink(DeviceEvent::AltAction(SCAN_BACKS.into(), false));
+    // Kept across reconnects, so a back scan still pairs with the last batch of fronts.
+    let mut duplex = Duplex::new(out_dir.to_path_buf());
     let mut last_error = None;
     let mut captured = 0;
     while control.alive.load(Ordering::Acquire) {
-        if let Err(e) = session(control, out_dir, dpi, sink, last_error.take(), &mut captured) {
+        if let Err(e) = session(control, out_dir, dpi, sink, last_error.take(), &mut duplex, &mut captured) {
             if !control.alive.load(Ordering::Acquire) {
                 break;
             }
@@ -126,42 +148,44 @@ fn session(
     dpi: u32,
     sink: &EventSink,
     last_error: Option<String>,
+    duplex: &mut Duplex,
     captured: &mut u32,
 ) -> x980::Result<()> {
     let usb = x980::usb::Usb::open()?.ok_or("scanner not connected")?;
     let mut scanner = Scanner::new(usb);
     scanner.reset()?;
     let id = scanner.identity()?;
-    let dpi = dpi.clamp(1, id.max_dpi);
+    let dpi = dpi.clamp(DETECT_DPI, id.max_dpi);
+    let grid = id.flatbed_at(DETECT_DPI);
     let (width, height) = id.flatbed_at(dpi);
     let params = ScanParams { dpi, left: 0, top: 0, width, height };
+    fs::create_dir_all(out_dir)?;
 
-    let ready = format!("{} · {dpi} dpi · press Scan or the scanner button", id.model);
     sink(DeviceEvent::Finished);
-    sink(DeviceEvent::Status(match last_error {
+    let mut status = match last_error {
         Some(e) => format!("Reconnected after: {e}"),
-        None => ready.clone(),
-    }));
+        None => format!("{} · {dpi} dpi · white mat in the lid", id.model),
+    };
     // Drop a press latched before we connected.
     scanner.button()?;
 
     while control.alive.load(Ordering::Acquire) {
+        sink(DeviceEvent::Status(format!("{status} · {}", prompt(duplex))));
+        sink(DeviceEvent::AltAction(SCAN_BACKS.into(), duplex.has_pending()));
         // Parameters must go in before the wait: after a button press the scanner expects
         // FS G directly (see `x980::wait_for_button`).
         scanner.configure(&params)?;
-        if !wait_for_trigger(&mut scanner, control)? {
+        let Some(backs) = wait_for_trigger(&mut scanner, control, duplex.has_pending(), sink)? else {
             break;
-        }
+        };
         sink(DeviceEvent::Started);
-        match scan_to_png(&mut scanner, &params, out_dir, control, sink)? {
-            Some(path) => {
-                *captured += 1;
-                sink(DeviceEvent::Captured(*captured));
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                sink(DeviceEvent::Status(format!("Saved {name} · {captured} this session")));
+        status = match scan_bed(&mut scanner, &params, control, sink)? {
+            Some(bed) => {
+                sink(DeviceEvent::Status(format!("Finding photos at {dpi} dpi…")));
+                save_photos(duplex, &bed, dpi, grid, backs, sink, captured)?
             }
-            None => sink(DeviceEvent::Status(format!("Scan cancelled · {ready}"))),
-        }
+            None => "Scan cancelled".into(),
+        };
         sink(DeviceEvent::Finished);
         // Ignore presses made while the scan was running.
         scanner.button()?;
@@ -169,95 +193,155 @@ fn session(
     Ok(())
 }
 
-/// Waits for the panel's Scan button or the scanner's front button. `false` on shutdown.
-fn wait_for_trigger(scanner: &mut Scanner, control: &Control) -> x980::Result<bool> {
-    loop {
-        if !control.alive.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        if control.start.swap(false, Ordering::AcqRel) || scanner.button()? != 0 {
-            control.cancel.store(false, Ordering::Release);
-            return Ok(true);
-        }
-        thread::sleep(BUTTON_POLL);
+/// What to do next, for the status line.
+fn prompt(duplex: &Duplex) -> String {
+    match duplex.pending_numbers() {
+        None => "place photos face down, then Scan".into(),
+        Some(numbers) => format!("Scan new photos, or flip {numbers} over in place and Scan backs"),
     }
 }
 
-/// Runs the configured scan into the next free `scan-NNNN.png`. `None` if cancelled.
-fn scan_to_png(
-    scanner: &mut Scanner,
-    params: &ScanParams,
-    out_dir: &Path,
-    control: &Control,
-    sink: &EventSink,
-) -> x980::Result<Option<PathBuf>> {
-    fs::create_dir_all(out_dir)?;
-    let path = next_free_path(out_dir)?;
-    let tmp = path.with_extension("png.part");
+/// Waits for the panel's Scan / Scan backs buttons or the scanner's front button: one
+/// press scans fronts, two about a second apart scan backs (only waited for when there
+/// are fronts to pair with). `Some(backs)`, or `None` on shutdown.
+fn wait_for_trigger(scanner: &mut Scanner, control: &Control, pending: bool, sink: &EventSink) -> x980::Result<Option<bool>> {
+    let backs = loop {
+        if !control.alive.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if control.start.swap(false, Ordering::AcqRel) {
+            break false;
+        }
+        if control.start_backs.swap(false, Ordering::AcqRel) {
+            break true;
+        }
+        if scanner.button()? != 0 {
+            break pending && second_press(scanner, sink)?;
+        }
+        thread::sleep(BUTTON_POLL);
+    };
+    control.cancel.store(false, Ordering::Release);
+    Ok(Some(backs))
+}
 
+/// After a first press of the scanner button, whether a second one follows in time.
+fn second_press(scanner: &mut Scanner, sink: &EventSink) -> x980::Result<bool> {
+    sink(DeviceEvent::Status("Press the button again to scan backs…".into()));
+    let first = Instant::now();
+    while first.elapsed() < DOUBLE_PRESS_WINDOW {
+        thread::sleep(Duration::from_millis(40));
+        if scanner.button()? != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Runs the configured whole-bed scan into memory, showing it as the live preview.
+/// `None` if cancelled.
+fn scan_bed(scanner: &mut Scanner, params: &ScanParams, control: &Control, sink: &EventSink) -> x980::Result<Option<Rgb>> {
     sink(DeviceEvent::Status("Warming up…".into()));
     scanner.wait_ready()?;
 
-    let mut png = png::Encoder::new(BufWriter::new(File::create(&tmp)?), params.width, params.height);
-    png.set_color(png::ColorType::Rgb);
-    png.set_depth(png::BitDepth::Eight);
-    png.set_compression(png::Compression::Fast);
-    let ppm = (params.dpi as f64 / 0.0254).round() as u32;
-    png.set_pixel_dims(Some(png::PixelDimensions { xppu: ppm, yppu: ppm, unit: png::Unit::Meter }));
-    let mut writer = png.write_header()?.into_stream_writer()?;
-
-    let mut preview = Preview::new(params.width, params.height);
     let expected = params.bytes_per_line() * params.height as usize;
-    let mut received = 0usize;
+    let mut data = Vec::with_capacity(expected);
+    let mut preview = Preview::new(params.width, params.height);
     let mut last_update = Instant::now();
-    let result = scanner.scan(|data| {
+    let result = scanner.scan(|block| {
         if control.cancel.load(Ordering::Acquire) {
             return Err("cancelled".into());
         }
-        received += data.len();
-        if received > expected {
+        if data.len() + block.len() > expected {
             return Err(format!("scanner sent more than the expected {expected} bytes").into());
         }
-        writer.write_all(data)?;
-        preview.feed(data);
+        data.extend_from_slice(block);
+        preview.feed(block);
         if last_update.elapsed() >= PREVIEW_INTERVAL {
             last_update = Instant::now();
             sink(DeviceEvent::Preview(preview.frame.clone()));
-            sink(DeviceEvent::Status(format!("Scanning {}% · {} dpi", received * 100 / expected, params.dpi)));
+            sink(DeviceEvent::Status(format!("Scanning {}% · {} dpi", data.len() * 100 / expected, params.dpi)));
         }
-        Ok(())
-    });
-    let result = result.and_then(|()| {
-        if received != expected {
-            return Err(format!("scan ended early: {received} of {expected} bytes").into());
-        }
-        writer.finish()?;
         Ok(())
     });
     if let Err(e) = result {
-        let _ = fs::remove_file(&tmp);
         return if control.cancel.load(Ordering::Acquire) { Ok(None) } else { Err(e) };
     }
-    fs::rename(&tmp, &path)?;
-
-    sink(DeviceEvent::Preview(preview.frame.clone()));
-    crate::thumbs::store_for_new_file(&path, &image::DynamicImage::ImageRgb8(preview.into_image()));
-    Ok(Some(path))
+    if data.len() != expected {
+        return Err(format!("scan ended early: {} of {expected} bytes", data.len()).into());
+    }
+    sink(DeviceEvent::Preview(preview.frame));
+    Ok(Some(Rgb { width: params.width, height: params.height, data }))
 }
 
-/// `scan-0001.png`, `scan-0002.png`, ... picking the first number after the highest present.
-fn next_free_path(dir: &Path) -> x980::Result<PathBuf> {
-    let mut highest = 0u32;
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let n = name
-            .to_str()
-            .and_then(|s| s.strip_prefix("scan-"))
-            .and_then(|s| s.strip_suffix(".png"))
-            .and_then(|s| s.parse::<u32>().ok());
-        highest = highest.max(n.unwrap_or(0));
+/// Cuts the photos out of `bed` and saves them, reporting each as a recent capture.
+/// Returns the outcome for the status line.
+fn save_photos(
+    duplex: &mut Duplex,
+    bed: &Rgb,
+    dpi: u32,
+    grid: (u32, u32),
+    backs: bool,
+    sink: &EventSink,
+    captured: &mut u32,
+) -> x980::Result<String> {
+    let (mut summary, mut warning) = (String::new(), None);
+    duplex.process(bed, dpi, grid, backs, &mut |event| match event {
+        Event::Log(line) => {
+            eprintln!("v850: {line}");
+            if warning.is_none() {
+                warning = line.lines().find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("WARNING: ").or_else(|| l.strip_prefix("warning: ")).map(str::to_owned)
+                });
+            }
+            if !line.starts_with(' ') {
+                summary = line;
+            }
+        }
+        Event::Saved { path, image } => {
+            *captured += 1;
+            sink(DeviceEvent::Captured(*captured));
+            let Some(full) = RgbImage::from_raw(image.width, image.height, image.data.clone()) else { return };
+            let large = thumbs::fit(&full, thumbs::Tier::Large.edge());
+            thumbs::store_for_new_file(path, &image::DynamicImage::ImageRgb8(large.clone()));
+            sink(DeviceEvent::Saved(frame(&thumbs::fit(&large, thumbs::Tier::Small.edge()))));
+        }
+    })?;
+    let mut status = capitalise(&summary);
+    if let Some(w) = warning {
+        status += &format!(" · {}", capitalise(&w));
     }
-    Ok(dir.join(format!("scan-{:04}.png", highest + 1)))
+    Ok(status)
+}
+
+/// Shows the last few photos already in `out_dir`, newest last, as recent captures.
+fn show_recent(out_dir: &Path, sink: &EventSink) {
+    let Ok(entries) = fs::read_dir(out_dir) else { return };
+    let mut photos: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let ours = name.starts_with("photo-") || name.starts_with("unmatched-back-");
+            (ours && name.ends_with(".png")).then_some(())?;
+            Some((e.metadata().ok()?.modified().ok()?, e.path()))
+        })
+        .collect();
+    photos.sort();
+    for (_, path) in photos.iter().rev().take(RECENT).rev() {
+        if let Some(image) = thumbs::small_for_file(path) {
+            sink(DeviceEvent::Saved(frame(&image)));
+        }
+    }
+}
+
+fn frame(image: &RgbImage) -> Frame {
+    Frame::clone_from_slice(image.as_raw(), image.width(), image.height())
+}
+
+fn capitalise(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 /// Box-filtered downscale of the scan, filled in as lines arrive. Blocks may split lines.
@@ -334,6 +418,7 @@ impl Preview {
         self.row += 1;
     }
 
+    #[cfg(test)]
     fn into_image(self) -> image::RgbImage {
         let (w, h) = (self.frame.width(), self.frame.height());
         image::RgbImage::from_raw(w, h, self.frame.as_bytes().to_vec()).expect("preview buffer size")
@@ -374,18 +459,10 @@ mod tests {
         assert_eq!(image.get_pixel(0, 0).0, [9, 9, 9]);
         assert_eq!(image.get_pixel(0, 3).0, [UNSCANNED.r, UNSCANNED.g, UNSCANNED.b]);
     }
-
-    #[test]
-    fn next_free_path_follows_the_highest_number() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(next_free_path(dir.path()).unwrap(), dir.path().join("scan-0001.png"));
-        fs::write(dir.path().join("scan-0007.png"), b"").unwrap();
-        fs::write(dir.path().join("scan-0002.png.part"), b"").unwrap();
-        assert_eq!(next_free_path(dir.path()).unwrap(), dir.path().join("scan-0008.png"));
-    }
 }
 
-/// Scans the real bed once at 75 dpi through the same path the panel uses.
+/// Scans the real bed once at 75 dpi through the same path the panel uses; put a photo or
+/// two on the glass (white mat in the lid) to see them cut out.
 /// Needs a connected V850: `V850_OUT=/tmp/x cargo test --release -- --ignored --nocapture v850_hardware_scan`
 #[cfg(test)]
 mod hardware {
@@ -405,6 +482,8 @@ mod hardware {
                 DeviceEvent::Status(s) => format!("status {s}"),
                 DeviceEvent::Started => "started".into(),
                 DeviceEvent::Captured(n) => format!("captured {n}"),
+                DeviceEvent::Saved(f) => format!("saved {}x{}", f.width(), f.height()),
+                DeviceEvent::AltAction(label, enabled) => format!("alt {label} {enabled}"),
                 DeviceEvent::Finished => "finished".into(),
                 DeviceEvent::Error(e) => format!("error {e}"),
             };
@@ -422,13 +501,16 @@ mod hardware {
             thread::sleep(Duration::from_millis(100));
         }
         device.start_acquire(&out, sink);
-        while !has("captured 1") {
+        let done = || events.lock().unwrap().iter().skip_while(|e| *e != "started").any(|e| e == "finished");
+        while !done() {
             assert!(Instant::now() < deadline && !has("error"), "scan failed: {:?}", events.lock().unwrap());
             thread::sleep(Duration::from_millis(200));
         }
         drop(device);
-        let saved = out.join("scan-0001.png");
-        let image = image::open(&saved).expect("saved PNG decodes");
-        eprintln!("saved {} {}x{}", saved.display(), image.width(), image.height());
+        for entry in fs::read_dir(&out).unwrap() {
+            let path = entry.unwrap().path();
+            let image = image::open(&path).expect("saved PNG decodes");
+            eprintln!("saved {} {}x{}", path.display(), image.width(), image.height());
+        }
     }
 }

@@ -7,6 +7,7 @@ export global AcquireBridge {
     in property <string> output-dir;
     callback rescan();
     callback start(int);   // device row
+    callback start-alt(int);  // the device's secondary action, e.g. "Scan backs"
     callback stop(int);
     callback start-all();
 }
@@ -42,9 +43,40 @@ component StatusPill inherits Rectangle {
     }
 }
 
+// The device's last few saved captures, newest first; empty slots keep the strip steady.
+component RecentStrip inherits HorizontalLayout {
+    in property <[image]> thumbs;
+    property <int> slots: 5;
+
+    height: 56px;
+    spacing: 6px;
+
+    for thumb in root.thumbs: Rectangle {
+        horizontal-stretch: 1;
+        min-width: 0;
+        background: Theme.well;
+        border-radius: 4px;
+        clip: true;
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: thumb;
+            image-fit: contain;
+        }
+    }
+    for i in Math.max(0, root.slots - root.thumbs.length): Rectangle {
+        horizontal-stretch: 1;
+        min-width: 0;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: Theme.border;
+    }
+}
+
 component DevicePanel inherits Rectangle {
     in property <DeviceTile> device;
     callback start();
+    callback start-alt();
     callback stop();
 
     property <bool> busy: device.state == DeviceState.acquiring;
@@ -99,6 +131,8 @@ component DevicePanel inherits Rectangle {
             }
         }
 
+        RecentStrip { thumbs: root.device.recent; }
+
         HorizontalLayout {
             spacing: 8px;
             Text {
@@ -107,6 +141,11 @@ component DevicePanel inherits Rectangle {
                 text: root.device.detail;
                 color: Theme.text-muted;
                 overflow: elide;
+            }
+            if root.device.alt-action != "": Button {
+                text: root.device.alt-action;
+                enabled: !root.busy && root.device.alt-enabled && root.device.state != DeviceState.error;
+                clicked => { root.start-alt(); }
             }
             Button {
                 text: root.busy ? "Stop" : root.device.is-video ? "Record" : "Scan";
@@ -169,6 +208,7 @@ export component AcquirePage inherits Rectangle {
                 y: Math.floor(i / root.cols) * (self.height + root.gap);
                 device: device;
                 start => { AcquireBridge.start(i); }
+                start-alt => { AcquireBridge.start-alt(i); }
                 stop => { AcquireBridge.stop(i); }
             }
 

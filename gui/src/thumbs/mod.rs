@@ -29,7 +29,7 @@ pub mod sched;
 mod writer;
 
 #[allow(unused_imports)] // used by capture backends
-pub use decode::{decode_preview, write_tiff_with_reduced_page};
+pub use decode::{decode_preview, fit, write_tiff_with_reduced_page};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -417,6 +417,19 @@ fn pixels(image: &RgbImage) -> Pixels {
 pub fn store_for_new_file(path: &Path, image: &DynamicImage) -> bool {
     let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
     disk.is_some_and(|disk| store_in(&disk, path, image))
+}
+
+/// A small-tier thumbnail of the image at `path`, for a capture backend's strip of recent
+/// captures: from the disk cache when it's there, else decoded (and not stored).
+pub fn small_for_file(path: &Path) -> Option<RgbImage> {
+    let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
+    if let (Some(fingerprint), Some(disk)) = (Fingerprint::of(path), &disk) {
+        let mut loader = Loader::new(Some(disk), Arc::new(Mutex::new(Lru::new(1 << 20))));
+        if let Some((image, _)) = loader.cached(fingerprint, Tier::Small) {
+            return Some(image);
+        }
+    }
+    decode::decode(path, MediaKind::Image, Tier::Small.edge())
 }
 
 fn store_in(disk: &DiskCache, path: &Path, image: &DynamicImage) -> bool {

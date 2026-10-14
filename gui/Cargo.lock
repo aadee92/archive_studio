@@ -238,6 +238,7 @@ dependencies = [
  "jpeg-decoder",
  "libc",
  "nusb",
+ "photo-duplex",
  "png",
  "rusqlite",
  "slint",
@@ -3419,6 +3420,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "photo-duplex"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "x980",
 ]
 
 [[package]]
