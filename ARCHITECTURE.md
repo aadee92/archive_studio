@@ -20,6 +20,7 @@ Archive Studio is a headless core with thin front ends.
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
+| `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings and clustering into people (lib; `examples/faces.rs` driver) |
 | `utils/orientation`, `utils/*.py`, `utils/*.sh` | | Standalone tools and scripts |
 
 The root `Cargo.toml` is a workspace of `core` and `gui` sharing one `Cargo.lock` and
