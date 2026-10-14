@@ -16,22 +16,25 @@ ARCHIVE_STUDIO_MOCK=ff680,vhs,reel,hi8 cargo run        # mixed scanners + video
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
 | `ui/review.slint` | Search, kind chips, sort, zoom slider, virtualized thumbnail grid |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
-| `src/acquire.rs` | `CaptureDevice` trait, discovery, coalesced preview delivery, mock devices |
+| `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
 | `src/review.rs` | Background indexer, `GridModel` (rows sliced on demand, incremental merges while indexing), filter thread, batched thumbnail delivery |
 | `src/thumbs/` | Viewport-ranked scheduler (`sched.rs`) → CPU workers (cache lookups, decodes) + I/O threads (source reads) → writer thread (`writer.rs`) → byte-budgeted LRU of `slint::Image` |
 
 ## Acquire
 
-Backends implement `CaptureDevice` (`name`, `kind`, `start_preview`, `start_acquire`, `stop`,
-optionally `start_alt` for a secondary action such as "Scan backs") and report through an
-`EventSink` from their own threads. Preview frames are coalesced per device (latest wins, one UI
-update in flight), so N devices at 30 fps can't flood the event loop. Each saved capture is
-reported with a small thumbnail (`DeviceEvent::Saved`); every panel shows its last five under
-the preview.
-Real backends to add in `acquire::discover()`: SANE/Epson SDK for FF-680W, V4L2 + ALSA for
-VHS/Hi8 analog capture and the Kodak Reels (UVC).
+The backends live in the `archive-core` crate (`../core/src/devices/`, see
+`../ARCHITECTURE.md`). They implement `CaptureDevice` (`name`, `kind`, `start_preview`,
+`start_acquire`, `stop`, optionally `start_alt` for a secondary action such as "Scan backs") and
+report through an `EventSink` from their own threads. Preview frames are coalesced per device
+(latest wins, one UI update in flight), so N devices at 30 fps can't flood the event loop. Each
+saved capture is reported with a small thumbnail and its in-memory image
+(`DeviceEvent::Saved`); the sink seeds the thumbnail cache from it on the backend's thread.
+Captures from earlier sessions arrive as `DeviceEvent::Recent(path)`. Every panel shows its last
+five under the preview.
+Real backends to add in `archive_core::devices::discover()`: SANE/Epson SDK for FF-680W, V4L2 +
+ALSA for VHS/Hi8 analog capture and the Kodak Reels (UVC).
 
-**Epson Perfection V850** (`src/acquire/v850.rs`, driver in `utils/epson/v850`, photo detection
+**Epson Perfection V850** (`core/src/devices/v850.rs`, driver in `utils/epson/v850`, photo detection
 in `utils/photo-duplex`): detected by USB id on launch/Rescan. It scans several photos at once
 against the white document mat (which must be in the lid). Scan, or one press of the scanner
 button, scans the whole bed (600 dpi; `ARCHIVE_STUDIO_V850_DPI` overrides) and saves each photo,
@@ -42,9 +45,9 @@ and is never saved; the recent strip and review grid show the cut-out photos, wh
 are seeded from memory. Stop cancels mid-scan; USB errors and unplugging reconnect automatically
 (the last batch of fronts is kept). While the GUI runs it holds the scanner exclusively (the
 standalone `x980` / `photo-duplex` CLIs and SANE can't use it). Hardware check:
-`V850_OUT=/tmp/x cargo test --release -- --ignored --nocapture v850_hardware_scan`.
+`V850_OUT=/tmp/x cargo test --release -p archive-core -- --ignored --nocapture v850_hardware_scan`.
 
-**DV / Digital8 camcorders over FireWire** (`src/acquire/dv.rs`; needs
+**DV / Digital8 camcorders over FireWire** (`core/src/devices/dv.rs`; needs
 `sudo apt install dvgrab libavc1394-tools`): the first AV/C unit in `/sys/bus/firewire/devices`
 is detected on launch/Rescan, and within ~2 s when switched on or plugged in later, without
 disturbing other devices. E.g. a Sony DCR-TRV240, which plays Hi8/Video8 tapes and digitizes
@@ -61,7 +64,7 @@ UI. The preview is decoded in Rust from the DC coefficients alone (90×60, no ff
 blank detection; the poster frame seeds the review thumbnail. Check that the camera's on-screen
 display goes to the LCD only: anything it draws on the video output is in the DV stream. Tests:
 `simulated::capture_hang_and_unplug` runs the controller against fake tools; with the camera
-attached, `cargo test --release -- --ignored --nocapture dv_hardware_stream`.
+attached, `cargo test --release -p archive-core -- --ignored --nocapture dv_hardware_stream`.
 `utils/dv-tape-capture.sh` is the same capture loop as a standalone script.
 
 ## Review performance
@@ -124,8 +127,8 @@ attached, `cargo test --release -- --ignored --nocapture dv_hardware_stream`.
   full decode of the source, which stores both tiers (+ average color). Keys hash (canonical path, size,
   mtime ns, tier), so edited files miss instead of showing stale thumbnails. An unusable
   database just disables the disk layer. The DB is never pruned yet.
-- Capture backends call `thumbs::store_for_new_file(path, &image)` after saving a scan, so
-  new scans are cached from the in-memory image without ever being decoded.
+- On each `DeviceEvent::Saved`, the acquire sink calls `thumbs::store_for_new_file(path, &image)`
+  with the backend's in-memory image, so new scans are cached without ever being decoded.
 - Search matches pre-lowercased names.
 - UI-thread cost, before → after (`bench4_*` in `review.rs`; 200k = synthetic tree of sparse
   files on tmpfs, name sort unless noted; 32 cores):

@@ -2,7 +2,7 @@
 //! Hi8 / Video8 / Digital8 tapes. Analog tapes are digitized to DV by the camera itself;
 //! the DV stream it sends is saved bit for bit as `<out_dir>/tape-NNNN.dv`.
 //!
-//! Nothing here can stall the UI or another device, whatever the camera or bus does:
+//! Nothing here can stall the host or another device, whatever the camera or bus does:
 //! - `dvgrab` streams DV to a reader thread for as long as the panel is up. The reader
 //!   writes frames to the open tape file and turns every third one into a preview, so
 //!   recording starts and stops without restarting the stream.
@@ -10,7 +10,7 @@
 //!   over AV/C with short-lived `dvcont` processes, each killed if it hasn't answered
 //!   within [`AVC_TIMEOUT`]. A hung `dvgrab` is killed and restarted, and an unplugged
 //!   camera closes the open file and is picked up again when it returns.
-//! - Children get `PR_SET_PDEATHSIG`, so they die with the controller (or the GUI)
+//! - Children get `PR_SET_PDEATHSIG`, so they die with the controller (or the host process)
 //!   instead of holding the camera.
 //!
 //! Record rewinds to the start and captures the whole tape; Record from here captures
@@ -33,8 +33,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use image::{imageops, RgbImage};
 
-use super::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, Frame, RECENT};
-use crate::thumbs;
+use crate::device::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, RECENT};
+use crate::resize;
 
 const SYSFS: &str = "/sys/bus/firewire/devices";
 /// IEEE 1394 Trade Association unit specifier for AV/C devices.
@@ -65,6 +65,8 @@ const MAX_DURATION: Duration = Duration::from_secs(250 * 60);
 const POSTER_AFTER: Duration = Duration::from_secs(10);
 const PREVIEW_EVERY: u64 = 3;
 const PREVIEW_SIZE: (u32, u32) = (320, 240);
+/// Longest edge of the thumbnail sent with each saved tape.
+const THUMB_EDGE: u32 = 192;
 const FLUSH_EVERY: u64 = 30;
 
 const RECORD_FROM_HERE: &str = "Record from here";
@@ -122,7 +124,7 @@ const NO_REQUEST: u8 = 0;
 const WHOLE_TAPE: u8 = 1;
 const FROM_HERE: u8 = 2;
 
-/// Flags shared between the UI-side handle and the controller thread.
+/// Flags shared between the host-side handle and the controller thread.
 struct Control {
     alive: AtomicBool,
     request: AtomicU8,
@@ -559,10 +561,9 @@ impl<'a> Controller<'a> {
             (self.sink)(DeviceEvent::Captured(self.captured));
             if let Some(poster) = rec.poster.take().or(fallback) {
                 let poster = imageops::resize(&poster, PREVIEW_SIZE.0, PREVIEW_SIZE.1, imageops::FilterType::Triangle);
-                if closed.is_ok() {
-                    thumbs::store_for_new_file(&rec.path, &image::DynamicImage::ImageRgb8(poster.clone()));
-                }
-                (self.sink)(DeviceEvent::Saved(frame(&thumbs::fit(&poster, thumbs::Tier::Small.edge()))));
+                let thumb = resize::fit(&poster, THUMB_EDGE);
+                let image = closed.is_ok().then(|| Arc::new(poster));
+                (self.sink)(DeviceEvent::Saved { path: rec.path.clone(), thumb, image });
             }
             let error = rec.error.as_ref().map(ToString::to_string).or(closed.err().map(|e| e.to_string()));
             self.last_result = Some(format!(
@@ -752,7 +753,7 @@ fn read_frames(mut out: ChildStdout, tap: &Mutex<Tap>, sink: &EventSink) {
         drop(tap);
         if let Some(picture) = picture {
             let preview = imageops::resize(&picture.image, PREVIEW_SIZE.0, PREVIEW_SIZE.1, imageops::FilterType::Triangle);
-            sink(DeviceEvent::Preview(frame(&preview)));
+            sink(DeviceEvent::Preview(preview));
         }
     }
 }
@@ -769,7 +770,7 @@ fn next_tape(dir: &Path) -> PathBuf {
     dir.join(format!("tape-{next:04}.dv"))
 }
 
-/// Shows the posters of the last few tapes already in `dir`.
+/// Reports the last few tapes already in `dir` as recent captures, oldest first.
 fn show_recent(dir: &Path, sink: &EventSink) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     let mut tapes: Vec<(SystemTime, PathBuf)> = entries
@@ -778,15 +779,9 @@ fn show_recent(dir: &Path, sink: &EventSink) {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     tapes.sort();
-    for (_, path) in tapes.iter().rev().take(RECENT).rev() {
-        if let Some(image) = thumbs::small_for_file(path) {
-            sink(DeviceEvent::Saved(frame(&image)));
-        }
+    for (_, path) in tapes.into_iter().rev().take(RECENT).rev() {
+        sink(DeviceEvent::Recent(path));
     }
-}
-
-fn frame(image: &RgbImage) -> Frame {
-    Frame::clone_from_slice(image.as_raw(), image.width(), image.height())
 }
 
 
@@ -1105,7 +1100,7 @@ mod tests {
 }
 
 /// The real controller against fake `dvgrab` / `dvcont` scripts and a fake sysfs: a
-/// whole-tape capture, a camera that stops answering, and an unplug mid-recording. The UI
+/// whole-tape capture, a camera that stops answering, and an unplug mid-recording. The host
 /// side (`start_*`, `stop`, drop) must return at once throughout.
 #[cfg(test)]
 mod simulated {
@@ -1171,7 +1166,7 @@ while cat "$d/frame.dv"; do sleep 0.03; done
                     DeviceEvent::Status(s) => format!("status {s}"),
                     DeviceEvent::Error(e) => format!("error {e}"),
                     DeviceEvent::Started => "started".into(),
-                    DeviceEvent::Saved(_) => "saved".into(),
+                    DeviceEvent::Saved { .. } => "saved".into(),
                     DeviceEvent::Finished => "finished".into(),
                     _ => return,
                 };
@@ -1200,7 +1195,7 @@ while cat "$d/frame.dv"; do sleep 0.03; done
         }
     }
 
-    /// Runs a UI-side call and checks it didn't block.
+    /// Runs a host-side call and checks it didn't block.
     fn quick(what: &str, f: impl FnOnce()) {
         let started = Instant::now();
         f();

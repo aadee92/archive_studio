@@ -230,22 +230,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "archive-studio-gui"
+name = "archive-core"
 version = "0.1.0"
 dependencies = [
  "fast_image_resize",
  "image",
- "jpeg-decoder",
  "libc",
  "nusb",
  "photo-duplex",
+ "tempfile",
+ "x980",
+]
+
+[[package]]
+name = "archive-studio-gui"
+version = "0.1.0"
+dependencies = [
+ "archive-core",
+ "fast_image_resize",
+ "image",
+ "jpeg-decoder",
+ "libc",
  "png",
  "rusqlite",
  "slint",
  "slint-build",
  "tempfile",
  "tiff",
- "x980",
 ]
 
 [[package]]

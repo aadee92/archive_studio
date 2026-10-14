@@ -7,8 +7,8 @@
 //! photos of that batch that were flipped over in place with their fronts,
 //! `photo-NNNN-back.png`. The whole bed is shown only as the live preview, built from the
 //! image blocks as they stream in; it is held in memory for the cut-out (~110 MB at
-//! 600 dpi) but never saved. Each saved photo seeds the review thumbnail cache and is
-//! reported as a recent capture.
+//! 600 dpi) but never saved. Each saved photo is reported with its full image, so the
+//! host can seed its thumbnails from memory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,15 +17,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use image::RgbImage;
+use image::{Rgb as Pixel, RgbImage};
 use nusb::MaybeFuture;
 use photo_duplex::detect::{DETECT_DPI, Rgb};
 use photo_duplex::session::{Duplex, Event};
-use slint::Rgb8Pixel;
 use x980::{ScanParams, Scanner};
 
-use super::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, Frame, RECENT};
-use crate::thumbs;
+use crate::device::{CaptureDevice, DeviceEvent, DeviceKind, EventSink, Frame, RECENT};
+use crate::resize;
 
 const DEFAULT_DPI: u32 = 600;
 const PREVIEW_WIDTH: u32 = 640;
@@ -37,8 +36,10 @@ const DOUBLE_PRESS_WINDOW: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(300);
 /// Matches `Theme.well`, so the unscanned part of the preview blends with the panel.
-const UNSCANNED: Rgb8Pixel = Rgb8Pixel::new(238, 240, 243);
+const UNSCANNED: Pixel<u8> = Pixel([238, 240, 243]);
 const SCAN_BACKS: &str = "Scan backs";
+/// Longest edge of the thumbnail sent with each saved photo.
+const THUMB_EDGE: u32 = 192;
 
 /// True if a V850 is plugged in. Only lists USB devices; doesn't open or claim it.
 pub fn present() -> bool {
@@ -47,7 +48,7 @@ pub fn present() -> bool {
     })
 }
 
-/// Flags shared between the UI-side handle and the scanner thread.
+/// Flags shared between the host-side handle and the scanner thread.
 struct Control {
     alive: AtomicBool,
     start: AtomicBool,
@@ -302,9 +303,8 @@ fn save_photos(
             *captured += 1;
             sink(DeviceEvent::Captured(*captured));
             let Some(full) = RgbImage::from_raw(image.width, image.height, image.data.clone()) else { return };
-            let large = thumbs::fit(&full, thumbs::Tier::Large.edge());
-            thumbs::store_for_new_file(path, &image::DynamicImage::ImageRgb8(large.clone()));
-            sink(DeviceEvent::Saved(frame(&thumbs::fit(&large, thumbs::Tier::Small.edge()))));
+            let thumb = resize::fit(&full, THUMB_EDGE);
+            sink(DeviceEvent::Saved { path: path.to_path_buf(), thumb, image: Some(Arc::new(full)) });
         }
     })?;
     let mut status = capitalise(&summary);
@@ -314,7 +314,7 @@ fn save_photos(
     Ok(status)
 }
 
-/// Shows the last few photos already in `out_dir`, newest last, as recent captures.
+/// Reports the last few photos already in `out_dir` as recent captures, oldest first.
 fn show_recent(out_dir: &Path, sink: &EventSink) {
     let Ok(entries) = fs::read_dir(out_dir) else { return };
     let mut photos: Vec<(SystemTime, PathBuf)> = entries
@@ -328,15 +328,9 @@ fn show_recent(out_dir: &Path, sink: &EventSink) {
         })
         .collect();
     photos.sort();
-    for (_, path) in photos.iter().rev().take(RECENT).rev() {
-        if let Some(image) = thumbs::small_for_file(path) {
-            sink(DeviceEvent::Saved(frame(&image)));
-        }
+    for (_, path) in photos.into_iter().rev().take(RECENT).rev() {
+        sink(DeviceEvent::Recent(path));
     }
-}
-
-fn frame(image: &RgbImage) -> Frame {
-    Frame::clone_from_slice(image.as_raw(), image.width(), image.height())
 }
 
 fn capitalise(s: &str) -> String {
@@ -361,10 +355,8 @@ impl Preview {
     fn new(width: u32, height: u32) -> Self {
         let step = width.div_ceil(PREVIEW_WIDTH).max(1);
         let (w, h) = ((width / step).max(1), (height / step).max(1));
-        let mut frame = Frame::new(w, h);
-        frame.make_mut_slice().fill(UNSCANNED);
         Self {
-            frame,
+            frame: Frame::from_pixel(w, h, UNSCANNED),
             step: step as usize,
             line_bytes: width as usize * 3,
             carry: Vec::new(),
@@ -393,7 +385,7 @@ impl Preview {
     }
 
     fn add_line(&mut self, line: &[u8]) {
-        let (w, step) = (self.frame.width() as usize, self.step);
+        let step = self.step;
         if self.row >= self.frame.height() as usize {
             return;
         }
@@ -409,19 +401,13 @@ impl Preview {
             return;
         }
         let n = (step * step) as u32;
-        let row = &mut self.frame.make_mut_slice()[self.row * w..(self.row + 1) * w];
-        for (px, sum) in row.iter_mut().zip(self.sums.chunks_exact(3)) {
-            *px = Rgb8Pixel::new((sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8);
+        for (x, sum) in self.sums.chunks_exact(3).enumerate() {
+            let px = Pixel([(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8]);
+            self.frame.put_pixel(x as u32, self.row as u32, px);
         }
         self.sums.fill(0);
         self.lines_in_row = 0;
         self.row += 1;
-    }
-
-    #[cfg(test)]
-    fn into_image(self) -> image::RgbImage {
-        let (w, h) = (self.frame.width(), self.frame.height());
-        image::RgbImage::from_raw(w, h, self.frame.as_bytes().to_vec()).expect("preview buffer size")
     }
 }
 
@@ -444,7 +430,7 @@ mod tests {
         for block in scan.chunks(7001) {
             preview.feed(block);
         }
-        let image = preview.into_image();
+        let image = preview.frame;
         assert_eq!(image.dimensions(), (500, 3));
         for (y, expected_g) in [(0, 15), (1, 55), (2, 95)] {
             assert_eq!(image.get_pixel(123, y).0, [150, expected_g, 7]);
@@ -455,9 +441,9 @@ mod tests {
     fn preview_shows_unscanned_rows_until_they_arrive() {
         let mut preview = Preview::new(640, 4);
         preview.feed(&vec![9u8; 640 * 3]);
-        let image = preview.into_image();
+        let image = preview.frame;
         assert_eq!(image.get_pixel(0, 0).0, [9, 9, 9]);
-        assert_eq!(image.get_pixel(0, 3).0, [UNSCANNED.r, UNSCANNED.g, UNSCANNED.b]);
+        assert_eq!(*image.get_pixel(0, 3), UNSCANNED);
     }
 }
 
@@ -482,7 +468,8 @@ mod hardware {
                 DeviceEvent::Status(s) => format!("status {s}"),
                 DeviceEvent::Started => "started".into(),
                 DeviceEvent::Captured(n) => format!("captured {n}"),
-                DeviceEvent::Saved(f) => format!("saved {}x{}", f.width(), f.height()),
+                DeviceEvent::Saved { path, thumb, .. } => format!("saved {} {}x{}", path.display(), thumb.width(), thumb.height()),
+                DeviceEvent::Recent(path) => format!("recent {}", path.display()),
                 DeviceEvent::AltAction(label, enabled) => format!("alt {label} {enabled}"),
                 DeviceEvent::Finished => "finished".into(),
                 DeviceEvent::Error(e) => format!("error {e}"),

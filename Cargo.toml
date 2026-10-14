@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["gui", "core"]
+# Standalone tools with their own lockfiles; `core` uses them as path dependencies.
+exclude = ["utils"]
