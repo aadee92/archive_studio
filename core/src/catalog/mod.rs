@@ -21,6 +21,7 @@
 
 pub mod faces;
 pub mod query;
+pub mod runs;
 pub mod xmp;
 
 use std::fmt;
@@ -29,8 +30,8 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// 1: assets and tags. 2: faces.
-const SCHEMA_VERSION: i32 = 2;
+/// 1: assets and tags. 2: faces. 3: file states and pipeline runs.
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE assets (
@@ -235,9 +236,28 @@ impl Catalog {
         Self::init(Connection::open(db)?, root)
     }
 
+    /// Switches the database to WAL (a no-op once it is). Switching a new database fails
+    /// at once, without the busy handler, while another connection is opening it too (a
+    /// host opens several when it opens a new library), so retry for as long as the busy
+    /// timeout would wait.
+    fn use_wal(conn: &Connection) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0)) {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     fn init(mut conn: Connection, root: &Path) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        Self::use_wal(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         // Broad searches probe each asset's tags in path order, i.e. all over the table: keep
@@ -251,7 +271,7 @@ impl Catalog {
         if version > SCHEMA_VERSION {
             return Err(Error::NewerSchema(version));
         }
-        for (added_in, schema) in [(1, SCHEMA), (2, faces::SCHEMA)] {
+        for (added_in, schema) in [(1, SCHEMA), (2, faces::SCHEMA), (3, runs::SCHEMA)] {
             if version < added_in {
                 tx.execute_batch(schema)?;
             }

@@ -78,5 +78,17 @@ export component Sidebar inherits Rectangle {
             active: root.active == 1;
             clicked => { root.navigate(1); }
         }
+        NavButton {
+            icon: @image-url("icons/people.svg");
+            label: "People";
+            active: root.active == 2;
+            clicked => { root.navigate(2); }
+        }
+        NavButton {
+            icon: @image-url("icons/details.svg");
+            label: "Details";
+            active: root.active == 3;
+            clicked => { root.navigate(3); }
+        }
     }
 }

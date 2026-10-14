@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Archive Studio
+Comment=Acquire and review archive media
+Exec=archive-studio
+Icon=archive-studio
+StartupWMClass=archive-studio
+Terminal=false
+Categories=Graphics;Photography;

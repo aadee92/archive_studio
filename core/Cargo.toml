@@ -11,8 +11,11 @@ fast_image_resize = { version = "6.1.0", features = ["image"] }
 faces = { path = "../utils/faces" }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 libc = "0.2"
+notify = "8.2.0"
 nusb = "0.2.7"
+orientation = { path = "../utils/orientation" }
 photo-duplex = { path = "../utils/photo-duplex" }
+png = "0.18.1"
 quick-xml = "0.41.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 x980 = { version = "0.1.0", path = "../utils/epson/v850" }

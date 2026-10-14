@@ -59,6 +59,8 @@ impl Duplex {
     /// Saves the photos on `bed`, a whole-bed scan at `dpi`. `grid` is the bed's size at
     /// `DETECT_DPI` (`Identity::flatbed_at`). With `backs`, they are saved as the backs of
     /// the last batch of fronts; without, or if there is no such batch, as new fronts.
+    /// Every photo is written under its final name and reported before this returns; a
+    /// batch of fronts is only remembered for pairing, never held back for a back scan.
     /// Returns how many photos were saved.
     pub fn process(
         &mut self,
@@ -218,4 +220,163 @@ pub fn save_png(path: &Path, img: &Rgb, dpi: u32) -> Result<()> {
     writer.finish()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Full-resolution test scans, twice the detection grid.
+    const DPI: u32 = 2 * DETECT_DPI;
+    /// The bed's size at `DETECT_DPI`, like a V850's (8.5 x 11.7 in).
+    const GRID: (u32, u32) = (425, 585);
+
+    /// An empty directory of its own for each test.
+    fn scratch(name: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("photo-duplex-{}-{n}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The bare white mat at `DPI`.
+    fn mat() -> Rgb {
+        let (w, h) = (GRID.0 * DPI / DETECT_DPI, GRID.1 * DPI / DETECT_DPI);
+        Rgb { width: w, height: h, data: vec![255; (w * h * 3) as usize] }
+    }
+
+    fn fill(bed: &mut Rgb, r: Rect, mut colour: impl FnMut(u32, u32) -> [u8; 3]) {
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                let i = (y * bed.width + x) as usize * 3;
+                bed.data[i..i + 3].copy_from_slice(&colour(x, y));
+            }
+        }
+    }
+
+    /// A photo's face (at `DPI`): a faint outline, a thin white border, a busy picture.
+    fn front(bed: &mut Rgb, r: Rect) {
+        fill(bed, r, |x, y| {
+            let edge = x == r.x || y == r.y || x == r.x + r.w - 1 || y == r.y + r.h - 1;
+            let border = x < r.x + 8 || y < r.y + 8 || x >= r.x + r.w - 8 || y >= r.y + r.h - 8;
+            if edge {
+                [190, 190, 190]
+            } else if border {
+                [252, 252, 250]
+            } else {
+                [(x * 7 % 200) as u8, 90, (y * 3 % 200) as u8]
+            }
+        });
+    }
+
+    /// A photo's plain paper back.
+    fn back(bed: &mut Rgb, r: Rect) {
+        fill(bed, r, |_, _| [236, 234, 228]);
+    }
+
+    /// Two photos side by side, then one below them (in `DPI` pixels).
+    const SPOTS: [Rect; 3] = [
+        Rect { x: 60, y: 60, w: 300, h: 200 },
+        Rect { x: 460, y: 60, w: 300, h: 200 },
+        Rect { x: 60, y: 400, w: 200, h: 300 },
+    ];
+
+    /// Runs `process`, returning the names of the files reported as saved.
+    fn scan(duplex: &mut Duplex, bed: &Rgb, backs: bool) -> Vec<String> {
+        let mut saved = Vec::new();
+        let n = duplex
+            .process(bed, DPI, GRID, backs, &mut |event| {
+                if let Event::Saved { path, image } = event {
+                    assert!(path.is_file(), "{} reported before it was written", path.display());
+                    assert!(image.width > 0 && image.height > 0);
+                    saved.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            })
+            .unwrap();
+        assert_eq!(n, saved.len());
+        saved
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_lone_front_scan_is_saved_and_reported_at_once() {
+        let dir = scratch("lone");
+        let mut bed = mat();
+        front(&mut bed, SPOTS[0]);
+        front(&mut bed, SPOTS[1]);
+        let mut duplex = Duplex::new(dir.clone());
+
+        let saved = scan(&mut duplex, &bed, false);
+        // No back scan, no further scan: the fronts are already on disk under their final
+        // names, as if the app quit right here.
+        assert_eq!(saved, ["photo-0001-front.png", "photo-0002-front.png"]);
+        assert_eq!(files(&dir), saved);
+        let decoder = png::Decoder::new(std::io::BufReader::new(File::open(dir.join(&saved[0])).unwrap()));
+        let info = decoder.read_info().unwrap();
+        assert!(info.info().width < bed.width / 2, "cut out, not the whole bed");
+        assert_eq!(duplex.pending_numbers().as_deref(), Some("photos 0001-0002"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_later_back_scan_pairs_with_the_saved_fronts() {
+        let dir = scratch("backs");
+        let mut bed = mat();
+        for spot in SPOTS {
+            front(&mut bed, spot);
+        }
+        let mut duplex = Duplex::new(dir.clone());
+        assert_eq!(scan(&mut duplex, &bed, false).len(), 3);
+
+        // The first and last were flipped over in place, the middle one left face down.
+        let mut flipped = mat();
+        back(&mut flipped, SPOTS[0]);
+        front(&mut flipped, SPOTS[1]);
+        back(&mut flipped, SPOTS[2]);
+        let mut saved = scan(&mut duplex, &flipped, true);
+        saved.sort();
+        assert_eq!(saved, ["photo-0001-back.png", "photo-0003-back.png"]);
+        assert!(!duplex.has_pending(), "the batch is done");
+        assert_eq!(files(&dir).len(), 5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn single_sided_batches_number_on() {
+        let dir = scratch("batches");
+        let mut duplex = Duplex::new(dir.clone());
+        let mut first = mat();
+        front(&mut first, SPOTS[0]);
+        front(&mut first, SPOTS[2]);
+        assert_eq!(scan(&mut duplex, &first, false), ["photo-0001-front.png", "photo-0002-front.png"]);
+
+        let mut second = mat();
+        front(&mut second, SPOTS[1]);
+        assert_eq!(scan(&mut duplex, &second, false), ["photo-0003-front.png"]);
+        // Backs go with the most recent batch only.
+        assert_eq!(duplex.pending_numbers().as_deref(), Some("photo 0003"));
+
+        // A new session (app restarted) carries on from the files on disk.
+        let mut duplex = Duplex::new(dir.clone());
+        assert_eq!(scan(&mut duplex, &first, false), ["photo-0004-front.png", "photo-0005-front.png"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_back_scan_without_fronts_saves_fronts() {
+        let dir = scratch("nofronts");
+        let mut bed = mat();
+        front(&mut bed, SPOTS[0]);
+        assert_eq!(scan(&mut Duplex::new(dir.clone()), &bed, true), ["photo-0001-front.png"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -2,8 +2,12 @@
 //!
 //! ```text
 //! beach dog              both tags (terms separated by spaces are ANDed)
+//! beach AND dog          explicit AND
+//! (beach and dog)        grouping with parentheses
 //! beach OR lake          either (AND binds tighter: `a b OR c` is `(a b) OR c`)
+//! beach or lake          case-insensitive operators (and, or, not)
 //! beach -dog             beach, without dog
+//! beach NOT dog          negation
 //! (beach OR lake) -dog   grouping
 //! "birthday party"       quotes for spaces
 //! person:alice           only tags of that kind (keyword, scene, object, person, place, event)
@@ -11,7 +15,7 @@
 //! -*                     untagged
 //! ```
 //!
-//! `OR` is an operator only in capitals; quote it (`"OR"`) to search for a tag of that name.
+//! Quote operators (`"OR"`, `"AND"`, `"NOT"`) to search for a tag of that name.
 //!
 //! A term matches a tag if it is one or more consecutive segments of the tag's path,
 //! ignoring ASCII case: `alice`, `family`, `family|alice` and `people|family|alice` all
@@ -76,6 +80,7 @@ fn tag_matches(tag_path: &str, tag_kind: Option<TagKind>, term_kind: Option<TagK
 enum Token {
     Open,
     Close,
+    And,
     Or,
     Not,
     Term { kind: Option<TagKind>, text: String },
@@ -86,7 +91,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
     let mut chars = s.chars().peekable();
     while let Some(&c) = chars.peek() {
         match c {
-            c if c.is_whitespace() => {
+            c if c.is_whitespace() || c == ',' || c == ';' => {
                 chars.next();
             }
             '(' => {
@@ -97,14 +102,21 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 chars.next();
                 tokens.push(Token::Close);
             }
-            '-' => {
+            '-' | '!' => {
                 chars.next();
                 tokens.push(Token::Not);
+            }
+            '&' => {
+                chars.next();
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+                tokens.push(Token::And);
             }
             _ => {
                 let mut word = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || matches!(c, '(' | ')' | '"') {
+                    if c.is_whitespace() || matches!(c, '(' | ')' | '"' | ',' | ';' | '&' | '!') {
                         break;
                     }
                     word.push(c);
@@ -131,8 +143,12 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         }
                     }
                     tokens.push(Token::Term { kind, text });
-                } else if word == "OR" {
+                } else if kind.is_none() && (word == "OR" || word == "||") {
                     tokens.push(Token::Or);
+                } else if kind.is_none() && (word.eq_ignore_ascii_case("AND") || word == "&&" || word == "&") {
+                    tokens.push(Token::And);
+                } else if kind.is_none() && (word == "NOT" || word == "not") {
+                    tokens.push(Token::Not);
                 } else if rest.is_empty() {
                     return Err(format!("{word:?} needs a tag after it"));
                 } else {
@@ -173,12 +189,22 @@ impl Parser {
 
     fn and(&mut self) -> Result<Expr, String> {
         let mut all = Vec::new();
-        while matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Term { .. })) {
-            all.push(self.unary()?);
+        loop {
+            if !all.is_empty() && self.tokens.next_if_eq(&Token::And).is_some() {
+                if !matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Term { .. })) {
+                    return Err("AND needs a term after it".into());
+                }
+            }
+            if matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Term { .. })) {
+                all.push(self.unary()?);
+            } else {
+                break;
+            }
         }
         match all.len() {
             0 => Err(match self.tokens.peek() {
                 Some(Token::Or) => "OR needs a term on each side".into(),
+                Some(Token::And) => "AND needs a term before it".into(),
                 Some(Token::Close) => "empty or unmatched ')'".into(),
                 _ => "missing term".into(),
             }),
@@ -189,7 +215,7 @@ impl Parser {
 
     fn unary(&mut self) -> Result<Expr, String> {
         match self.tokens.next() {
-            Some(Token::Not) => Ok(Expr::Not(Box::new(self.unary().map_err(|_| "'-' needs a term after it".to_owned())?))),
+            Some(Token::Not) => Ok(Expr::Not(Box::new(self.unary().map_err(|_| "negation needs a term after it".to_owned())?))),
             Some(Token::Open) => {
                 let inner = self.or()?;
                 match self.tokens.next() {

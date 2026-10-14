@@ -8,17 +8,64 @@ ARCHIVE_STUDIO_MOCK=ff680,ff680,ff680,ff680 cargo run   # 4 simulated FF-680s �
 ARCHIVE_STUDIO_MOCK=ff680,vhs,reel,hi8 cargo run        # mixed scanners + video
 ```
 
+Launcher icon (GNOME and other freedesktop desktops; the window matches it via the
+`archive-studio` app id):
+
+```sh
+install -Dm644 data/archive-studio.desktop ~/.local/share/applications/archive-studio.desktop
+install -Dm644 ui/icons/app.svg ~/.local/share/icons/hicolor/scalable/apps/archive-studio.svg
+```
+
+`Exec=archive-studio` expects the binary on `PATH`; edit it to an absolute path otherwise.
+
 ## Layout
 
 | Path | Role |
 |---|---|
 | `ui/app.slint` | Window: sidebar + page host (pages stay alive when hidden) |
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
-| `ui/review.slint` | Search, kind chips, sort, zoom slider, virtualized thumbnail grid |
+| `ui/review.slint` | Search, kind chips, sort, virtualized thumbnail grid, size slider in the bottom bar |
+| `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops |
+| `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review or a face in People. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes |
+| `ui/pipeline.slint` | `PipelineStatus`: the pipeline's status line with Pause / Resume (in Review's bottom bar) |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
 | `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
-| `src/review.rs` | Background indexer, `GridModel` (rows sliced on demand, incremental merges while indexing), filter thread, batched thumbnail delivery |
+| `src/people.rs` | Reads people and faces from the catalog on a worker; decodes crops for the rows on screen |
+| `src/details.rs` | Decodes the opened item off the UI thread (up to 4096 px), "Open externally"; asks the engine to rotate / accept / keep on a worker, reloads when the file is rotated |
+| `src/pipeline.rs` | Hosts the pipeline `Engine` while the window is open: relay thread (coalesced reports → review-grid updates, status counts), capture priority, status line |
+| `src/review.rs` | Background indexer, `GridModel` (rows sliced on demand, incremental merges while indexing and of pipeline updates), filter thread, batched thumbnail delivery |
 | `src/thumbs/` | Viewport-ranked scheduler (`sched.rs`) → CPU workers (cache lookups, decodes) + I/O threads (source reads) → writer thread (`writer.rs`) → byte-budgeted LRU of `slint::Image` |
+
+## Pipeline
+
+While the window is open it hosts the library's processing pipeline (`archive_core::pipeline`,
+see `../ARCHITECTURE.md`): the `Engine` is started for the root on launch (on a thread, with
+`Config::default()`) and dropped after the window closes. One engine per library: if another
+window or the `archive` shell already runs it, this one runs without and its status line says
+"Pipeline running in another window"; rotating is then unavailable here.
+
+- **Reports**: the engine's sink only forwards events to a relay thread, which takes each burst
+  in one go (~100 ms; thousands of `Updated` during a catch-up become one batch, one entry per
+  file), reads the files they name (stat, catalog tags), counts what is left
+  (`pipeline::status`: at most twice a second while busy, and once on idle) and posts one
+  event-loop callback per burst. Warnings and failures go to stderr and show in the status
+  line for a few seconds.
+- **Captures**: each `DeviceEvent::Saved` calls `engine.add(path)` (after the thumbnail is
+  seeded), so a new scan is processed at once instead of after the watcher's settle time, and
+  appears in Review even without an engine here. While any device is acquiring, the engine
+  runs in `Mode::Background` (one worker) so a real-time DV capture isn't starved; the status
+  line's Pause holds it entirely.
+- **Live refresh**: new files are merged into the Review grid in sort order; a changed file
+  (e.g. rotated) gets a new entry, so it is re-sorted and its thumbnail is made afresh (the
+  old entry is retired and its in-memory thumbnails dropped; the persistent cache layers are
+  keyed by size + mtime, so they miss by themselves); a deleted file leaves the grid. The
+  selection follows a replaced file. Reports that come in while the indexer is still walking
+  are applied when it finishes. The Details page reloads a file that was rotated; People
+  re-reads the catalog after the pipeline groups faces, if it is on screen.
+- **Rotations**: Details shows "Rotate 90°?" with Accept / Keep when orient left one for
+  review, and Rotate left / right for any image. The engine rewrites the file on its own
+  thread (about a second for a large scan), so these are asked from a worker; an error (e.g.
+  a format that can't be rotated losslessly yet) is shown under the picture.
 
 ## Acquire
 
@@ -38,11 +85,15 @@ ALSA for VHS/Hi8 analog capture and the Kodak Reels (UVC).
 in `utils/photo-duplex`): detected by USB id on launch/Rescan. It scans several photos at once
 against the white document mat (which must be in the lid). Scan, or one press of the scanner
 button, scans the whole bed (600 dpi; `ARCHIVE_STUDIO_V850_DPI` overrides) and saves each photo,
-straightened, as `<dir>/epson-v850/photo-NNNN-front.png`. Scan backs, or two presses about a
-second apart, scans again after the double-sided photos of that batch were flipped over in place
-and saves `photo-NNNN-back.png` beside each front. The whole bed appears only in the live preview
-and is never saved; the recent strip and review grid show the cut-out photos, whose thumbnails
-are seeded from memory. Stop cancels mid-scan; USB errors and unplugging reconnect automatically
+straightened, as `<dir>/epson-v850/photo-NNNN-front.png`, each reported (`Saved`) as soon as
+it is written: one-sided photos need nothing more, and the next batch numbers on. Scan backs, or
+two presses about a second apart, is optional: it scans again after the double-sided photos of
+the latest batch were flipped over in place and saves `photo-NNNN-back.png` beside each front.
+(When there are fronts to pair with, a single press waits those two seconds before scanning.)
+Closing the app (or Rescan) right after a scan waits for its photos to be saved. Run a release
+build: in a debug build the cut-out is ~20× slower (tens of seconds per batch instead of ~1 s).
+The whole bed appears only in the live preview and is never saved; the recent strip and review
+grid show the cut-out photos, whose thumbnails are seeded from memory. Stop cancels mid-scan; USB errors and unplugging reconnect automatically
 (the last batch of fronts is kept). While the GUI runs it holds the scanner exclusively (the
 standalone `x980` / `photo-duplex` CLIs and SANE can't use it). Hardware check:
 `V850_OUT=/tmp/x cargo test --release -p archive-core -- --ignored --nocapture v850_hardware_scan`.
@@ -158,6 +209,11 @@ Source decoding (`src/thumbs/decode.rs`, cache misses only) never builds more pi
 - `thumbs::decode_preview` returns a JPEG's embedded EXIF thumbnail (~160 px) from the
   metadata segments alone, for use as an instant placeholder.
 - Decoder panics on malformed files are caught; the file just gets no thumbnail.
+
+- Pipeline updates (`update_files`): a new file is merged like an indexer batch; a changed one
+  is appended as a new entry and the old id retired (`Index::gone`, left out of every filter
+  and removed from the shown order with `row_removed`, never `reset`). A path → id map
+  (64-bit path hashes computed on the indexer thread) finds the entry.
 
 Stubs: video/audio thumbnails, the in-app viewer
 (double-click currently hands off to `xdg-open`), real device backends, persistent index.

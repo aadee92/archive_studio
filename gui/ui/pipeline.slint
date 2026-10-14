@@ -1,0 +1,47 @@
+import { Theme } from "theme.slint";
+
+export global PipelineBridge {
+    // "Processing… orient 12 · faces 40 left", "All caught up", a recent warning, …
+    in property <string> text;
+    in property <bool> busy;
+    // The engine runs in this window (else another one has it, or it failed to start).
+    in property <bool> running;
+    in property <bool> paused;
+    // `text` is a warning or failure.
+    in property <bool> alert;
+
+    callback toggle-pause();
+}
+
+// The pipeline's standing in one line, with Pause / Resume.
+export component PipelineStatus inherits HorizontalLayout {
+    property <color> tone: PipelineBridge.alert ? Theme.danger
+        : PipelineBridge.busy ? Theme.accent
+        : PipelineBridge.running && !PipelineBridge.paused ? Theme.ok
+        : Theme.text-muted;
+
+    spacing: 6px;
+
+    VerticalLayout {
+        alignment: center;
+        Rectangle { width: 6px; height: 6px; border-radius: 3px; background: root.tone; }
+    }
+    Text {
+        vertical-alignment: center;
+        text: PipelineBridge.text;
+        color: PipelineBridge.alert ? Theme.danger : Theme.text-muted;
+        font-size: 12px;
+        overflow: elide;
+        min-width: 80px;
+    }
+    if PipelineBridge.running: Text {
+        vertical-alignment: center;
+        text: PipelineBridge.paused ? "Resume" : "Pause";
+        color: ta.has-hover ? Theme.accent : Theme.text-muted;
+        font-size: 12px;
+        ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { PipelineBridge.toggle-pause(); }
+        }
+    }
+}

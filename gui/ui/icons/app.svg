@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- The sidebar's "AS" badge: Theme.text tile, Theme.surface letters. -->
+  <rect width="64" height="64" rx="16" fill="#1f2328"/>
+  <g fill="none" stroke="#ffffff" stroke-width="4.2">
+    <path d="M17.4 41 L24 24.6 L30.6 41" stroke-linejoin="miter"/>
+    <path d="M20.2 35.2 H27.8"/>
+    <path d="M45.4 27.4 C44.4 25 42.4 24.6 40.2 24.6 C37.4 24.6 35.6 26 35.6 28.2 C35.6 33.4 45.6 30.8 45.6 36 C45.6 38.4 43.6 39.6 40.4 39.6 C38 39.6 36.2 38.8 35.2 37"/>
+  </g>
+</svg>

@@ -1,5 +1,6 @@
 import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { PipelineStatus } from "pipeline.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
 
 export global ReviewBridge {
@@ -9,13 +10,14 @@ export global ReviewBridge {
     in property <string> status-text;
     in property <bool> indexing;
     in property <bool> empty;
+    in property <[string]> available-tags;
     in-out property <length> tile-size: 160px;
 
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
     callback viewport-changed(int, int);
-    // query, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
-    callback filter-changed(string, int, int);
+    // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
+    callback filter-changed(string, string, int, int);
     callback select(int);
     callback open(int);
 }
@@ -120,6 +122,7 @@ component MediaCell inherits Rectangle {
 
 export component ReviewPage inherits Rectangle {
     property <int> kind-filter: 0;
+    property <string> selected-tag: "";
     property <length> gap: 14px;
     property <length> row-height: ReviewBridge.tile-size + 44px;
     property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (ReviewBridge.tile-size + root.gap)));
@@ -140,94 +143,255 @@ export component ReviewPage inherits Rectangle {
     changed last-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
 
     function apply() {
-        ReviewBridge.filter-changed(search.text, root.kind-filter, sort.current-index);
+        ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index);
+    }
+
+    function select-tag(tag: string) {
+        if (root.selected-tag == tag) {
+            root.selected-tag = "";
+            tag-search.text = "";
+        } else {
+            root.selected-tag = tag;
+            tag-search.text = tag;
+        }
+        root.apply();
+    }
+
+    function clear-tags() {
+        root.selected-tag = "";
+        tag-search.text = "";
+        root.apply();
     }
 
     background: Theme.bg;
 
-    VerticalLayout {
-        padding: 20px;
-        padding-bottom: 0px;
-        spacing: 14px;
-
-        HorizontalLayout {
-            spacing: 12px;
-            VerticalLayout {
-                horizontal-stretch: 1;
-                Text { text: "Review"; font-size: 20px; font-weight: 600; color: Theme.text; }
-                Text { text: ReviewBridge.root-path; color: Theme.text-muted; overflow: elide; }
-            }
-            VerticalLayout {
-                alignment: center;
-                search := LineEdit {
-                    width: 280px;
-                    placeholder-text: "Search by name…";
-                    edited => { root.apply(); }
-                }
-            }
-        }
-
-        HorizontalLayout {
-            spacing: 6px;
-            Chip { text: "All";    active: root.kind-filter == 0; clicked => { root.kind-filter = 0; root.apply(); } }
-            Chip { text: "Images"; active: root.kind-filter == 1; clicked => { root.kind-filter = 1; root.apply(); } }
-            Chip { text: "Video";  active: root.kind-filter == 2; clicked => { root.kind-filter = 2; root.apply(); } }
-            Chip { text: "Audio";  active: root.kind-filter == 3; clicked => { root.kind-filter = 3; root.apply(); } }
-            Rectangle { horizontal-stretch: 1; }
-            Text { text: "Sort"; color: Theme.text-muted; vertical-alignment: center; }
-            sort := ComboBox {
-                width: 150px;
-                model: ["Name", "Date modified", "Size", "Type"];
-                selected => { root.apply(); }
-            }
-            Rectangle { width: 12px; }
-            Text { text: "Size"; color: Theme.text-muted; vertical-alignment: center; }
-            Slider {
-                width: 120px;
-                minimum: 96;
-                maximum: 320;
-                value: 160;
-                changed(v) => { ReviewBridge.tile-size = v * 1px; }
-            }
-        }
-
+    HorizontalLayout {
+        // Full height left pane for Search & Filter (just to the right of the scan/review buttons)
         Rectangle {
-            vertical-stretch: 1;
-            background: Theme.surface;
-            border-radius: Theme.radius;
-            border-width: 1px;
-            border-color: Theme.border;
-            clip: true;
+            width: 240px;
+            background: Theme.sidebar;
 
-            // ListView only instantiates delegates for rows in the viewport, so the
-            // cost of scrolling is O(visible tiles), independent of library size.
-            list := ListView {
-                for row in ReviewBridge.rows: Rectangle {
-                    height: root.row-height;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 16px;
+
+                Text {
+                    text: "Search & Filter";
+                    font-size: 15px;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+
+                // 1. Search Bar (Moved here)
+                VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Search";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: Theme.text-muted;
+                    }
+                    search := LineEdit {
+                        placeholder-text: "Search name or tags…";
+                        edited => { root.apply(); }
+                    }
+                }
+
+                // 2. Filter Buttons (Moved here)
+                VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Media Type";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: Theme.text-muted;
+                    }
                     HorizontalLayout {
-                        padding-left: root.gap;
-                        padding-top: root.gap;
-                        spacing: root.gap;
+                        spacing: 6px;
                         alignment: start;
-                        for t in row.tiles: MediaCell { tile: t; size: ReviewBridge.tile-size; }
+                        Chip { text: "All";    active: root.kind-filter == 0; clicked => { root.kind-filter = 0; root.apply(); } }
+                        Chip { text: "Images"; active: root.kind-filter == 1; clicked => { root.kind-filter = 1; root.apply(); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Chip { text: "Video";  active: root.kind-filter == 2; clicked => { root.kind-filter = 2; root.apply(); } }
+                        Chip { text: "Audio";  active: root.kind-filter == 3; clicked => { root.kind-filter = 3; root.apply(); } }
+                    }
+                }
+
+                // 3. Tag Search & Filter (New)
+                VerticalLayout {
+                    vertical-stretch: 1;
+                    spacing: 8px;
+
+                    HorizontalLayout {
+                        Text {
+                            text: "Tags";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: Theme.text-muted;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if tag-search.text != "" || root.selected-tag != "": Text {
+                            text: "Clear";
+                            font-size: 11px;
+                            color: Theme.accent;
+                            vertical-alignment: center;
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.clear-tags(); }
+                            }
+                        }
+                    }
+
+                    tag-search := LineEdit {
+                        placeholder-text: "Filter tags (e.g. tag_a and tag_b)…";
+                        edited => {
+                            if (self.text != root.selected-tag) {
+                                root.selected-tag = "";
+                            }
+                            root.apply();
+                        }
+                    }
+
+                    // Available Tags List
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: Theme.surface;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+
+                        if ReviewBridge.available-tags.length == 0: Text {
+                            text: "No tags found";
+                            font-size: 12px;
+                            color: Theme.placeholder;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        ListView {
+                            for tag in ReviewBridge.available-tags: Rectangle {
+                                height: 28px;
+                                background: (root.selected-tag == tag || tag-search.text == tag)
+                                    ? Theme.accent-soft
+                                    : tag-ta.has-hover ? Theme.hover : transparent;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    alignment: start;
+                                    Text {
+                                        text: tag;
+                                        font-size: 12px;
+                                        color: (root.selected-tag == tag || tag-search.text == tag)
+                                            ? Theme.accent
+                                            : Theme.text;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                tag-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.select-tag(tag); }
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            if ReviewBridge.empty: Text {
-                text: ReviewBridge.indexing ? "Indexing…" : "No matching media";
-                color: Theme.text-muted;
-            }
         }
 
-        HorizontalLayout {
-            height: 34px;
-            Text {
-                vertical-alignment: center;
-                text: ReviewBridge.status-text;
-                color: Theme.text-muted;
-                font-size: 12px;
+        // 1px Border between Left Pane and Main Review
+        Rectangle {
+            width: 1px;
+            background: Theme.border;
+        }
+
+        // Main Review Pane
+        Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg;
+
+            VerticalLayout {
+                padding: 20px;
+                padding-bottom: 0px;
+                spacing: 14px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        Text { text: "Review"; font-size: 20px; font-weight: 600; color: Theme.text; }
+                        Text { text: ReviewBridge.root-path; color: Theme.text-muted; overflow: elide; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: center;
+                        Text { text: "Sort"; color: Theme.text-muted; vertical-alignment: center; }
+                        sort := ComboBox {
+                            width: 140px;
+                            model: ["Name", "Date modified", "Size", "Type"];
+                            selected => { root.apply(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.surface;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+
+                    list := ListView {
+                        for row in ReviewBridge.rows: Rectangle {
+                            height: root.row-height;
+                            HorizontalLayout {
+                                padding-left: root.gap;
+                                padding-top: root.gap;
+                                spacing: root.gap;
+                                alignment: start;
+                                for t in row.tiles: MediaCell { tile: t; size: ReviewBridge.tile-size; }
+                            }
+                        }
+                    }
+
+                    if ReviewBridge.empty: Text {
+                        text: ReviewBridge.indexing ? "Indexing…" : "No matching media";
+                        color: Theme.text-muted;
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        text: ReviewBridge.status-text;
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                    PipelineStatus { horizontal-stretch: 2; }
+                    Rectangle { width: 8px; }
+                    Text { text: "Size"; color: Theme.text-muted; font-size: 12px; vertical-alignment: center; }
+                    Slider {
+                        width: 110px;
+                        minimum: 96;
+                        maximum: 320;
+                        value: 160;
+                        changed(v) => { ReviewBridge.tile-size = v * 1px; }
+                    }
+                }
             }
         }
     }
 }
+

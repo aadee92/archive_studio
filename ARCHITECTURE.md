@@ -16,12 +16,14 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug` |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
 | `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings and clustering into people (lib; `examples/faces.rs` driver) |
-| `utils/orientation`, `utils/*.py`, `utils/*.sh` | | Standalone tools and scripts |
+| `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
+| `utils/*.py`, `utils/*.sh` | | Standalone scripts |
 
 The root `Cargo.toml` is a workspace of `core` and `gui` sharing one `Cargo.lock` and
 `target/`. `utils/` is excluded: each crate there builds on its own with its own lockfile and
@@ -46,3 +48,31 @@ is used by core as a path dependency.
 - **Files**: backends write captures themselves and report each with `Saved` once the file is
   closed. They know nothing about thumbnails or caches; `Saved` carries the in-memory image so
   a host can make its own without decoding the file.
+
+## Pipeline (`archive_core::pipeline`)
+
+What happens to a file once it is in the library: register → orient → faces, then, once
+the per-file stages are quiet, identify (suggestions and clusters) and XMP sidecar sync.
+
+- **Hosted, not a daemon**: a front end starts an `Engine` when it opens a library and drops
+  it on exit. The engine catches up with what changed on disk while nothing ran, then
+  watches the library (inotify) for as long as it lives. One engine per library: it holds
+  an `flock` on `.archive-studio/engine.lock`; a second front end runs without one.
+- **State is in the catalog**: each asset records its file's size and mtime; each stage's
+  run records the fingerprint and model version it ran on (`stage_runs`). A stage is due
+  when either no longer matches, so the engine can stop at any time, and a model upgrade or
+  a changed file redoes exactly what it affects. Failures aren't retried until the file
+  changes or the user asks.
+- **Orient rewrites the file**: a confident prediction (≥ 85%) turns the image itself,
+  losslessly (JPEG in the DCT domain like `jpegtran -trim`, PNG; TIFF goes to review), via
+  a hidden temporary renamed over the original, and turns the asset's face and tag regions
+  with it. The EXIF orientation is baked into the pixels and reset to 1, since predictions
+  and regions are relative to the displayed image. The engine records the new fingerprint
+  itself, so its own write doesn't look like a change.
+- **The user has the last word**: rotations the user chose or settled are never redone by
+  the model; reviewed faces survive rescans.
+- **Threads**: per-file stages run on a worker pool; one engine thread does all catalog
+  writes, scheduling and watching. Events go to the host's sink on the engine thread.
+- **Models**: `$ARCHIVE_STUDIO_MODELS`, else `~/.local/share/archive-studio/models`:
+  `orientation.onnx` and `buffalo_l/` (`det_10g.onnx`, `w600k_r50.onnx`). A stage whose
+  model is missing is skipped.

@@ -29,7 +29,7 @@ pub mod sched;
 mod writer;
 
 #[allow(unused_imports)] // used by capture backends
-pub use decode::{decode_preview, fit, write_tiff_with_reduced_page};
+pub use decode::{decode, decode_preview, fit, write_tiff_with_reduced_page};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -281,6 +281,19 @@ impl ThumbCache {
                 false
             }
         }
+    }
+
+    /// Forgets everything held for `id` (both tiers, preview, color, a failed decode), e.g.
+    /// because its file changed: the next [`schedule`](Self::schedule) of it loads it anew.
+    /// The persistent layers need no invalidation: they are keyed by the file's size and
+    /// mtime, so a rewritten file misses there.
+    pub fn invalidate(&self, id: u32) {
+        let mut images = self.images.borrow_mut();
+        images.remove(&(id, Tier::Small));
+        images.remove(&(id, Tier::Large));
+        self.previews.borrow_mut().remove(&id);
+        self.colors.borrow_mut().remove(&id);
+        self.failed.borrow_mut().remove(&id);
     }
 
     /// Stops the workers and gives the writer a moment to store what it has queued.
@@ -862,6 +875,44 @@ mod tests {
         };
         run(true);
         run(false); // second session: served from the disk cache, no source reads
+    }
+
+    /// A file that changed (e.g. was rotated) must not keep its old thumbnail anywhere.
+    #[test]
+    fn invalidated_thumbnail_is_loaded_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, src) = (dir.path().join("thumbs.sqlite"), dir.path().join("scan.png"));
+        image::RgbImage::from_pixel(900, 600, image::Rgb([200, 0, 0])).save(&src).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cache = ThumbCache::new(Some(&db), Threads { decode: 1, io: 1 }, move |id, tier, d| {
+            let _ = tx.send((id, tier, d));
+        });
+        let load = || {
+            cache.schedule([(0, Tier::Large)], |_| Some((src.clone(), MediaKind::Image)));
+            loop {
+                let (id, tier, d) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let thumb = matches!(d, Delivery::Thumb(..));
+                cache.complete(id, tier, d);
+                if thumb {
+                    return;
+                }
+            }
+        };
+        load();
+        let size = |cache: &ThumbCache| cache.get(0, Tier::Large).map(|(image, _)| (image.size().width, image.size().height));
+        assert_eq!(size(&cache), Some((384, 256)));
+
+        // Rotated on disk, as the pipeline does: a new file renamed over the old one.
+        let rotated = dir.path().join(".scan.png.rotating");
+        image::RgbImage::from_pixel(600, 900, image::Rgb([0, 0, 200])).save_with_format(&rotated, image::ImageFormat::Png).unwrap();
+        std::fs::rename(&rotated, &src).unwrap();
+        cache.schedule([(0, Tier::Large)], |_| panic!("still cached in memory until invalidated"));
+
+        cache.invalidate(0);
+        assert!(cache.get(0, Tier::Large).is_none() && cache.color(0).is_none());
+        load();
+        assert_eq!(size(&cache), Some((256, 384)), "the new pixels, not a stale cache layer");
+        assert!(cache.color(0).is_some_and(|[r, _, b]| b > r));
     }
 
     #[test]

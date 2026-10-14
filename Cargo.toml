@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["gui", "core"]
+members = ["gui", "core", "cli"]
 # Standalone tools with their own lockfiles; `core` uses them as path dependencies.
 exclude = ["utils"]
+
+# Cutting photos out of a 600 dpi bed is ~20× slower unoptimized: keep debug builds of the
+# GUI usable with a scanner.
+[profile.dev.package.photo-duplex]
+opt-level = 3

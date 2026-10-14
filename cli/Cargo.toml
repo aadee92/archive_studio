@@ -1,0 +1,12 @@
+[package]
+name = "archive-studio-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "archive"
+path = "src/main.rs"
+
+[dependencies]
+archive-core = { path = "../core" }
+rustyline = "17"

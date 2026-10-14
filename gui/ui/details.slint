@@ -1,0 +1,137 @@
+import { Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { PipelineBridge } from "pipeline.slint";
+
+export global DetailsBridge {
+    in property <bool> has-item;
+    in property <string> name;
+    in property <string> path;
+    in property <string> info;      // kind, size, dimensions once decoded
+    in property <image> image;
+    in property <bool> image-ready;
+    in property <bool> loading;
+    in property <bool> is-image;
+    // The rotation the orient stage proposes for review, degrees clockwise; 0 = none.
+    in property <int> review-cw;
+    in property <string> review-detail;
+    // A request to the pipeline is in flight.
+    in property <bool> working;
+    // Why the last request failed.
+    in property <string> message;
+
+    callback open-external();
+    callback accept();
+    callback keep();
+    callback rotate(int);   // degrees clockwise
+}
+
+// One item, enlarged. Filled by double-clicking a tile in Review.
+export component DetailsPage inherits Rectangle {
+    background: Theme.bg;
+
+    VerticalLayout {
+        padding: 20px;
+        padding-bottom: 0px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Text {
+                    text: DetailsBridge.has-item ? DetailsBridge.name : "Details";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: Theme.text;
+                    overflow: elide;
+                }
+                Text { text: DetailsBridge.path; color: Theme.text-muted; overflow: elide; }
+            }
+            if DetailsBridge.has-item: HorizontalLayout {
+                alignment: center;
+                spacing: 8px;
+                // Rotating rewrites the file, which the pipeline in this window does.
+                if DetailsBridge.is-image && PipelineBridge.running: Button {
+                    text: "Rotate left";
+                    enabled: !DetailsBridge.working;
+                    clicked => { DetailsBridge.rotate(270); }
+                }
+                if DetailsBridge.is-image && PipelineBridge.running: Button {
+                    text: "Rotate right";
+                    enabled: !DetailsBridge.working;
+                    clicked => { DetailsBridge.rotate(90); }
+                }
+                Button {
+                    text: "Open externally";
+                    clicked => { DetailsBridge.open-external(); }
+                }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+
+            if DetailsBridge.image-ready: Image {
+                x: 12px;
+                y: 12px;
+                width: parent.width - 24px;
+                height: parent.height - 24px;
+                source: DetailsBridge.image;
+                image-fit: contain;
+            }
+            if !DetailsBridge.image-ready: Text {
+                text: !DetailsBridge.has-item ? "Double-click an item in Review to see it here"
+                    : DetailsBridge.loading ? "Loading…" : "No preview for this file";
+                color: Theme.text-muted;
+            }
+        }
+
+        HorizontalLayout {
+            height: 34px;
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: DetailsBridge.info;
+                color: Theme.text-muted;
+                font-size: 12px;
+            }
+            Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                // The request in flight, else why the last one failed, else orient's detail.
+                text: DetailsBridge.working ? "Working…"
+                    : DetailsBridge.message != "" ? DetailsBridge.message
+                    : DetailsBridge.review-cw != 0 ? DetailsBridge.review-detail : "";
+                color: !DetailsBridge.working && DetailsBridge.message != "" ? Theme.danger : Theme.text-muted;
+                font-size: 12px;
+                overflow: elide;
+            }
+            // The orient stage wasn't sure enough to turn the file itself.
+            if DetailsBridge.review-cw != 0: HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    vertical-alignment: center;
+                    text: "Rotate \{DetailsBridge.review-cw}°?";
+                    color: Theme.text;
+                    font-size: 12px;
+                }
+                if PipelineBridge.running: Button {
+                    text: "Accept";
+                    primary: true;
+                    enabled: !DetailsBridge.working;
+                    clicked => { DetailsBridge.accept(); }
+                }
+                if PipelineBridge.running: Button {
+                    text: "Keep";
+                    enabled: !DetailsBridge.working;
+                    clicked => { DetailsBridge.keep(); }
+                }
+            }
+        }
+    }
+}

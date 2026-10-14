@@ -1,0 +1,193 @@
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { MediaRow, MediaTile } from "types.slint";
+
+// A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
+export struct PersonItem {
+    key: int,
+    name: string,
+    count: int,
+}
+
+export global PeopleBridge {
+    in property <[PersonItem]> people;
+    in-out property <int> selected: -1;
+    // Face crops, `columns` per row; `MediaTile.index` is the face id, `detail` says
+    // whether a face is confirmed or only suggested.
+    in property <[MediaRow]> rows;
+    in property <string> title;
+    in property <string> status-text;
+    in property <bool> empty;
+    in property <bool> loading;
+    in property <length> tile-size: 120px;
+
+    callback refresh();
+    callback columns-changed(int);
+    callback select(int);
+    callback open(int);
+}
+
+component FaceCell inherits Rectangle {
+    in property <MediaTile> tile;
+    in property <length> size;
+
+    width: size;
+
+    Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        clip: true;
+        background: Theme.well;
+        if root.tile.thumb-ready: Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.tile.thumb;
+            image-fit: cover;
+        }
+    }
+    Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        border-width: ta.has-hover ? 1px : 0px;
+        border-color: Theme.border;
+    }
+    Text {
+        x: 2px;
+        y: root.size + 4px;
+        width: root.size - 4px;
+        text: root.tile.detail;
+        font-size: 11px;
+        color: Theme.text-muted;
+        overflow: elide;
+    }
+
+    ta := TouchArea {
+        double-clicked => { PeopleBridge.open(root.tile.index); }
+    }
+}
+
+export component PeoplePage inherits Rectangle {
+    property <length> gap: 12px;
+    property <length> row-height: PeopleBridge.tile-size + 22px;
+    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (PeopleBridge.tile-size + root.gap)));
+
+    changed columns => { PeopleBridge.columns-changed(self.columns); }
+    // Faces get named elsewhere (and by scans): re-read the catalog whenever the page is shown.
+    changed visible => { if (self.visible) { PeopleBridge.refresh(); } }
+    init => { PeopleBridge.columns-changed(self.columns); }
+
+    background: Theme.bg;
+
+    HorizontalLayout {
+        Rectangle {
+            width: 240px;
+            background: Theme.sidebar;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Text { text: "People"; font-size: 15px; font-weight: 600; color: Theme.text; }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.surface;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+
+                    ListView {
+                        for person in PeopleBridge.people: Rectangle {
+                            height: 30px;
+                            background: PeopleBridge.selected == person.key ? Theme.accent-soft
+                                : person-ta.has-hover ? Theme.hover : transparent;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 6px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: person.name;
+                                    font-size: 12px;
+                                    font-italic: person.key == -1;
+                                    color: PeopleBridge.selected == person.key ? Theme.accent : Theme.text;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: person.count;
+                                    font-size: 11px;
+                                    color: Theme.text-muted;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            person-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { PeopleBridge.select(person.key); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { width: 1px; background: Theme.border; }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg;
+
+            VerticalLayout {
+                padding: 20px;
+                padding-bottom: 0px;
+                spacing: 14px;
+
+                Text { text: PeopleBridge.title; font-size: 20px; font-weight: 600; color: Theme.text; overflow: elide; }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.surface;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+
+                    list := ListView {
+                        for row in PeopleBridge.rows: Rectangle {
+                            height: root.row-height;
+                            HorizontalLayout {
+                                padding-left: root.gap;
+                                padding-top: root.gap;
+                                spacing: root.gap;
+                                alignment: start;
+                                for t in row.tiles: FaceCell { tile: t; size: PeopleBridge.tile-size; }
+                            }
+                        }
+                    }
+
+                    if PeopleBridge.empty: Text {
+                        text: PeopleBridge.loading ? "Loading…" : "No faces";
+                        color: Theme.text-muted;
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 34px;
+                    Text {
+                        vertical-alignment: center;
+                        text: PeopleBridge.status-text;
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+    }
+}

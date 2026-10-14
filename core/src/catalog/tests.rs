@@ -66,9 +66,15 @@ fn search_terms_and_operators() {
     assert_eq!(lib.search(""), ["beach.jpg", "blank.jpg", "lake.jpg", "park.jpg"]);
     assert_eq!(lib.search("dog"), ["lake.jpg", "park.jpg"]);
     assert_eq!(lib.search("DOG park"), ["park.jpg"]);
+    assert_eq!(lib.search("dog and park"), ["park.jpg"]);
+    assert_eq!(lib.search("(dog and park)"), ["park.jpg"]);
+    assert_eq!(lib.search("dog && park"), ["park.jpg"]);
     assert_eq!(lib.search("dog -park"), ["lake.jpg"]);
+    assert_eq!(lib.search("dog and not park"), ["lake.jpg"]);
     assert_eq!(lib.search("beach OR lake"), ["beach.jpg", "lake.jpg"]);
     assert_eq!(lib.search("beach OR lake dog"), ["beach.jpg", "lake.jpg"]);
+    assert_eq!(lib.search("(beach OR lake) and dog"), ["lake.jpg"]);
+    assert_eq!(lib.search("(beach OR lake) AND dog"), ["lake.jpg"]);
     assert_eq!(lib.search("(beach OR park) -alice"), ["park.jpg"]);
     assert_eq!(lib.search("-*"), ["blank.jpg"]);
     assert_eq!(lib.search("nothing"), Vec::<String>::new());
@@ -86,6 +92,11 @@ fn in_memory_query_matches() {
     assert!(!parse("dog").unwrap().matches(&tags));
     assert!(parse("beach OR dog").unwrap().matches(&tags));
     assert!(parse("beach -dog").unwrap().matches(&tags));
+    assert!(parse("(beach and alice)").unwrap().matches(&tags));
+    assert!(!parse("(beach and dog)").unwrap().matches(&tags));
+    assert!(parse("(beach and not dog)").unwrap().matches(&tags));
+    assert!(parse("(beach OR dog) and alice").unwrap().matches(&tags));
+    assert!(parse("beach && alice").unwrap().matches(&tags));
     assert!(parse("person:alice").unwrap().matches(&tags));
     assert!(!parse("scene:alice").unwrap().matches(&tags));
     assert!(parse("wedding").unwrap().matches(&tags));
@@ -296,7 +307,12 @@ fn query_parsing() {
         parse("Person:\"Alice Smith\"").unwrap(),
         Expr::Term { kind: Some(TagKind::Person), text: "Alice Smith".into() }
     );
-    for bad in ["(a", "a)", "a OR", "OR a", "-", "\"a", "a\"b\"", "person:", "()", "a||b"] {
+    assert_eq!(parse("(a and b)").unwrap(), Expr::And(vec![term("a"), term("b")]));
+    assert_eq!(parse("a AND b").unwrap(), Expr::And(vec![term("a"), term("b")]));
+    assert_eq!(parse("a && b").unwrap(), Expr::And(vec![term("a"), term("b")]));
+    assert_eq!(parse("(a OR b) and c").unwrap(), Expr::And(vec![Expr::Or(vec![term("a"), term("b")]), term("c")]));
+    assert_eq!(parse("a and not b").unwrap(), Expr::And(vec![term("a"), Expr::Not(Box::new(term("b")))]));
+    for bad in ["(a", "a)", "a OR", "OR a", "a AND", "AND a", "(a and)", "-", "\"a", "a\"b\"", "person:", "()", "a||b"] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
 }
@@ -362,4 +378,23 @@ fn sync_sidecars_writes_and_tracks() {
 fn tag_paths_reject_control_characters() {
     let lib = Lib::new();
     assert!(matches!(lib.cat.tag("a\nb", TagKind::Keyword), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn a_new_catalog_opens_from_many_threads_at_once() {
+    // A host opening a new library opens several connections at once (indexer, people
+    // list, pipeline); turning the fresh database to WAL must not fail any of them.
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Catalog::default_path(dir.path());
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    barrier.wait();
+                    Catalog::open(&db, dir.path()).unwrap();
+                });
+            }
+        });
+    }
 }

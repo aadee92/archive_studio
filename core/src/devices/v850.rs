@@ -9,6 +9,11 @@
 //! image blocks as they stream in; it is held in memory for the cut-out (~110 MB at
 //! 600 dpi) but never saved. Each saved photo is reported with its full image, so the
 //! host can seed its thumbnails from memory.
+//!
+//! Fronts are cut out, saved and reported as soon as their scan is in, whether or not a
+//! back scan ever follows: a batch of one-sided photos needs nothing more. Dropping the
+//! device lets a scan that is already in finish saving, so quitting right after a scan
+//! loses nothing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +39,8 @@ const BUTTON_POLL: Duration = Duration::from_millis(250);
 /// to be about a second apart.
 const DOUBLE_PRESS_WINDOW: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Longest a drop waits for the photos of a finished scan to be saved.
+const SAVE_GRACE: Duration = Duration::from_secs(60);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(300);
 /// Matches `Theme.well`, so the unscanned part of the preview blends with the panel.
 const UNSCANNED: Pixel<u8> = Pixel([238, 240, 243]);
@@ -54,6 +61,9 @@ struct Control {
     start: AtomicBool,
     start_backs: AtomicBool,
     cancel: AtomicBool,
+    /// From the start of a scan's image data until its photos are saved: the bed is only
+    /// in memory, so a drop waits for this to clear.
+    busy: AtomicBool,
 }
 
 pub struct V850 {
@@ -76,6 +86,7 @@ impl V850 {
                 start: AtomicBool::new(false),
                 start_backs: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
+                busy: AtomicBool::new(false),
             }),
             started: false,
         }
@@ -87,6 +98,12 @@ impl Drop for V850 {
         // The thread notices within one button poll, or at the next block mid-scan.
         self.control.alive.store(false, Ordering::Release);
         self.control.cancel.store(true, Ordering::Release);
+        // A scan still coming in stops at its next block; one that is in gets its photos
+        // saved first.
+        let deadline = Instant::now() + SAVE_GRACE;
+        while self.control.busy.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -180,6 +197,7 @@ fn session(
             break;
         };
         sink(DeviceEvent::Started);
+        let busy = Busy(&control.busy);
         status = match scan_bed(&mut scanner, &params, control, sink)? {
             Some(bed) => {
                 sink(DeviceEvent::Status(format!("Finding photos at {dpi} dpi…")));
@@ -187,6 +205,7 @@ fn session(
             }
             None => "Scan cancelled".into(),
         };
+        drop(busy);
         sink(DeviceEvent::Finished);
         // Ignore presses made while the scan was running.
         scanner.button()?;
@@ -243,6 +262,8 @@ fn second_press(scanner: &mut Scanner, sink: &EventSink) -> x980::Result<bool> {
 fn scan_bed(scanner: &mut Scanner, params: &ScanParams, control: &Control, sink: &EventSink) -> x980::Result<Option<Rgb>> {
     sink(DeviceEvent::Status("Warming up…".into()));
     scanner.wait_ready()?;
+    // Set here rather than at the trigger, so a drop doesn't wait out the warm-up.
+    control.busy.store(true, Ordering::Release);
 
     let expected = params.bytes_per_line() * params.height as usize;
     let mut data = Vec::with_capacity(expected);
@@ -274,8 +295,18 @@ fn scan_bed(scanner: &mut Scanner, params: &ScanParams, control: &Control, sink:
     Ok(Some(Rgb { width: params.width, height: params.height, data }))
 }
 
-/// Cuts the photos out of `bed` and saves them, reporting each as a recent capture.
-/// Returns the outcome for the status line.
+/// Clears [`Control::busy`] however the scan ends (saved, cancelled or failed).
+struct Busy<'a>(&'a AtomicBool);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Cuts the photos out of `bed` and saves them, reporting each as a recent capture the
+/// moment its file is in place; nothing waits for a later scan. Returns the outcome for
+/// the status line.
 fn save_photos(
     duplex: &mut Duplex,
     bed: &Rgb,
@@ -302,6 +333,9 @@ fn save_photos(
         Event::Saved { path, image } => {
             *captured += 1;
             sink(DeviceEvent::Captured(*captured));
+            if let Some(name) = path.file_name() {
+                sink(DeviceEvent::Status(format!("Saved {}", name.to_string_lossy())));
+            }
             let Some(full) = RgbImage::from_raw(image.width, image.height, image.data.clone()) else { return };
             let thumb = resize::fit(&full, THUMB_EDGE);
             sink(DeviceEvent::Saved { path: path.to_path_buf(), thumb, image: Some(Arc::new(full)) });
@@ -414,6 +448,7 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn preview_box_filters_lines_split_across_blocks() {
@@ -444,6 +479,96 @@ mod tests {
         let image = preview.frame;
         assert_eq!(image.get_pixel(0, 0).0, [9, 9, 9]);
         assert_eq!(*image.get_pixel(0, 3), UNSCANNED);
+    }
+
+    /// The bed's size at `DETECT_DPI`, like a V850's, and test scans at twice that.
+    const GRID: (u32, u32) = (425, 585);
+    const DPI: u32 = 2 * DETECT_DPI;
+
+    /// White mat at `DPI` with a photo face (outline, white border, picture) at each spot.
+    fn bed_with_fronts(spots: &[(u32, u32, u32, u32)]) -> Rgb {
+        let (w, h) = (GRID.0 * 2, GRID.1 * 2);
+        let mut data = vec![255u8; (w * h * 3) as usize];
+        for &(x0, y0, pw, ph) in spots {
+            for y in y0..y0 + ph {
+                for x in x0..x0 + pw {
+                    let edge = x == x0 || y == y0 || x == x0 + pw - 1 || y == y0 + ph - 1;
+                    let border = x < x0 + 8 || y < y0 + 8 || x >= x0 + pw - 8 || y >= y0 + ph - 8;
+                    let px = if edge {
+                        [190, 190, 190]
+                    } else if border {
+                        [252, 252, 250]
+                    } else {
+                        [(x * 7 % 200) as u8, 90, (y * 3 % 200) as u8]
+                    };
+                    let i = (y * w + x) as usize * 3;
+                    data[i..i + 3].copy_from_slice(&px);
+                }
+            }
+        }
+        Rgb { width: w, height: h, data }
+    }
+
+    /// Runs `save_photos`, returning the file names reported with `Saved`.
+    fn saved_by(duplex: &mut Duplex, bed: &Rgb, backs: bool, captured: &mut u32) -> Vec<String> {
+        let names: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = names.clone();
+        let sink: EventSink = Arc::new(move |event| {
+            if let DeviceEvent::Saved { path, thumb, image } = event {
+                assert!(path.is_file(), "{} reported before it was written", path.display());
+                assert!(thumb.width() <= THUMB_EDGE && image.is_some());
+                log.lock().unwrap().push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        });
+        save_photos(duplex, bed, DPI, GRID, backs, &sink, captured).unwrap();
+        let names = names.lock().unwrap().clone();
+        names
+    }
+
+    #[test]
+    fn fronts_are_saved_and_reported_without_a_back_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut duplex = Duplex::new(dir.path().to_path_buf());
+        let mut captured = 0;
+        let bed = bed_with_fronts(&[(60, 60, 300, 200), (460, 60, 300, 200)]);
+        // One-sided photos: a scan, and nothing after it.
+        assert_eq!(saved_by(&mut duplex, &bed, false, &mut captured), ["photo-0001-front.png", "photo-0002-front.png"]);
+        assert_eq!(captured, 2);
+
+        // Another batch of one-sided photos numbers on.
+        let bed = bed_with_fronts(&[(60, 400, 200, 300)]);
+        assert_eq!(saved_by(&mut duplex, &bed, false, &mut captured), ["photo-0003-front.png"]);
+
+        // Scan backs pairs with that latest batch, already on disk.
+        let mut flipped = bed_with_fronts(&[]);
+        for y in 400..700 {
+            for x in 60..260 {
+                let i = (y * flipped.width + x) as usize * 3;
+                flipped.data[i..i + 3].copy_from_slice(&[236, 234, 228]);
+            }
+        }
+        assert_eq!(saved_by(&mut duplex, &flipped, true, &mut captured), ["photo-0003-back.png"]);
+        assert!(!duplex.has_pending());
+        assert_eq!(captured, 4);
+    }
+
+    #[test]
+    fn drop_waits_for_a_scan_being_saved() {
+        let device = V850::new(PathBuf::from("/nonexistent"));
+        let control = device.control.clone();
+        control.busy.store(true, Ordering::Release);
+        let saver = thread::spawn(move || {
+            // Stands in for the scanner thread: sees the drop, finishes saving.
+            while control.alive.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            thread::sleep(Duration::from_millis(200));
+            control.busy.store(false, Ordering::Release);
+            Instant::now()
+        });
+        drop(device);
+        let dropped = Instant::now();
+        assert!(saver.join().unwrap() <= dropped, "drop returned before the photos were saved");
     }
 }
 

@@ -17,9 +17,12 @@
 //!   off-thread from a persistent cache or decoded, and kept in a byte-budgeted LRU;
 //!   see `thumbs/`. Finished thumbnails collect in a mailbox drained by one event-loop
 //!   callback, which re-reads each affected row once. `row_data` only reads what has arrived.
+//! - Files the pipeline adds, changes or loses are merged in, replaced or taken out
+//!   ([`update_files`]) the same way, without re-walking.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool};
@@ -30,13 +33,17 @@ use std::{fs, thread};
 use slint::{ComponentHandle, Model, ModelNotify, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel};
 
 use crate::thumbs::{self, sched, Delivery, ThumbCache, Threads, Tier};
+use archive_core::catalog::query::{self, Expr};
+use archive_core::catalog::{Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
-use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge};
+use crate::{details, AppWindow, MediaRow, MediaTile, ReviewBridge};
 
 #[cfg_attr(test, derive(Clone))]
-struct Entry {
+pub(crate) struct Entry {
     path: PathBuf,
+    /// [`path_hash`] of `path`, computed off the UI thread.
+    path_hash: u64,
     name: SharedString,
     name_lc: Box<str>,
     /// The first 16 bytes of `name_lc`, big-endian: compares like the names wherever they differ.
@@ -45,27 +52,63 @@ struct Entry {
     size: u64,
     /// Modification time in ns since the epoch (0 if earlier or unknown).
     mtime: u64,
+    tags: Arc<[(String, Option<TagKind>)]>,
 }
 
 impl Entry {
+    #[cfg(test)]
     fn new(path: PathBuf, name: String, kind: MediaKind, size: u64, modified: SystemTime) -> Self {
+        Self::with_tags(path, name, kind, size, modified, Vec::new())
+    }
+
+    fn with_tags(
+        path: PathBuf,
+        name: String,
+        kind: MediaKind,
+        size: u64,
+        modified: SystemTime,
+        tags: Vec<(String, Option<TagKind>)>,
+    ) -> Self {
         let name_lc: Box<str> = name.to_lowercase().into();
         let mut prefix = [0u8; 16];
         let n = name_lc.len().min(16);
         prefix[..n].copy_from_slice(&name_lc.as_bytes()[..n]);
         let mtime = modified.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos().min(u64::MAX as u128) as u64);
-        Self { path, name: name.into(), name_lc, name_prefix: u128::from_be_bytes(prefix), kind, size, mtime }
+        Self {
+            path_hash: path_hash(&path),
+            path,
+            name: name.into(),
+            name_lc,
+            name_prefix: u128::from_be_bytes(prefix),
+            kind,
+            size,
+            mtime,
+            tags: tags.into(),
+        }
     }
+}
+
+/// Identifies a path in [`GridModel::by_path`]. 64 bits: a collision among a library's
+/// paths is vanishingly unlikely, and would only make an update miss its entry.
+fn path_hash(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The indexed files, append-only, as shared chunks (one per indexer batch): a snapshot for
 /// the filter thread is a clone of the chunk list. An entry's id is its position.
+/// A file that changes gets a new entry (and so a new id, which also means a fresh
+/// thumbnail); the old one, like that of a deleted file, is retired into `gone`.
 #[derive(Clone, Default)]
 struct Index {
     chunks: Vec<Arc<[Entry]>>,
     /// First id of each chunk.
     starts: Vec<u32>,
     len: usize,
+    /// Retired ids, never shown again.
+    gone: Arc<HashSet<u32>>,
 }
 
 impl Index {
@@ -84,6 +127,16 @@ impl Index {
     fn get(&self, id: u32) -> Option<&Entry> {
         let chunk = self.starts.partition_point(|&start| start <= id).checked_sub(1)?;
         self.chunks[chunk].get((id - self.starts[chunk]) as usize)
+    }
+
+    /// Entries still in the library.
+    fn live(&self) -> usize {
+        self.len - self.gone.len()
+    }
+
+    /// Entries `from..` with their ids, leaving out retired ones.
+    fn live_from(&self, from: usize) -> impl Iterator<Item = (u32, &Entry)> {
+        self.iter_from(from).filter(|(id, _)| !self.gone.contains(id))
     }
 
     /// Entries `from..` with their ids.
@@ -146,14 +199,43 @@ impl Sort {
 
 #[derive(Clone, Default)]
 struct Query {
-    /// Already lowercased.
+    /// Already lowercased text string.
     text: String,
+    /// Pre-parsed text query expression if it parsed as a valid tag query.
+    text_expr: Option<Arc<Expr>>,
+    /// Tag filter string.
+    tag: String,
+    /// Pre-parsed tag query expression.
+    tag_expr: Option<Arc<Expr>>,
     /// 0 all, 1 images, 2 video, 3 audio
     kind: i32,
     sort: Sort,
 }
 
 impl Query {
+    fn new(text: String, tag: String, kind: i32, sort: Sort) -> Self {
+        let text_trimmed = text.trim();
+        let text_expr = if text_trimmed.is_empty() {
+            None
+        } else {
+            query::parse(text_trimmed).ok().map(Arc::new)
+        };
+        let tag_trimmed = tag.trim();
+        let tag_expr = if tag_trimmed.is_empty() {
+            None
+        } else {
+            query::parse(tag_trimmed).ok().map(Arc::new)
+        };
+        Self {
+            text: text_trimmed.to_lowercase(),
+            text_expr,
+            tag: tag_trimmed.to_string(),
+            tag_expr,
+            kind,
+            sort,
+        }
+    }
+
     fn accepts(&self, e: &Entry) -> bool {
         let kind_ok = match self.kind {
             1 => e.kind == MediaKind::Image,
@@ -161,7 +243,33 @@ impl Query {
             3 => e.kind == MediaKind::Audio,
             _ => true,
         };
-        kind_ok && e.name_lc.contains(&self.text)
+        if !kind_ok {
+            return false;
+        }
+
+        // Text search: matches filename OR matches tag query if typed in search bar
+        if !self.text.is_empty() {
+            let name_match = e.name_lc.contains(&self.text);
+            let tag_match = self.text_expr.as_ref().map_or(false, |expr| expr.matches(&e.tags));
+            if !name_match && !tag_match {
+                return false;
+            }
+        }
+
+        // Dedicated tag filter
+        if !self.tag.is_empty() {
+            if let Some(expr) = &self.tag_expr {
+                if !expr.matches(&e.tags) {
+                    return false;
+                }
+            } else {
+                let tag_lc = self.tag.to_ascii_lowercase();
+                if !e.tags.iter().any(|(t, _)| t.to_ascii_lowercase().contains(&tag_lc)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The entries it accepts, in display order.
@@ -190,6 +298,8 @@ struct Filtered {
     generation: u64,
     /// Entries `0..upto` were considered.
     upto: usize,
+    /// How many entries were retired at the time; later ones are still shown.
+    gone: usize,
     visible: Vec<u32>,
     keys: Vec<u128>,
     slot_of: Vec<u32>,
@@ -197,12 +307,12 @@ struct Filtered {
 
 impl Filtered {
     fn compute(index: &Index, query: &Query, generation: u64) -> Self {
-        let (keys, visible): (Vec<u128>, Vec<u32>) = query.filter_sort(index.iter_from(0)).into_iter().map(|(key, id, _)| (key, id)).unzip();
+        let (keys, visible): (Vec<u128>, Vec<u32>) = query.filter_sort(index.live_from(0)).into_iter().map(|(key, id, _)| (key, id)).unzip();
         let mut slot_of = vec![HIDDEN; index.len()];
         for (slot, &id) in visible.iter().enumerate() {
             slot_of[id as usize] = slot as u32;
         }
-        Self { generation, upto: index.len(), visible, keys, slot_of }
+        Self { generation, upto: index.len(), gone: index.gone.len(), visible, keys, slot_of }
     }
 }
 
@@ -279,6 +389,7 @@ struct Notify {
 enum Change {
     Changed(usize),
     Added(usize, usize),
+    Removed(usize, usize),
     Reset,
 }
 
@@ -293,6 +404,12 @@ impl Notify {
         #[cfg(test)]
         self.log.borrow_mut().push(Change::Added(index, count));
         self.inner.row_added(index, count);
+    }
+
+    fn row_removed(&self, index: usize, count: usize) {
+        #[cfg(test)]
+        self.log.borrow_mut().push(Change::Removed(index, count));
+        self.inner.row_removed(index, count);
     }
 
     fn reset(&self) {
@@ -327,8 +444,14 @@ struct GridModel {
     sync_limit: usize,
     selected: Cell<Option<u32>>,
     indexing: Cell<bool>,
+    /// Entry id of each path ([`path_hash`]), for [`update_files`](Self::update_files).
+    by_path: RefCell<HashMap<u64, u32>>,
+    /// File updates that arrived while indexing, applied once it is done (the indexer
+    /// may find the same files).
+    deferred: RefCell<Vec<FileUpdate>>,
     thumbs: ThumbCache,
     ready: Arc<Mailbox<Ready>>,
+    available_tags: RefCell<BTreeSet<String>>,
     /// Tests: a drain left work for the next event-loop turn.
     #[cfg(test)]
     redrain_due: Cell<bool>,
@@ -378,14 +501,15 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     bridge.on_open(|id| with_grid(|g| g.open(id as u32)));
 
     let debounce = Timer::default();
-    bridge.on_filter_changed(move |text, kind, sort| {
-        let query = Query { text: text.to_lowercase(), kind, sort: Sort::from_index(sort) };
+    bridge.on_filter_changed(move |text, tag, kind, sort| {
+        let query = Query::new(text.to_string(), tag.to_string(), kind, Sort::from_index(sort));
         debounce.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
             with_grid(|g| g.set_query(query.clone()))
         });
     });
 
     grid.publish_status();
+    grid.publish_tags();
     spawn_indexer(root, ui.as_weak());
 }
 
@@ -394,9 +518,9 @@ pub fn shutdown() {
     with_grid(|g| g.thumbs.shutdown());
 }
 
-/// Walks `root` on a background thread, streaming batches to the UI every ~150 ms.
-/// TODO: persist the index (e.g. SQLite with EXIF/duration columns) and watch the
-/// tree with inotify instead of rescanning on every launch.
+/// Walks `root` on a background thread, streaming batches to the UI every ~150 ms. After
+/// that, the pipeline's reports keep the grid current ([`update_files`]).
+/// TODO: build the grid from the catalog instead of rescanning on every launch.
 fn spawn_indexer(root: PathBuf, ui: slint::Weak<AppWindow>) {
     thread::spawn(move || {
         walk(root, |batch, done| {
@@ -405,11 +529,105 @@ fn spawn_indexer(root: PathBuf, ui: slint::Weak<AppWindow>) {
     });
 }
 
+fn extract_file_tags(path: &Path, root: &Path, cat: Option<&Catalog>) -> Vec<(String, Option<TagKind>)> {
+    let mut tags: Vec<(String, Option<TagKind>)> = Vec::new();
+
+    // 1. Tags from catalog
+    if let Some(cat) = cat {
+        if let Ok(Some(asset_id)) = cat.find_asset(path) {
+            if let Ok(applied) = cat.tags_of(asset_id) {
+                for t in applied {
+                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&t.path)) {
+                        tags.push((t.path, Some(t.kind)));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Tags from XMP sidecar
+    let sidecar = archive_core::catalog::xmp::sidecar_path(path);
+    if sidecar.is_file() {
+        if let Ok(content) = fs::read_to_string(&sidecar) {
+            if let Ok(xmp_tags) = archive_core::catalog::xmp::extract_tags(&content) {
+                for (path, kind) in xmp_tags {
+                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&path)) {
+                        tags.push((path, Some(kind)));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Folder-based tags (relative to root)
+    if let Ok(rel) = path.strip_prefix(root) {
+        if let Some(parent) = rel.parent() {
+            for comp in parent.components() {
+                let name = comp.as_os_str().to_string_lossy();
+                if !name.is_empty() && !name.starts_with('.') {
+                    let tag_name = name.into_owned();
+                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&tag_name)) {
+                        tags.push((tag_name, Some(TagKind::Keyword)));
+                    }
+                }
+            }
+        }
+    }
+
+    tags
+}
+
+fn entry_for(path: PathBuf, kind: MediaKind, meta: Option<fs::Metadata>, root: &Path, catalog: Option<&Catalog>) -> Entry {
+    let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let size = meta.as_ref().map_or(0, |m| m.len());
+    let modified = meta.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+    let tags = extract_file_tags(&path, root, catalog);
+    Entry::with_tags(path, name, kind, size, modified, tags)
+}
+
+/// A file the pipeline (or a capture) reported, as the grid should now show it.
+pub(crate) enum FileUpdate {
+    /// The file as it is now. `changed`: its pixels changed (e.g. rotated) even if its size,
+    /// date and tags look the same.
+    Present(Entry, bool),
+    Gone(PathBuf),
+}
+
+impl FileUpdate {
+    /// Reads the file at `path` (blocking: stat, catalog tags, sidecar), or `None` if it
+    /// isn't media the grid shows. For a worker thread; hand the result to [`update_files`].
+    pub(crate) fn read(path: &Path, root: &Path, catalog: Option<&Catalog>, changed: bool) -> Option<Self> {
+        let kind = classify(path)?;
+        let hidden = path.strip_prefix(root).ok()?.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+        if hidden {
+            return None;
+        }
+        Some(match fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Self::Present(entry_for(path.to_owned(), kind, Some(meta), root, catalog), changed),
+            _ => Self::Gone(path.to_owned()),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Present(entry, _) => &entry.path,
+            Self::Gone(path) => path,
+        }
+    }
+}
+
+/// Applies files the pipeline added, changed or saw go: new ones are merged into the grid in
+/// sort order, changed ones replaced, gone ones taken out, without re-walking the library.
+pub(crate) fn update_files(updates: Vec<FileUpdate>) {
+    with_grid(|g| g.update_files(updates));
+}
+
 /// Calls `flush` with what was found every ~150 ms, and once more at the end (`done`).
 fn walk(root: PathBuf, mut flush: impl FnMut(Arc<[Entry]>, bool)) {
+    let catalog = Catalog::open(&Catalog::default_path(&root), &root).ok();
     let mut batch = Vec::new();
     let mut last_flush = Instant::now();
-    let mut dirs = vec![root];
+    let mut dirs = vec![root.clone()];
 
     while let Some(dir) = dirs.pop() {
         let Ok(read) = fs::read_dir(&dir) else { continue };
@@ -423,11 +641,7 @@ fn walk(root: PathBuf, mut flush: impl FnMut(Arc<[Entry]>, bool)) {
             }
             let path = item.path();
             let Some(kind) = classify(&path) else { continue };
-            let meta = item.metadata().ok();
-            let name = item.file_name().to_string_lossy().into_owned();
-            let size = meta.as_ref().map_or(0, |m| m.len());
-            let modified = meta.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-            batch.push(Entry::new(path, name, kind, size, modified));
+            batch.push(entry_for(path, kind, item.metadata().ok(), &root, catalog.as_ref()));
             if last_flush.elapsed() > Duration::from_millis(150) {
                 flush(std::mem::take(&mut batch).into(), false);
                 last_flush = Instant::now();
@@ -457,8 +671,11 @@ impl GridModel {
             sync_limit,
             selected: Cell::new(None),
             indexing: Cell::new(true),
+            by_path: RefCell::default(),
+            deferred: RefCell::default(),
             thumbs,
             ready,
+            available_tags: RefCell::default(),
             #[cfg(test)]
             redrain_due: Cell::new(false),
             notify: Notify::default(),
@@ -472,8 +689,27 @@ impl GridModel {
     /// them all. A batch too big to sort within a frame goes to the filter thread instead.
     fn append(&self, batch: Arc<[Entry]>, done: bool) {
         let from = self.entries.borrow().len();
-        self.entries.borrow_mut().push(batch);
+        self.entries.borrow_mut().push(batch.clone());
+        {
+            let mut by_path = self.by_path.borrow_mut();
+            by_path.extend(batch.iter().enumerate().map(|(i, e)| (e.path_hash, (from + i) as u32)));
+        }
+        let finished = self.indexing.get() && done;
         self.indexing.set(!done);
+        let mut tags_changed = false;
+        {
+            let mut known = self.available_tags.borrow_mut();
+            for entry in batch.iter() {
+                for (t, _) in entry.tags.iter() {
+                    if known.insert(t.clone()) {
+                        tags_changed = true;
+                    }
+                }
+            }
+        }
+        if tags_changed {
+            self.publish_tags();
+        }
         let added = self.entries.borrow().len() - from;
         if self.pending.get() {
             // The refilter in flight catches up on these entries when it lands.
@@ -498,6 +734,115 @@ impl GridModel {
             }
         }
         self.publish_status();
+        if finished {
+            let deferred = self.deferred.take();
+            if !deferred.is_empty() {
+                self.update_files(deferred);
+            }
+        }
+    }
+
+    /// See [`update_files`]. A changed file gets a new entry (and id, so its thumbnail is made
+    /// afresh) and the old one is retired; a file that looks the same is left alone.
+    fn update_files(&self, updates: Vec<FileUpdate>) {
+        if self.indexing.get() {
+            self.deferred.borrow_mut().extend(updates);
+            return;
+        }
+        let (mut retired, mut fresh, mut replaced) = (Vec::new(), Vec::new(), Vec::new());
+        {
+            let (index, by_path) = (self.entries.borrow(), self.by_path.borrow());
+            let mut seen = HashSet::new();
+            // Newest first: only the last report of a path counts.
+            for update in updates.into_iter().rev() {
+                let hash = path_hash(update.path());
+                if !seen.insert(hash) {
+                    continue;
+                }
+                let current = by_path
+                    .get(&hash)
+                    .copied()
+                    .filter(|id| !index.gone.contains(id) && index.get(*id).is_some_and(|e| e.path == update.path()));
+                match update {
+                    FileUpdate::Present(entry, changed) => {
+                        if let Some(id) = current {
+                            let old = index.get(id).expect("mapped ids are indexed");
+                            if !changed && (old.size, old.mtime, &old.tags) == (entry.size, entry.mtime, &entry.tags) {
+                                continue;
+                            }
+                            retired.push(id);
+                            replaced.push((id, fresh.len()));
+                        }
+                        fresh.push(entry);
+                    }
+                    FileUpdate::Gone(_) => retired.extend(current),
+                }
+            }
+        }
+        self.retire(&retired);
+        if fresh.is_empty() {
+            self.publish_status();
+            return;
+        }
+        let from = self.entries.borrow().len() as u32;
+        if let Some(&(_, i)) = replaced.iter().find(|(old, _)| self.selected.get() == Some(*old)) {
+            self.selected.set(Some(from + i as u32));
+        }
+        self.append(fresh.into(), true);
+    }
+
+    /// Retires entries: they leave the grid (the rows from the first one on are re-read) and
+    /// their thumbnails are dropped.
+    fn retire(&self, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.entries.borrow_mut().gone).extend(ids);
+        for &id in ids {
+            self.thumbs.invalidate(id);
+        }
+        if self.pending.get() {
+            // The refilter in flight leaves them out when it lands.
+            return;
+        }
+        let old_rows = self.row_count();
+        let Some(first) = self.hide(ids.iter().copied()) else { return };
+        let (first_row, new_rows) = (first / self.columns.get(), self.row_count());
+        for row in first_row..new_rows {
+            self.notify.row_changed(row);
+        }
+        if old_rows > new_rows {
+            self.notify.row_removed(new_rows, old_rows - new_rows);
+        }
+        self.reschedule();
+    }
+
+    /// Takes `ids` out of the shown order; returns the first slot that changed, if any.
+    fn hide(&self, ids: impl Iterator<Item = u32>) -> Option<usize> {
+        let mut slot_of = self.slot_of.borrow_mut();
+        let mut first = usize::MAX;
+        for id in ids {
+            if let Some(slot) = slot_of.get_mut(id as usize).filter(|slot| **slot != HIDDEN) {
+                first = first.min(*slot as usize);
+                *slot = HIDDEN;
+            }
+        }
+        if first == usize::MAX {
+            return None;
+        }
+        let (mut visible, mut keys) = (self.visible.borrow_mut(), self.keys.borrow_mut());
+        let mut write = first;
+        for read in first..visible.len() {
+            let id = visible[read];
+            if slot_of[id as usize] != HIDDEN {
+                (visible[write], keys[write]) = (id, keys[read]);
+                slot_of[id as usize] = write as u32;
+                write += 1;
+            }
+        }
+        visible.truncate(write);
+        keys.truncate(write);
+        Some(first)
     }
 
     /// Filters entries `from..` into `visible` in sort order (a merge: the batch is sorted
@@ -508,7 +853,7 @@ impl GridModel {
         let query = self.query.borrow();
         let mut slot_of = self.slot_of.borrow_mut();
         slot_of.resize(index.len(), HIDDEN);
-        let new = query.filter_sort(index.iter_from(from));
+        let new = query.filter_sort(index.live_from(from));
         let (sort, first_new) = (query.sort, new.first()?);
         let before = |key: u128, id: u32, item: &Keyed| match key.cmp(&item.0) {
             Ordering::Equal => sort.cmp(&(key, id, index.get(id).expect("shown ids are indexed")), item).is_lt(),
@@ -566,6 +911,11 @@ impl GridModel {
         *self.visible.borrow_mut() = result.visible;
         *self.keys.borrow_mut() = result.keys;
         *self.slot_of.borrow_mut() = result.slot_of;
+        // Entries retired since the snapshot.
+        if self.entries.borrow().gone.len() != result.gone {
+            let gone = self.entries.borrow().gone.clone();
+            self.hide(gone.iter().copied());
+        }
         // Entries indexed since the snapshot: merged here, unless that's a big job itself.
         if behind >= self.sync_limit.max(1) {
             self.refilter();
@@ -639,11 +989,16 @@ impl GridModel {
         }
     }
 
+    /// Shows `id` on the Details page.
     fn open(&self, id: u32) {
-        // TODO: in-app viewer (zoom, side-by-side compare, metadata editing).
-        if let Some(entry) = self.entries.borrow().get(id) {
-            let _ = std::process::Command::new("xdg-open").arg(&entry.path).spawn();
-        }
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some((path, name, kind, size)) =
+            self.entries.borrow().get(id).map(|e| (e.path.clone(), e.name.clone(), e.kind, e.size))
+        else {
+            return;
+        };
+        self.select(id);
+        details::show(&ui, path, name, kind, size);
     }
 
     /// Applies the thumbnails that arrived since the last drain (in arrival order, within
@@ -710,7 +1065,7 @@ impl GridModel {
     fn publish_status(&self) {
         let Some(ui) = self.ui.upgrade() else { return };
         let shown = self.visible.borrow().len();
-        let total = self.entries.borrow().len();
+        let total = self.entries.borrow().live();
         let mut status = if shown == total {
             format!("{} items", grouped(total))
         } else {
@@ -723,6 +1078,12 @@ impl GridModel {
         bridge.set_status_text(status.into());
         bridge.set_indexing(self.indexing.get());
         bridge.set_empty(shown == 0);
+    }
+
+    fn publish_tags(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let tags: Vec<SharedString> = self.available_tags.borrow().iter().map(|s| s.as_str().into()).collect();
+        ui.global::<ReviewBridge>().set_available_tags(ModelRc::new(VecModel::from(tags)));
     }
 }
 
@@ -776,7 +1137,7 @@ fn ui_kind(kind: MediaKind) -> crate::MediaKind {
     }
 }
 
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -788,7 +1149,7 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// 12345 -> "12,345"
-fn grouped(n: usize) -> String {
+pub(crate) fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -859,6 +1220,10 @@ mod tests {
                     assert!(index <= mirror.len(), "{change:?}");
                     mirror.splice(index..index, now[index..index + count].iter().cloned());
                 }
+                Change::Removed(index, count) => {
+                    assert!(index + count <= mirror.len(), "{change:?}");
+                    mirror.drain(index..index + count);
+                }
                 Change::Reset => *mirror = now.clone(),
             }
         }
@@ -886,7 +1251,7 @@ mod tests {
             for (text, kind) in [("", 0), ("a", 0), ("", 1), ("img_20230512_143b", 0)] {
                 let columns = 1 + rng.below(7) as usize;
                 let g = grid(usize::MAX, columns, |_| {});
-                g.set_query(Query { text: text.into(), kind, sort });
+                g.set_query(Query { text: text.into(), kind, sort, ..Default::default() });
                 let mut mirror = Vec::new();
                 replay(&g, &mut mirror);
                 let mut appended = 0;
@@ -1009,6 +1374,119 @@ mod tests {
         assert_eq!(*g.slot_of.borrow(), Filtered::compute(&index, &new, 0).slot_of);
     }
 
+    fn present(entry: &Entry, changed: bool) -> FileUpdate {
+        FileUpdate::Present(entry.clone(), changed)
+    }
+
+    /// Files the pipeline reports are merged in, replaced or taken out, and the grid ends up
+    /// as a fresh walk of the same files would show it, without ever being reset.
+    #[test]
+    fn file_updates_match_a_fresh_index() {
+        let mut rng = Rng(11);
+        for sort in [Sort::Name, Sort::Date, Sort::Size, Sort::Type] {
+            let g = grid(usize::MAX, 3, |_| {});
+            g.set_query(Query { sort, ..Default::default() });
+            let mut mirror = Vec::new();
+            replay(&g, &mut mirror);
+            // Distinct paths: the grid's notion of a file.
+            let mut files: Vec<Entry> = random_entries(&mut rng, 300)
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| Entry::new(PathBuf::from(format!("/x/{i}/{}", e.name)), e.name.to_string(), e.kind, e.size, SystemTime::UNIX_EPOCH))
+                .collect();
+            g.append(files[..200].to_vec().into(), true);
+            replay(&g, &mut mirror);
+
+            for round in 0..20 {
+                let mut updates = Vec::new();
+                for _ in 0..rng.below(30) {
+                    let i = rng.below(files.len() as u64) as usize;
+                    match rng.below(4) {
+                        // New, or unchanged (a no-op).
+                        0 | 1 => updates.push(present(&files[i], false)),
+                        // Changed: a new size and date.
+                        2 => {
+                            let e = &files[i];
+                            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(rng.below(9));
+                            files[i] = Entry::new(e.path.clone(), e.name.to_string(), e.kind, rng.below(9) * 1000, modified);
+                            updates.push(present(&files[i], false));
+                        }
+                        _ => updates.push(FileUpdate::Gone(files[i].path.clone())),
+                    }
+                }
+                g.update_files(updates);
+                assert!(!g.notify.log.borrow().contains(&Change::Reset), "updates never reset the view");
+                replay(&g, &mut mirror);
+
+                let index = g.entries.borrow();
+                let shown: Vec<(PathBuf, u64, u64)> =
+                    g.visible.borrow().iter().map(|&id| index.get(id).map(|e| (e.path.clone(), e.size, e.mtime)).unwrap()).collect();
+                let live: Vec<&Entry> = index.live_from(0).map(|(_, e)| e).collect();
+                assert_eq!(live.len(), shown.len(), "{sort:?} round {round}: everything live is shown");
+                let mut paths: Vec<_> = shown.iter().map(|s| &s.0).collect();
+                paths.sort();
+                paths.dedup();
+                assert_eq!(paths.len(), shown.len(), "a path is shown once");
+                for (path, size, mtime) in &shown {
+                    let file = files.iter().find(|f| &f.path == path).unwrap();
+                    assert_eq!((file.size, file.mtime), (*size, *mtime), "the latest version of {path:?}");
+                }
+                assert_eq!(*g.visible.borrow(), Filtered::compute(&index, &g.query.borrow(), 0).visible, "in sort order");
+            }
+        }
+    }
+
+    #[test]
+    fn file_updates_wait_for_indexing_and_keep_the_selection() {
+        let g = grid(usize::MAX, 4, |_| {});
+        let a = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, SystemTime::UNIX_EPOCH);
+        let b = Entry::new("/x/b.png".into(), "b.png".into(), MediaKind::Image, 20, SystemTime::UNIX_EPOCH);
+        g.append(vec![a.clone()].into(), false);
+        // Reported while the indexer is still walking (which finds b itself).
+        g.update_files(vec![present(&b, false), present(&a, true)]);
+        assert_eq!(g.entries.borrow().len(), 1, "deferred");
+        g.select(0);
+        g.append(vec![b.clone()].into(), true);
+        let index = g.entries.borrow();
+        assert_eq!(index.len(), 3, "a replaced (it changed), b not duplicated");
+        assert_eq!(index.gone.iter().copied().collect::<Vec<_>>(), vec![0]);
+        let names: Vec<String> = g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.to_string()).collect();
+        assert_eq!(names, ["a.png", "b.png"]);
+        assert_eq!(g.selected.get(), Some(2), "the selection follows the file to its new entry");
+        drop(index);
+
+        g.update_files(vec![FileUpdate::Gone("/x/b.png".into()), FileUpdate::Gone("/x/unknown.png".into())]);
+        assert_eq!(g.visible.borrow().len(), 1);
+        assert_eq!(g.entries.borrow().live(), 1);
+    }
+
+    #[test]
+    fn retired_entries_stay_out_of_background_refilters() {
+        let (tx, rx) = mpsc::channel();
+        let g = grid(10, 2, move |result| {
+            let _ = tx.send(result);
+        });
+        let files: Vec<Entry> = (0..20)
+            .map(|i| Entry::new(format!("/x/{i:02}.png").into(), format!("{i:02}.png"), MediaKind::Image, i, SystemTime::UNIX_EPOCH))
+            .collect();
+        g.append(files.clone().into(), true);
+        while g.pending.get() {
+            g.apply_filtered(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        g.set_query(Query { sort: Sort::Size, ..Default::default() });
+        assert!(g.pending.get());
+        // Retired while the refilter runs on its snapshot.
+        g.update_files(vec![FileUpdate::Gone("/x/03.png".into())]);
+        while g.pending.get() {
+            g.apply_filtered(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        assert_eq!(g.visible.borrow().len(), 19);
+        assert!(!g.visible.borrow().contains(&3));
+        assert_eq!(g.slot_of.borrow()[3], HIDDEN);
+        let index = g.entries.borrow();
+        assert_eq!(*g.visible.borrow(), Filtered::compute(&index, &g.query.borrow(), 0).visible);
+    }
+
     #[test]
     fn index_chunks_and_gallop() {
         let mut index = Index::default();
@@ -1027,6 +1505,104 @@ mod tests {
         for cut in 0..=100 {
             assert_eq!(gallop(ids.len(), |i| ids[i] < cut), cut as usize);
         }
+    }
+
+    #[test]
+    fn query_filters_by_tag() {
+        let modified = SystemTime::UNIX_EPOCH;
+        let e1 = Entry::with_tags(
+            PathBuf::from("/lib/beach.jpg"),
+            "beach.jpg".to_string(),
+            MediaKind::Image,
+            1000,
+            modified,
+            vec![
+                ("Scenes|Beach".to_string(), Some(TagKind::Scene)),
+                ("People|Family|Alice".to_string(), Some(TagKind::Person)),
+            ],
+        );
+        let e2 = Entry::with_tags(
+            PathBuf::from("/lib/lake.jpg"),
+            "lake.jpg".to_string(),
+            MediaKind::Image,
+            1200,
+            modified,
+            vec![
+                ("Scenes|Lake".to_string(), Some(TagKind::Scene)),
+                ("Objects|Dog".to_string(), Some(TagKind::Object)),
+            ],
+        );
+        let e3 = Entry::with_tags(
+            PathBuf::from("/lib/wedding.jpg"),
+            "wedding.jpg".to_string(),
+            MediaKind::Image,
+            1500,
+            modified,
+            vec![("1999_wedding".to_string(), Some(TagKind::Keyword))],
+        );
+
+        // Filter by tag "beach"
+        let q = Query::new("".into(), "beach".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+        assert!(!q.accepts(&e3));
+
+        // Filter by tag "dog"
+        let q = Query::new("".into(), "dog".into(), 0, Sort::Name);
+        assert!(!q.accepts(&e1));
+        assert!(q.accepts(&e2));
+        assert!(!q.accepts(&e3));
+
+        // Boolean tag query "beach OR dog"
+        let q = Query::new("".into(), "beach OR dog".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(q.accepts(&e2));
+        assert!(!q.accepts(&e3));
+
+        // Negative tag query "-dog"
+        let q = Query::new("".into(), "-dog".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+        assert!(q.accepts(&e3));
+
+        // Combined name and tag query
+        let q = Query::new("beach".into(), "alice".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+
+        let q = Query::new("other".into(), "alice".into(), 0, Sort::Name);
+        assert!(!q.accepts(&e1));
+
+        // Folder tag "wedding"
+        let q = Query::new("".into(), "wedding".into(), 0, Sort::Name);
+        assert!(!q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+        assert!(q.accepts(&e3));
+
+        // Complex tag queries with AND and parentheses
+        let q = Query::new("".into(), "(beach and alice)".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+
+        let q = Query::new("".into(), "beach and alice".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+
+        let q = Query::new("".into(), "(beach and dog)".into(), 0, Sort::Name);
+        assert!(!q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+
+        let q = Query::new("".into(), "(beach OR lake) and dog".into(), 0, Sort::Name);
+        assert!(!q.accepts(&e1));
+        assert!(q.accepts(&e2));
+
+        // Complex query entered directly in the search bar
+        let q = Query::new("(beach and alice)".into(), "".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
+
+        let q = Query::new("beach and not dog".into(), "".into(), 0, Sort::Name);
+        assert!(q.accepts(&e1));
+        assert!(!q.accepts(&e2));
     }
 }
 
@@ -1146,7 +1722,7 @@ mod bench4 {
             let mut times = Vec::new();
             for _ in 0..3 {
                 run(Query::default());
-                times.push(run(Query { text: text.into(), kind, sort: Sort::from_index(sort) }));
+                times.push(run(Query { text: text.into(), kind, sort: Sort::from_index(sort), ..Default::default() }));
             }
             times.sort();
             let (latency, blocked) = times[1];

@@ -21,6 +21,7 @@ use archive_core::device::{CaptureDevice, DeviceEvent, EventSink, Frame, RECENT}
 use archive_core::devices;
 use archive_core::image::DynamicImage;
 
+use crate::pipeline::Handle;
 use crate::thumbs::{self, Tier};
 use crate::{AcquireBridge, AppWindow, DeviceState, DeviceTile};
 
@@ -42,17 +43,20 @@ pub struct Acquire {
     devices: RefCell<Vec<Box<dyn CaptureDevice>>>,
     tiles: Rc<VecModel<DeviceTile>>,
     out_dir: PathBuf,
+    /// Saved captures are handed to the pipeline.
+    pipeline: Handle,
     /// Bumped on rescan so late events from dropped devices can't land on new tiles.
     epoch: Arc<AtomicU64>,
     hotplug: Timer,
 }
 
-pub fn install(ui: &AppWindow, out_dir: &Path) -> Rc<Acquire> {
+pub fn install(ui: &AppWindow, out_dir: &Path, pipeline: Handle) -> Rc<Acquire> {
     let this = Rc::new(Acquire {
         ui: ui.as_weak(),
         devices: RefCell::default(),
         tiles: Rc::new(VecModel::default()),
         out_dir: out_dir.to_path_buf(),
+        pipeline,
         epoch: Arc::default(),
         hotplug: Timer::default(),
     });
@@ -94,6 +98,7 @@ impl Acquire {
         for (row, device) in devices.iter_mut().enumerate() {
             device.start_preview(self.sink_for(row));
         }
+        report_capturing(&*self.tiles);
     }
 
     /// Adds devices switched on or plugged in after the last scan, leaving the others (and
@@ -120,6 +125,7 @@ impl Acquire {
         device.start_acquire(&self.out_dir, self.sink_for(row));
         tile.state = DeviceState::Acquiring;
         self.tiles.set_row_data(row, tile);
+        report_capturing(&*self.tiles);
     }
 
     fn start_alt(&self, row: usize) {
@@ -133,6 +139,7 @@ impl Acquire {
         device.start_alt(&self.out_dir, self.sink_for(row));
         tile.state = DeviceState::Acquiring;
         self.tiles.set_row_data(row, tile);
+        report_capturing(&*self.tiles);
     }
 
     fn stop(&self, row: usize) {
@@ -143,10 +150,11 @@ impl Acquire {
             tile.state = DeviceState::Previewing;
             self.tiles.set_row_data(row, tile);
         }
+        report_capturing(&*self.tiles);
     }
 
     fn sink_for(&self, row: usize) -> EventSink {
-        let ui = self.ui.clone();
+        let (ui, pipeline) = (self.ui.clone(), self.pipeline.clone());
         let epoch = self.epoch.clone();
         let mine = epoch.load(Ordering::Acquire);
         let latest: Arc<Mutex<Option<Buffer>>> = Arc::default();
@@ -180,6 +188,8 @@ impl Acquire {
                         let large = thumbs::fit(&image, Tier::Large.edge());
                         thumbs::store_for_new_file(&path, &DynamicImage::ImageRgb8(large));
                     }
+                    // After seeding, so the grid finds the thumbnail when the file arrives.
+                    pipeline.saved(&path);
                     Update::Recent(buffer(&thumb))
                 }
                 DeviceEvent::Recent(path) => match thumbs::small_for_file(&path) {
@@ -207,9 +217,15 @@ fn buffer(frame: &Frame) -> Buffer {
     Buffer::clone_from_slice(frame.as_raw(), frame.width(), frame.height())
 }
 
+/// Tells the pipeline whether any device is capturing, so it can step back meanwhile.
+fn report_capturing(tiles: &impl Model<Data = DeviceTile>) {
+    crate::pipeline::set_capturing(tiles.iter().any(|tile| tile.state == DeviceState::Acquiring));
+}
+
 fn apply(ui: &AppWindow, row: usize, update: Update) {
     let tiles = ui.global::<AcquireBridge>().get_devices();
     let Some(mut tile) = tiles.row_data(row) else { return };
+    let event = matches!(update, Update::Event(_));
     match update {
         Update::Preview(frame) => {
             tile.preview = Image::from_rgb8(frame);
@@ -241,4 +257,7 @@ fn apply(ui: &AppWindow, row: usize, update: Update) {
         },
     }
     tiles.set_row_data(row, tile);
+    if event {
+        report_capturing(&tiles);
+    }
 }

@@ -2,15 +2,19 @@ import { Theme } from "theme.slint";
 import { Sidebar } from "sidebar.slint";
 import { AcquirePage, AcquireBridge } from "acquire.slint";
 import { ReviewPage, ReviewBridge } from "review.slint";
+import { PeoplePage, PeopleBridge } from "people.slint";
+import { DetailsPage, DetailsBridge } from "details.slint";
+import { PipelineBridge } from "pipeline.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
-export { AcquireBridge, ReviewBridge }
+export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
     in-out property <int> page: 0;
 
     title: "Archive Studio";
+    icon: @image-url("icons/app.svg");
     preferred-width: 1280px;
     preferred-height: 820px;
     min-width: 820px;
@@ -31,6 +35,8 @@ export component AppWindow inherits Window {
             horizontal-stretch: 1;
             AcquirePage { visible: root.page == 0; }
             ReviewPage { visible: root.page == 1; }
+            PeoplePage { visible: root.page == 2; }
+            DetailsPage { visible: root.page == 3; }
         }
     }
 }

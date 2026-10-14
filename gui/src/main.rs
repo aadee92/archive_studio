@@ -4,8 +4,13 @@
 //! - **Acquire** (`acquire.rs`): one live panel per connected capture device.
 //! - **Review** (`review.rs`): a virtualized grid over every image / video / audio
 //!   file under the working directory.
+//!
+//! While the window is open it hosts the library's processing pipeline (`pipeline.rs`).
 
 mod acquire;
+mod details;
+mod people;
+mod pipeline;
 mod review;
 mod thumbs;
 
@@ -19,11 +24,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir()?,
     };
+    // Absolute like the catalog's root, so the paths the pipeline reports match the grid's.
+    let root = std::path::absolute(root)?;
 
     let ui = AppWindow::new()?;
-    let _acquire = acquire::install(&ui, &root);
+    // Matches archive-studio.desktop, which is how GNOME (Wayland) finds the launcher
+    // icon; the window's own `icon` covers X11 and other platforms. Needs the platform
+    // that `AppWindow::new` sets up, and must come before the window is shown.
+    slint::set_xdg_app_id("archive-studio")?;
+    let pipeline = pipeline::install(&ui, root.clone());
+    let _acquire = acquire::install(&ui, &root, pipeline.clone());
+    details::install(&ui, root.clone(), pipeline);
+    people::install(&ui, root.clone());
     review::install(&ui, root);
     ui.run()?;
+    pipeline::shutdown();
     review::shutdown();
     Ok(())
 }
