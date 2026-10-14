@@ -8,6 +8,7 @@ name = "archive_core"
 
 [dependencies]
 fast_image_resize = { version = "6.1.0", features = ["image"] }
+faces = { path = "../utils/faces" }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 libc = "0.2"
 nusb = "0.2.7"

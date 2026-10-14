@@ -14,9 +14,12 @@
 //!   can move as a whole. The database belongs inside the library
 //!   ([`Catalog::default_path`]), unlike the thumbnail cache: it holds user data.
 //!
+//! Faces found in the images, and the review that names them, are in [`faces`].
+//!
 //! See [`query`] for the search syntax. Each thread opens its own [`Catalog`]; WAL lets
 //! readers run alongside a writer.
 
+pub mod faces;
 pub mod query;
 pub mod xmp;
 
@@ -26,7 +29,8 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i32 = 1;
+/// 1: assets and tags. 2: faces.
+const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE assets (
@@ -242,13 +246,18 @@ impl Catalog {
         conn.pragma_update(None, "mmap_size", 1i64 << 30)?;
         // Taking the write lock first: another thread may be creating the schema too.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        match tx.pragma_query_value(None, "user_version", |row| row.get(0))? {
-            0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        // Each version's additions, applied in turn from the database's version.
+        let version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(Error::NewerSchema(version));
+        }
+        for (added_in, schema) in [(1, SCHEMA), (2, faces::SCHEMA)] {
+            if version < added_in {
+                tx.execute_batch(schema)?;
             }
-            SCHEMA_VERSION => {}
-            newer => return Err(Error::NewerSchema(newer)),
+        }
+        if version < SCHEMA_VERSION {
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
         let root = std::path::absolute(root).map_err(|_| Error::Path(root.to_owned()))?;

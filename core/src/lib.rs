@@ -18,3 +18,5 @@ mod resize;
 
 /// The `image` version [`device::Frame`] comes from.
 pub use image;
+/// The face models [`catalog::faces::scan_image`] runs.
+pub use faces;
