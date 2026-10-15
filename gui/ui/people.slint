@@ -1,4 +1,4 @@
-import { ListView, LineEdit, Button } from "std-widgets.slint";
+import { ListView, LineEdit, Button, ComboBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { ScrollRestore, UiLog } from "nav.slint";
 import { ItemMenu } from "menu.slint";
@@ -7,7 +7,13 @@ import { ItemMenu } from "menu.slint";
 export struct PersonItem {
     key: int,
     name: string,
+    // The person tag ("People|Family|Ann"); "" for Unknown.
+    path: string,
     count: int,
+    // Their cover face, small; else `initial` on a plain disc.
+    avatar: image,
+    has-avatar: bool,
+    initial: string,
 }
 
 // One face crop in the grid.
@@ -28,7 +34,11 @@ export struct FaceTile {
 export struct FaceRow { tiles: [FaceTile] }
 
 export global PeopleBridge {
+    // Unknown first, then the people `filter` matches, in `sort` order.
     in property <[PersonItem]> people;
+    // 0: by name, 1: most faces first, 2: recently named first. Kept for the session.
+    in-out property <int> sort: 0;
+    in-out property <string> filter;
     in-out property <int> selected: -1;
     // Face crops, `columns` per row; a face is addressed by (row, column).
     in property <[FaceRow]> rows;
@@ -51,6 +61,12 @@ export global PeopleBridge {
 
     callback columns-changed(int);
     callback select(int);
+    // `sort` or `filter` changed.
+    callback arrange();
+    // From a person's menu: "rename", "merge" or "delete" (opens `TagEdit`'s dialog).
+    callback person-action(/* key */ int, string);
+    // A person (key) was dropped on the row at this index of `people`: merge, once confirmed.
+    callback merge-drop(int, int);
     // (row, column); -1 for neither when the click missed every face.
     callback open(int, int);
     // Right-click on a face. Shows the item context menu (`ItemMenu`).
@@ -147,6 +163,26 @@ export component PeoplePage inherits Rectangle {
     // The name box's match highlighted with Up / Down (-1: the typed text).
     property <int> match-index: -1;
 
+    // The people list: row height, the person right-clicked, and a person being dragged
+    // onto another (key -2: none) with the row under the pointer and where the pointer is.
+    property <length> person-row: 36px;
+    property <PersonItem> menu-person;
+    property <int> drag-key: -2;
+    property <string> drag-name;
+    property <int> drop-index: -1;
+    property <bool> dragged;
+    property <length> drag-x;
+    property <length> drag-y;
+
+    function drop() {
+        if (root.drop-index >= 0 && root.drop-index < PeopleBridge.people.length) {
+            UiLog.debug("people.list", "person \{root.drag-key} dropped on row \{root.drop-index}");
+            PeopleBridge.merge-drop(root.drag-key, root.drop-index);
+        }
+        root.drag-key = -2;
+        root.drop-index = -1;
+    }
+
     changed columns => { PeopleBridge.columns-changed(self.columns); }
     // `init` runs before Rust handles columns-changed, so the count is sent again here.
     // (Whether the catalog is re-read on showing the page, or the view left is restored,
@@ -172,6 +208,30 @@ export component PeoplePage inherits Rectangle {
     }
 
     background: Theme.bg;
+
+    // A person's menu, shown where they were right-clicked; never opened by its own clicks.
+    person-menu-area := ContextMenuArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        enabled: false;
+        Menu {
+            MenuItem {
+                title: "Rename…";
+                activated => { PeopleBridge.person-action(root.menu-person.key, "rename"); }
+            }
+            MenuItem {
+                title: "Merge into…";
+                activated => { PeopleBridge.person-action(root.menu-person.key, "merge"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Delete person…";
+                activated => { PeopleBridge.person-action(root.menu-person.key, "delete"); }
+            }
+        }
+    }
 
     // Diagnostics (UiLog): the lists' models and scroll state, so the log shows a list that
     // is empty, scrolled past its end, or not where Rust thinks it is.
@@ -310,6 +370,35 @@ export component PeoplePage inherits Rectangle {
 
                 Rectangle { height: 1px; background: Theme.border; }
 
+                // Finding someone in the list, and its order.
+                HorizontalLayout {
+                    vertical-stretch: 0;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> PeopleBridge.filter;
+                        placeholder-text: "Find a person";
+                        edited => { PeopleBridge.arrange(); }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape && self.text != "") {
+                                self.text = "";
+                                PeopleBridge.arrange();
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+                    ComboBox {
+                        width: 92px;
+                        model: ["Name", "Most faces", "Recent"];
+                        current-index <=> PeopleBridge.sort;
+                        selected => {
+                            UiLog.debug("people.list", "sort by \{self.current-value}");
+                            PeopleBridge.arrange();
+                        }
+                    }
+                }
+
                 Rectangle {
                     vertical-stretch: 1;
                     background: Theme.surface;
@@ -320,14 +409,40 @@ export component PeoplePage inherits Rectangle {
 
                     plist := ListView {
                         for person[i] in PeopleBridge.people: Rectangle {
-                            height: 30px;
-                            background: PeopleBridge.selected == person.key ? Theme.accent-soft
-                                : person-ta.has-hover ? Theme.hover : transparent;
+                            property <bool> drop-target: root.drag-key != -2 && root.drop-index == i
+                                && person.key != -1 && person.key != root.drag-key;
+                            height: root.person-row;
+                            background: self.drop-target || PeopleBridge.selected == person.key ? Theme.accent-soft
+                                : person-ta.has-hover && root.drag-key == -2 ? Theme.hover : transparent;
+                            border-width: self.drop-target ? 2px : 0px;
+                            border-color: Theme.accent;
 
                             HorizontalLayout {
-                                padding-left: 10px;
+                                padding-left: 8px;
                                 padding-right: 10px;
-                                spacing: 6px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 13px;
+                                        clip: true;
+                                        background: Theme.well;
+                                        if person.has-avatar: Image {
+                                            width: parent.width;
+                                            height: parent.height;
+                                            source: person.avatar;
+                                            image-fit: cover;
+                                        }
+                                        if !person.has-avatar: Text {
+                                            text: person.initial;
+                                            font-size: 11px;
+                                            font-weight: 600;
+                                            color: Theme.text-muted;
+                                        }
+                                    }
+                                }
                                 Text {
                                     horizontal-stretch: 1;
                                     text: person.name;
@@ -345,17 +460,46 @@ export component PeoplePage inherits Rectangle {
                                 }
                             }
 
+                            // Click to pick; right-click for the person's menu; drag onto
+                            // another person to merge them into that one.
                             person-ta := TouchArea {
-                                mouse-cursor: pointer;
-                                changed pressed => {
-                                    if (self.pressed) {
+                                mouse-cursor: root.drag-key != -2 ? MouseCursor.grabbing : MouseCursor.pointer;
+                                pointer-event(event) => {
+                                    if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down && person.key != -1) {
+                                        root.menu-person = person;
+                                        UiLog.debug("people.list", "menu for row \{i} (key \{person.key}, \{person.name})");
+                                        person-menu-area.show({
+                                            x: self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                                            y: self.absolute-position.y + self.mouse-y - root.absolute-position.y });
+                                    }
+                                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                                         UiLog.debug("people.list", "press on row \{i} (key \{person.key}, \{person.name})");
+                                        root.dragged = false;
+                                    }
+                                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up && root.drag-key != -2) {
+                                        root.drop();
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed && person.key != -1
+                                        && (root.drag-key != -2 || Math.abs(self.mouse-y - self.pressed-y) > 6px)) {
+                                        if (root.drag-key == -2) {
+                                            UiLog.debug("people.list", "dragging row \{i} (key \{person.key}, \{person.name})");
+                                        }
+                                        root.drag-key = person.key;
+                                        root.drag-name = person.name;
+                                        root.dragged = true;
+                                        root.drag-x = self.absolute-position.x + self.mouse-x - root.absolute-position.x;
+                                        root.drag-y = self.absolute-position.y + self.mouse-y - root.absolute-position.y;
+                                        root.drop-index = Math.floor((self.absolute-position.y + self.mouse-y - plist.absolute-position.y - plist.content-y) / root.person-row);
                                     }
                                 }
                                 clicked => {
-                                    UiLog.debug("people.list", "click on row \{i} (key \{person.key}, \{person.name}); \{root.lists-state()}");
-                                    name-box.text = "";
-                                    PeopleBridge.select(person.key);
+                                    if (!root.dragged) {
+                                        UiLog.debug("people.list", "click on row \{i} (key \{person.key}, \{person.name}); \{root.lists-state()}");
+                                        name-box.text = "";
+                                        PeopleBridge.select(person.key);
+                                    }
                                 }
                             }
                         }
@@ -565,6 +709,23 @@ export component PeoplePage inherits Rectangle {
                     }
                 }
             }
+        }
+    }
+
+    // The person being dragged, at the pointer.
+    if root.drag-key != -2: Rectangle {
+        x: root.drag-x + 12px;
+        y: root.drag-y + 4px;
+        width: drag-label.preferred-width + 20px;
+        height: 24px;
+        border-radius: 12px;
+        background: #1f2328e8;
+        drag-label := Text {
+            text: root.drop-index >= 0 && root.drop-index < PeopleBridge.people.length
+                && PeopleBridge.people[root.drop-index].key != -1 && PeopleBridge.people[root.drop-index].key != root.drag-key
+                ? "Merge \{root.drag-name} into \{PeopleBridge.people[root.drop-index].name}" : root.drag-name;
+            color: white;
+            font-size: 12px;
         }
     }
 

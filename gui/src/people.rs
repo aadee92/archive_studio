@@ -11,6 +11,13 @@
 //! pictures `People|<Name>`), which then reports the pictures to `pipeline::changed` so
 //! Review shows their new tags, and refreshes the suggestions, so faces like the ones just
 //! named are listed under that person on the next load.
+//!
+//! The list shows each person's cover face (`Catalog::person_cover`, decoded small on the
+//! worker that reads the list, and cached), and is sorted and narrowed on the UI thread
+//! ([`arrange`]: by name, most faces or recently named; the order is kept for the session).
+//! A person's menu (Rename…, Merge into…, Delete person…), or dragging one onto another,
+//! opens `tags`' dialog for them; "Set as cover" on a face (here or on Details) is
+//! [`set_cover`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -22,11 +29,13 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, SharedString, VecModel};
 
+use std::sync::Mutex;
+
 use crate::nav::{self, Scope, Target};
 use crate::thumbs::Pixels;
-use crate::{AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
-use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, DEFAULT_MIN_SIMILARITY};
-use archive_core::catalog::people::{display_name, matching_people, person_path};
+use crate::{actions, AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
+use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, PersonFaces, DEFAULT_MIN_SIMILARITY};
+use archive_core::catalog::people::{arrange, display_name, matching_people, person_path, PeopleOrder};
 use archive_core::catalog::{Catalog, TagId, TagKind};
 
 /// `PersonItem.key` of the faces nobody has named.
@@ -37,6 +46,14 @@ const CROP_CACHE: usize = 3000;
 const MATCHES: usize = 6;
 /// The writer waits this long for more changes before refreshing the suggestions.
 const SETTLE: Duration = Duration::from_millis(500);
+/// Edge of the decoded cover faces (the list draws them at 26 px; twice that for HiDPI).
+const AVATAR_EDGE: u32 = 52;
+/// Decoded covers kept across list reads; ~8 KB each.
+const AVATAR_CACHE: usize = 4000;
+
+/// Covers decoded by the workers that read the list, by face, so a re-read only decodes
+/// covers it hasn't seen.
+static AVATARS: Mutex<Option<HashMap<FaceId, Pixels>>> = Mutex::new(None);
 
 struct FaceRef {
     id: FaceId,
@@ -71,7 +88,11 @@ struct Loaded {
 
 /// The people list and every person tag.
 struct People {
-    items: Vec<PersonItem>,
+    /// Faces nobody has named or been suggested as.
+    unknown: usize,
+    people: Vec<PersonFaces>,
+    /// The covers' pixels.
+    avatars: Vec<(FaceId, Pixels)>,
     names: Vec<(String, String)>,
 }
 
@@ -102,6 +123,11 @@ struct FaceGrid {
     /// What a drag adds its rubber band to.
     drag_base: RefCell<BTreeSet<usize>>,
     names: RefCell<Vec<Name>>,
+    /// The people list as read (by path), before `arrange` sorts and filters it.
+    people: RefCell<Vec<PersonFaces>>,
+    unknown: Cell<usize>,
+    /// The covers, as images.
+    avatars: RefCell<HashMap<FaceId, Image>>,
     writer: mpsc::Sender<Change>,
     changes: Cell<u64>,
     /// A view to return to (Back) once the load in flight lands.
@@ -176,6 +202,9 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
         anchor: Cell::new(None),
         drag_base: RefCell::default(),
         names: RefCell::default(),
+        people: RefCell::default(),
+        unknown: Cell::new(0),
+        avatars: RefCell::default(),
         writer: spawn_writer(root, ui.as_weak()),
         changes: Cell::new(0),
         restore: RefCell::default(),
@@ -187,6 +216,27 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     bridge.on_select(|key| {
         log::debug!("person list click: key {key} ({})", person_label(key));
         with_grid(|g| g.load(Some(key), "person picked in the list"))
+    });
+    bridge.on_arrange(|| with_grid(|g| g.arrange()));
+    bridge.on_person_action(|key, action| {
+        log::debug!("person menu: {action} key {key} ({})", person_label(key));
+        with_grid(|g| match (g.ui.upgrade(), g.person_path(key)) {
+            (Some(ui), Some(path)) => crate::tags::edit(&ui, path, &action, None),
+            _ => log::debug!("person menu: key {key} not in the list - ignored"),
+        })
+    });
+    bridge.on_merge_drop(|from, index| {
+        with_grid(|g| {
+            let Some(ui) = g.ui.upgrade() else { return };
+            let into = usize::try_from(index).ok().and_then(|i| ui.global::<PeopleBridge>().get_people().row_data(i));
+            match (g.person_path(from), into) {
+                (Some(path), Some(into)) if into.key != UNKNOWN && into.key != from => {
+                    log::debug!("person {path:?} dropped on {:?}: confirm the merge", into.path);
+                    crate::tags::edit(&ui, path, "merge", Some(into.path.into()));
+                }
+                (path, into) => log::debug!("person {from} ({path:?}) dropped on row {index} ({:?}) - nothing to merge", into.map(|p| p.key)),
+            }
+        })
     });
     bridge.on_columns_changed(|n| {
         with_grid(|g| {
@@ -214,6 +264,14 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
             (Some(ui), Some(i)) => {
                 let target = g.target(i);
                 nav::context_menu(&ui, target);
+                // A face confirmed as the person on screen (not one only suggested, or named
+                // otherwise since the grid was loaded) can stand for them.
+                let bridge = ui.global::<PeopleBridge>();
+                let key = bridge.get_selected();
+                let confirmed = g.faces.borrow().get(i).is_some_and(|f| !f.suggested && f.mask.is_none());
+                if key != UNKNOWN && confirmed {
+                    actions::offer_cover(&ui, TagId(key as i64), bridge.get_title().into());
+                }
             }
             _ => log::debug!("face right-click at row {row} col {col}: no face there - no menu"),
         })
@@ -267,6 +325,24 @@ fn person_label(key: i32) -> String {
         }
     });
     found.unwrap_or_else(|| "not in the list".to_owned())
+}
+
+/// The user picks `face` (confirmed as `person`, called `name`) to stand for them in the
+/// list: saved on a worker, then the list is re-read.
+pub fn set_cover(ui: &AppWindow, person: TagId, face: FaceId, name: String) {
+    let Some(root) = GRID.with_borrow(|g| g.as_ref().map(|g| g.root.clone())) else { return };
+    log::debug!("set face {} as the cover for person {} ({name})", face.0, person.0);
+    let weak = ui.as_weak();
+    let _ = thread::Builder::new().name("people-cover".into()).spawn(move || {
+        let result = actions::open_catalog(&root).and_then(|mut c| c.set_person_cover(person, Some(face)).map_err(|e| e.to_string()));
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(()) => {
+                with_grid(|g| g.load_people());
+                actions::notify(&ui, format!("Cover for {name} set"), false, Vec::new());
+            }
+            Err(e) => actions::notify(&ui, format!("Can't set the cover: {e}"), true, Vec::new()),
+        });
+    });
 }
 
 /// The page was picked in the sidebar: faces get named elsewhere (and found by scans), so
@@ -378,7 +454,7 @@ impl FaceGrid {
             match &loaded {
                 Ok(l) => log::debug!(
                     "load #{generation} read: {} people, person {} {:?}, {} faces in {:?}",
-                    l.people.items.len(),
+                    l.people.people.len(),
                     l.selected,
                     l.title,
                     l.faces.len(),
@@ -414,7 +490,7 @@ impl FaceGrid {
             let people = Catalog::open(&Catalog::default_path(&root), &root).map_err(|e| e.to_string()).and_then(|c| read_people(&c));
             match people {
                 Ok(people) => {
-                    log::debug!("people list read: {} people in {:?}", people.items.len(), started.elapsed());
+                    log::debug!("people list read: {} people in {:?}", people.people.len(), started.elapsed());
                     let _ = weak.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
                 }
                 Err(e) => log::warn!("people list: {e}"),
@@ -438,7 +514,7 @@ impl FaceGrid {
             "show person {} {:?}: {} people, {} faces (model reset, selection cleared); restore pending: {}",
             loaded.selected,
             loaded.title,
-            loaded.people.items.len(),
+            loaded.people.people.len(),
             loaded.faces.len(),
             self.restore.borrow().as_ref().map_or_else(|| "none".to_owned(), |s| format!("{s:?}"))
         );
@@ -501,16 +577,70 @@ impl FaceGrid {
     }
 
     fn show_people(&self, people: People) {
-        let Some(ui) = self.ui.upgrade() else { return };
         log::debug!(
-            "people list model replaced: {} rows [{}], {} person tags",
-            people.items.len(),
-            people.items.iter().take(12).map(|p| format!("{}:{}({})", p.key, p.name, p.count)).collect::<Vec<_>>().join(", "),
+            "people list read: {} people with faces, {} unknown faces, {} covers, {} person tags",
+            people.people.len(),
+            people.unknown,
+            people.avatars.len(),
             people.names.len()
         );
-        ui.global::<PeopleBridge>().set_people(ModelRc::new(VecModel::from(people.items)));
+        {
+            let mut avatars = self.avatars.borrow_mut();
+            if avatars.len() >= AVATAR_CACHE {
+                avatars.clear();
+            }
+            for (face, pixels) in people.avatars {
+                avatars.entry(face).or_insert_with(|| Image::from_rgb8(pixels));
+            }
+        }
+        *self.people.borrow_mut() = people.people;
+        self.unknown.set(people.unknown);
         *self.names.borrow_mut() =
             people.names.into_iter().map(|(display, path)| Name { display, path }).collect();
+        self.arrange();
+    }
+
+    /// Shows the people list as read, sorted and filtered as the page says: Unknown first,
+    /// then the people the filter matches in the order picked ([`arrange`]).
+    fn arrange(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let bridge = ui.global::<PeopleBridge>();
+        let order = PeopleOrder::ALL.get(bridge.get_sort().max(0) as usize).copied().unwrap_or_default();
+        let filter = bridge.get_filter();
+        let people = arrange(self.people.borrow().clone(), order, &filter);
+        let avatars = self.avatars.borrow();
+        let mut items = vec![PersonItem {
+            key: UNKNOWN,
+            name: "Unknown".into(),
+            count: self.unknown.get() as i32,
+            initial: "?".into(),
+            ..Default::default()
+        }];
+        items.extend(people.iter().map(|p| {
+            let name = display_name(&p.path);
+            let avatar = p.cover.and_then(|f| avatars.get(&f)).cloned();
+            PersonItem {
+                key: p.tag.0 as i32,
+                name: name.into(),
+                path: p.path.as_str().into(),
+                count: (p.confirmed + p.suggested) as i32,
+                has_avatar: avatar.is_some(),
+                avatar: avatar.unwrap_or_default(),
+                initial: name.chars().next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default().into(),
+            }
+        }));
+        log::debug!(
+            "people list model replaced ({}, filter {filter:?}): {} rows [{}]",
+            order.name(),
+            items.len(),
+            items.iter().take(12).map(|p| format!("{}:{}({})", p.key, p.name, p.count)).collect::<Vec<_>>().join(", ")
+        );
+        bridge.set_people(ModelRc::new(VecModel::from(items)));
+    }
+
+    /// The tag path of the person with list key `key`.
+    fn person_path(&self, key: i32) -> Option<String> {
+        self.people.borrow().iter().find(|p| p.tag.0 as i32 == key).map(|p| p.path.clone())
     }
 
     fn publish_status(&self) {
@@ -799,7 +929,7 @@ fn spawn_writer(root: PathBuf, ui: slint::Weak<AppWindow>) -> mpsc::Sender<Chang
                 None => (change_id(&change), Err("can't open the catalog".to_owned())),
             };
             match &result {
-                Ok(people) => log::debug!("change {id} written in {:?}; {} people now", started.elapsed(), people.items.len()),
+                Ok(people) => log::debug!("change {id} written in {:?}; {} people now", started.elapsed(), people.people.len()),
                 Err(e) => log::warn!("change {id} failed: {e}"),
             }
             pending_refresh |= result.is_ok();
@@ -863,23 +993,41 @@ fn file_name(path: &Path) -> SharedString {
     path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into())
 }
 
-/// The people list: Unknown, then every person with faces; and every person tag.
+/// The people list: how many faces are unknown, every person with faces and their covers'
+/// pixels; and every person tag.
 fn read_people(catalog: &Catalog) -> Result<People, String> {
     let err = |e: archive_core::catalog::Error| e.to_string();
-    let unknown = catalog.faces(FaceFilter::Unknown, FaceOrder::Asset).map_err(err)?;
-    let mut items = vec![PersonItem { key: UNKNOWN, name: "Unknown".into(), count: unknown.len() as i32 }];
-    items.extend(catalog.people_with_faces().map_err(err)?.iter().map(|p| PersonItem {
-        key: p.tag.0 as i32,
-        name: display_name(&p.path).into(),
-        count: (p.confirmed + p.suggested) as i32,
-    }));
+    let unknown = catalog.faces(FaceFilter::Unknown, FaceOrder::Asset).map_err(err)?.len();
+    let people = catalog.people_with_faces().map_err(err)?;
+    let avatars = people.iter().filter_map(|p| p.cover).filter_map(|face| Some((face, avatar(catalog, face)?))).collect();
     let names = catalog
         .leaf_tags(TagKind::Person)
         .map_err(err)?
         .into_iter()
         .map(|(_, path)| (display_name(&path).to_owned(), path))
         .collect();
-    Ok(People { items, names })
+    Ok(People { unknown, people, avatars, names })
+}
+
+/// The face's crop, small, for the people list: decoded once, then from [`AVATARS`].
+fn avatar(catalog: &Catalog, face: FaceId) -> Option<Pixels> {
+    if let Some(pixels) = AVATARS.lock().ok()?.as_ref().and_then(|cache| cache.get(&face)) {
+        return Some(pixels.clone());
+    }
+    let jpeg = catalog.face_crop(face).ok()??;
+    let rgb = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+        .inspect_err(|e| log::debug!("people: cover face {}: {e}", face.0))
+        .ok()?
+        .to_rgb8();
+    let small = image::imageops::thumbnail(&rgb, AVATAR_EDGE.min(rgb.width()), AVATAR_EDGE.min(rgb.height()));
+    let pixels = Pixels::clone_from_slice(small.as_raw(), small.width(), small.height());
+    let mut cache = AVATARS.lock().ok()?;
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if cache.len() >= AVATAR_CACHE {
+        cache.clear();
+    }
+    cache.insert(face, pixels.clone());
+    Some(pixels)
 }
 
 /// Worker thread: the people list, and the faces of `key` (Unknown if that person is gone).

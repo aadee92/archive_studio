@@ -41,6 +41,9 @@ add-face PATH X Y W H      box a face the detector missed (fractions of the pict
 person rename NAME NEW     rename a person (onto an existing one: merge)
 person merge NAME INTO     NAME's faces and tags become INTO's
 person delete NAME         un-name their faces and drop their tag
+person cover NAME FACE_ID  the face that stands for them in people lists (auto: the best)
+people [ORDER] [TEXT]      people with faces: counts and cover face, by name or ORDER
+                           (faces: most first, recent: named last first); TEXT narrows
 sync-people                put missing People| tags on files with named faces
 tags [PATH]                every tag as a tree with how many files carry it (or one
                            under it), or the file's tags
@@ -309,6 +312,7 @@ impl Shell {
             "delete-face" => self.each_face(rest, "delete-face", Catalog::delete_faces),
             "add-face" => self.add_face(rest),
             "person" => self.person(rest),
+            "people" => self.people(rest),
             "sync-people" => self.catalog.sync_person_tags().map(|n| println!("added {n} person tags")).map_err(|e| e.to_string()),
             "tags" if rest.is_empty() => self.tag_tree(),
             "tags" => self.tags(rest),
@@ -491,6 +495,25 @@ impl Shell {
         Ok(())
     }
 
+    /// `people [name|faces|recent] [TEXT]`.
+    fn people(&self, args: &[&str]) -> Result<(), String> {
+        use archive_core::catalog::people::{arrange, PeopleOrder};
+        let (order, filter) = match args.split_first() {
+            Some((first, rest)) => match PeopleOrder::from_name(first) {
+                Some(order) => (order, rest.join(" ")),
+                None => (PeopleOrder::Name, args.join(" ")),
+            },
+            None => (PeopleOrder::Name, String::new()),
+        };
+        let people = arrange(self.catalog.people_with_faces().map_err(err)?, order, &filter);
+        for p in &people {
+            let cover = p.cover.map_or_else(|| "-".to_owned(), |f| f.0.to_string());
+            println!("{:>5} confirmed  {:>5} suggested  cover {cover:<6}  {}", p.confirmed, p.suggested, p.path);
+        }
+        println!("{} people", people.len());
+        Ok(())
+    }
+
     /// The asset a typed path names.
     fn asset(&self, arg: &str) -> Result<AssetId, String> {
         let path = self.resolve(arg);
@@ -573,7 +596,7 @@ impl Shell {
 
     /// `person rename|merge|delete ...`; two names are separated by `->` (or are one word each).
     fn person(&mut self, args: &[&str]) -> Result<(), String> {
-        let usage = "person rename NAME -> NEW | person merge NAME -> INTO | person delete NAME";
+        let usage = "person rename NAME -> NEW | person merge NAME -> INTO | person delete NAME | person cover NAME FACE_ID|auto";
         let Some((&action, rest)) = args.split_first() else { return Err(usage.into()) };
         let two = || two_names(rest, usage);
         let existing = |catalog: &Catalog, name: &str| -> Result<archive_core::catalog::TagId, String> {
@@ -603,6 +626,18 @@ impl Shell {
             "delete" => {
                 let person = existing(&self.catalog, &rest.join(" "))?;
                 self.catalog.delete_person(person).map_err(err)?;
+            }
+            "cover" => {
+                let [name @ .., face] = rest else { return Err(usage.into()) };
+                let face = match *face {
+                    "auto" => None,
+                    id => Some(FaceId(id.parse().map_err(|_| usage.to_owned())?)),
+                };
+                let person = existing(&self.catalog, &name.join(" "))?;
+                self.catalog.set_person_cover(person, face).map_err(err)?;
+                let cover = self.catalog.person_cover(person).map_err(err)?;
+                println!("cover: {}", cover.map_or_else(|| "none (no face named as them)".to_owned(), |f| format!("face {}", f.0)));
+                return Ok(());
             }
             _ => return Err(usage.into()),
         }

@@ -339,6 +339,10 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
             "not" => change_face(&ui, FaceChange::Not(face.id)),
             "ignore" => change_face(&ui, FaceChange::Ignore(face.id)),
             "delete" => change_face(&ui, FaceChange::Delete(face.id)),
+            "cover" => match face.person {
+                Some((person, name)) => crate::people::set_cover(&ui, person, face.id, name),
+                None => log::debug!("details: face {} isn't named: no cover - ignored", face.id.0),
+            },
             other => log::warn!("details: unknown face action {other:?}"),
         }
     });
@@ -350,6 +354,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         let who = face.person.as_ref().or(face.suggestion.as_ref()).map(|(_, name)| name.as_str()).unwrap_or_default();
         details.set_menu_face(i);
         details.set_menu_person(who.into());
+        details.set_menu_named(face.person.is_some());
         details.set_menu_ignored(face.ignored);
         details.set_face_menu_serial(details.get_face_menu_serial() + 1);
     });

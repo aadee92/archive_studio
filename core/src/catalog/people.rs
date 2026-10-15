@@ -16,14 +16,107 @@
 //!
 //! Catalogs from before this was kept get the tags once on upgrade
 //! ([`Catalog::sync_person_tags`] repairs any time).
+//!
+//! Each person has a *cover*, the face that stands for them in a people list
+//! ([`Catalog::person_cover`]): the one the user picked ([`Catalog::set_person_cover`]) while
+//! it is still confirmed as them, else the best of their confirmed faces. A people list can
+//! be [arranged](arrange) by name, face count or who was named last.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::faces::{FaceId, FaceStatus};
+use super::faces::{FaceId, FaceStatus, PersonFaces};
 use super::{normalize_tag, AssetId, Catalog, Error, Region, Result, TagId, TagKind};
 
 /// The root of every person tag.
 pub const PEOPLE: &str = "People";
+
+/// Schema 7: covers picked by the user, and when faces were named (for "recently named").
+pub(super) const SCHEMA_7: &str = "
+-- The face the user picked to stand for a person. Ignored once that face is no longer
+-- confirmed as them (person_cover falls back to the best one).
+CREATE TABLE person_covers (
+    tag_id INTEGER PRIMARY KEY REFERENCES tags(id) ON DELETE CASCADE,
+    face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE
+);
+-- When the face was named as its person (ms since the Unix epoch); NULL from before.
+ALTER TABLE faces ADD COLUMN named_at INTEGER;
+";
+
+/// A face box shorter than this fraction of the picture counts as small for a cover: its
+/// crop is blown up from few pixels.
+const COVER_HEIGHT: f32 = 0.15;
+
+/// SQL for the cover of the person whose tag id is `person` (a column or a parameter): the
+/// face picked for them while it is still theirs, else their best confirmed face: one with
+/// a crop, found by a scan rather than boxed by hand (no real score), with the highest
+/// detector score, scaled down for small faces.
+pub(super) fn cover_of(person: &str) -> String {
+    format!(
+        "COALESCE(
+             (SELECT c.face_id FROM person_covers c JOIN faces cf ON cf.id = c.face_id
+              WHERE c.tag_id = {person} AND cf.person = {person}),
+             (SELECT bf.id FROM faces bf WHERE bf.person = {person}
+              ORDER BY NOT EXISTS (SELECT 1 FROM face_crops WHERE face_id = bf.id), bf.manual,
+                  bf.score * min(1.0, bf.h / {COVER_HEIGHT}) DESC, bf.id
+              LIMIT 1))"
+    )
+}
+
+/// Now, as `faces.named_at` keeps it.
+pub(super) fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// How [`arrange`] orders a people list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeopleOrder {
+    /// By display name, ignoring case.
+    #[default]
+    Name,
+    /// Most faces (confirmed and suggested) first.
+    Faces,
+    /// Whoever had a face named last first; people named before that was kept last.
+    RecentlyNamed,
+}
+
+impl PeopleOrder {
+    pub const ALL: [PeopleOrder; 3] = [PeopleOrder::Name, PeopleOrder::Faces, PeopleOrder::RecentlyNamed];
+
+    /// `name`, `faces` or `recent`.
+    pub fn name(self) -> &'static str {
+        match self {
+            PeopleOrder::Name => "name",
+            PeopleOrder::Faces => "faces",
+            PeopleOrder::RecentlyNamed => "recent",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.name().eq_ignore_ascii_case(name.trim()))
+    }
+}
+
+/// `people` (as [`Catalog::people_with_faces`] lists them) whose path below `People|`
+/// contains `filter` ignoring case (all of them for an empty one), in `order`; ties go by
+/// name.
+pub fn arrange(mut people: Vec<PersonFaces>, order: PeopleOrder, filter: &str) -> Vec<PersonFaces> {
+    let filter = filter.trim().to_lowercase();
+    if !filter.is_empty() {
+        people.retain(|p| {
+            let path = p.path.to_lowercase();
+            path.strip_prefix(&format!("{}|", PEOPLE.to_lowercase())).unwrap_or(&path).contains(&filter)
+        });
+    }
+    let name = |p: &PersonFaces| (display_name(&p.path).to_lowercase(), p.path.to_lowercase());
+    match order {
+        PeopleOrder::Name => people.sort_by_cached_key(name),
+        PeopleOrder::Faces => people.sort_by_cached_key(|p| (std::cmp::Reverse(p.confirmed + p.suggested), name(p))),
+        PeopleOrder::RecentlyNamed => people.sort_by_cached_key(|p| (std::cmp::Reverse(p.last_named), name(p))),
+    }
+    people
+}
 
 /// A face on an asset, for drawing its box and name over the image.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +280,45 @@ impl Catalog {
         tx.execute("DELETE FROM tags WHERE id = ?1", [person.0])?;
         super::tags::prune_ancestors(&tx, &path)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The face that stands for `person`: the one [picked](Self::set_person_cover) while it
+    /// is still confirmed as them, else their best confirmed face (with a crop, found by a
+    /// scan, highest detector score, big enough). `None` if no face is confirmed as them.
+    pub fn person_cover(&self, person: TagId) -> Result<Option<FaceId>> {
+        self.person_tag_path(person)?;
+        let sql = format!("SELECT {}", cover_of("?1"));
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        Ok(stmt.query_row([person.0], |row| row.get::<_, Option<i64>>(0))?.map(FaceId))
+    }
+
+    /// The user picks `face` (confirmed as `person`) to stand for them; `None` goes back to
+    /// the best one. Once the face is no longer theirs the pick is ignored.
+    pub fn set_person_cover(&mut self, person: TagId, face: Option<FaceId>) -> Result<()> {
+        let result = self.set_person_cover_inner(person, face);
+        super::logged(format_args!("set_person_cover {} to face {:?}", person.0, face.map(|f| f.0)), result)
+    }
+
+    fn set_person_cover_inner(&mut self, person: TagId, face: Option<FaceId>) -> Result<()> {
+        let path = self.person_tag_path(person)?;
+        let Some(face) = face else {
+            self.conn.execute("DELETE FROM person_covers WHERE tag_id = ?1", [person.0])?;
+            return Ok(());
+        };
+        let named: Option<Option<i64>> =
+            self.conn.query_row("SELECT person FROM faces WHERE id = ?1", [face.0], |row| row.get(0)).optional()?;
+        match named {
+            None => return Err(Error::Invalid(format!("no face {}", face.0))),
+            Some(who) if who != Some(person.0) => {
+                return Err(Error::Invalid(format!("face {} isn't named as {path}", face.0)));
+            }
+            Some(_) => {}
+        }
+        self.conn.execute(
+            "INSERT INTO person_covers (tag_id, face_id) VALUES (?1, ?2) ON CONFLICT DO UPDATE SET face_id = excluded.face_id",
+            [person.0, face.0],
+        )?;
         Ok(())
     }
 
@@ -392,6 +524,93 @@ mod tests {
         assert_eq!(matching_people(&people, "ali", 2), ["People|Alice", "People|Family|Alice"]);
         assert_eq!(matching_people(&people, "bo", 10), ["Bob"]);
         assert!(matching_people(&people, "  ", 10).is_empty());
+    }
+
+    #[test]
+    fn the_cover_is_the_pick_while_it_is_theirs_else_the_best_face() {
+        let mut lib = Lib::new();
+        let (_, f) = lib.photo("a.jpg", 3);
+        let alice = lib.cat.name_faces(&f, "Alice").unwrap();
+        // Same score: the bigger face wins; a small one with a better score doesn't.
+        let set = |lib: &mut Lib, face: FaceId, score: f32, h: f32| {
+            lib.cat.conn.execute("UPDATE faces SET score = ?2, h = ?3 WHERE id = ?1", params![face.0, score, h]).unwrap();
+        };
+        set(&mut lib, f[0], 0.8, 0.3);
+        set(&mut lib, f[1], 0.95, 0.03);
+        set(&mut lib, f[2], 0.7, 0.3);
+        assert_eq!(lib.cat.person_cover(alice).unwrap(), Some(f[0]));
+        assert_eq!(lib.cat.people_with_faces().unwrap()[0].cover, Some(f[0]));
+
+        lib.cat.set_person_cover(alice, Some(f[2])).unwrap();
+        assert_eq!(lib.cat.person_cover(alice).unwrap(), Some(f[2]));
+        assert_eq!(lib.cat.people_with_faces().unwrap()[0].cover, Some(f[2]));
+
+        // Only a face of theirs can be picked.
+        let (_, g) = lib.photo("b.jpg", 1);
+        assert!(lib.cat.set_person_cover(alice, Some(g[0])).is_err());
+        assert!(lib.cat.set_person_cover(alice, Some(FaceId(999))).is_err());
+
+        // Not theirs any more: back to the best.
+        lib.cat.not_person(&f[2..]).unwrap();
+        assert_eq!(lib.cat.person_cover(alice).unwrap(), Some(f[0]));
+        lib.cat.set_person_cover(alice, Some(f[1])).unwrap();
+        lib.cat.set_person_cover(alice, None).unwrap();
+        assert_eq!(lib.cat.person_cover(alice).unwrap(), Some(f[0]));
+
+        // A person with no confirmed face has none.
+        let bob = lib.cat.person("Bob").unwrap();
+        assert_eq!(lib.cat.person_cover(bob).unwrap(), None);
+        assert!(lib.cat.person_cover(lib.cat.tag("Dog", TagKind::Object).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_merge_keeps_the_cover_of_whoever_had_one() {
+        let mut lib = Lib::new();
+        let (_, f) = lib.photo("a.jpg", 2);
+        let al = lib.cat.name_faces(&f[..1], "Al").unwrap();
+        let alice = lib.cat.name_faces(&f[1..], "Alice").unwrap();
+        lib.cat.set_person_cover(al, Some(f[0])).unwrap();
+        lib.cat.merge_people(al, alice).unwrap();
+        assert_eq!(lib.cat.person_cover(alice).unwrap(), Some(f[0]));
+        lib.cat.delete_person(alice).unwrap();
+        let left: i64 = lib.cat.conn.query_row("SELECT count(*) FROM person_covers", [], |row| row.get(0)).unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn people_are_arranged_by_name_faces_or_last_named() {
+        let mut lib = Lib::new();
+        let (_, f) = lib.photo("a.jpg", 4);
+        lib.cat.name_faces(&f[..1], "bob").unwrap();
+        lib.cat.name_faces(&f[1..3], "Alice").unwrap();
+        lib.cat.name_faces(&f[3..], "Family|Carol").unwrap();
+        // Bob named last; Carol before this was kept.
+        lib.cat.conn.execute("UPDATE faces SET named_at = 10 WHERE id IN (?1, ?2)", [f[1].0, f[2].0]).unwrap();
+        lib.cat.conn.execute("UPDATE faces SET named_at = 20 WHERE id = ?1", [f[0].0]).unwrap();
+        lib.cat.conn.execute("UPDATE faces SET named_at = NULL WHERE id = ?1", [f[3].0]).unwrap();
+        let people = lib.cat.people_with_faces().unwrap();
+        let names = |order, filter| -> Vec<String> {
+            arrange(people.clone(), order, filter).iter().map(|p| display_name(&p.path).to_owned()).collect()
+        };
+        assert_eq!(names(PeopleOrder::Name, ""), ["Alice", "bob", "Carol"]);
+        assert_eq!(names(PeopleOrder::Faces, ""), ["Alice", "bob", "Carol"]);
+        assert_eq!(names(PeopleOrder::RecentlyNamed, ""), ["bob", "Alice", "Carol"]);
+        assert_eq!(names(PeopleOrder::Name, " fam"), ["Carol"]);
+        assert_eq!(names(PeopleOrder::Name, "O"), ["bob", "Carol"]);
+        assert_eq!(PeopleOrder::from_name("Recent"), Some(PeopleOrder::RecentlyNamed));
+    }
+
+    #[test]
+    fn naming_keeps_when_a_face_was_named() {
+        let mut lib = Lib::new();
+        let (_, f) = lib.photo("a.jpg", 1);
+        let alice = lib.cat.name_faces(&f, "Alice").unwrap();
+        let named = lib.cat.people_with_faces().unwrap()[0].last_named;
+        assert!(named.is_some_and(|t| t > 0));
+        // Naming them as the same person again leaves the time.
+        lib.cat.conn.execute("UPDATE faces SET named_at = 5", []).unwrap();
+        lib.cat.confirm_faces(&f, alice).unwrap();
+        assert_eq!(lib.cat.people_with_faces().unwrap()[0].last_named, Some(5));
     }
 
     #[test]

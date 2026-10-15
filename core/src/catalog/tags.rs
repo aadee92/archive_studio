@@ -331,6 +331,8 @@ pub(super) fn prune_ancestors(conn: &Connection, path: &str) -> Result<()> {
 /// applied if either was, the region kept where there is one).
 pub(super) fn move_tag_rows(tx: &Transaction, from: TagId, into: TagId) -> Result<()> {
     tx.execute("UPDATE faces SET person = ?2 WHERE person = ?1", [from.0, into.0])?;
+    // `from`'s cover stands for `into` if `into` had none.
+    tx.execute("INSERT OR IGNORE INTO person_covers (tag_id, face_id) SELECT ?2, face_id FROM person_covers WHERE tag_id = ?1", [from.0, into.0])?;
     tx.execute("UPDATE faces SET suggested = ?2 WHERE suggested = ?1", [from.0, into.0])?;
     tx.execute("INSERT OR IGNORE INTO face_rejections (face_id, tag_id) SELECT face_id, ?2 FROM face_rejections WHERE tag_id = ?1", [from.0, into.0])?;
     tx.execute("DELETE FROM face_rejections WHERE tag_id = ?1 AND face_id IN (SELECT id FROM faces WHERE person = ?1)", [into.0])?;

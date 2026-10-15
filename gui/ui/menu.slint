@@ -27,8 +27,11 @@ export global ItemMenu {
     // The view it was right-clicked in has an item before / after it, to pair it with.
     in property <bool> can-pair-prev;
     in property <bool> can-pair-next;
+    // A face confirmed as a person (right-clicked in People): their name, for "Set as cover
+    // for …"; "" otherwise.
+    in property <string> cover-for;
     // "rotate-left", "rotate-right", "delete", "tag", "properties", "pair-prev", "pair-next"
-    // (it is the back of that item), "swap-sides", "unpair", "find-similar".
+    // (it is the back of that item), "swap-sides", "unpair", "find-similar", "set-cover".
     callback action(string);
 
     // Add tag dialog.
@@ -56,8 +59,8 @@ export global ItemMenu {
     callback notice-clicked();
 }
 
-// Managing a tag from Review's tag tree (`src/tags.rs`): its menu reports `action`, and
-// Rust opens the dialog for it (`mode`).
+// Managing a tag from Review's tag tree or a person from People's list (`src/tags.rs`): its
+// menu reports `action`, and Rust opens the dialog for it (`mode`).
 export global TagEdit {
     // From the tag tree's menu: the tag's path, how many items it is on, whether tags are
     // under it, and "rename", "merge" or "delete".
@@ -65,6 +68,8 @@ export global TagEdit {
 
     // The dialog: "" (closed), "rename", "merge" or "delete".
     in property <string> mode;
+    // The tag is a person: the dialog speaks of people.
+    in property <bool> person;
     // The tag, as shown ("People / Ann").
     in property <string> label;
     // What the change will do (how many items, the tags under it, faces).
@@ -219,7 +224,9 @@ export component TagEditDialog inherits Rectangle {
                 padding: 18px;
                 spacing: 10px;
                 Text {
-                    text: TagEdit.mode == "rename" ? "Rename tag" : TagEdit.mode == "merge" ? "Merge tag into…" : "Delete tag";
+                    text: TagEdit.person
+                        ? (TagEdit.mode == "rename" ? "Rename person" : TagEdit.mode == "merge" ? "Merge person into…" : "Delete person")
+                        : (TagEdit.mode == "rename" ? "Rename tag" : TagEdit.mode == "merge" ? "Merge tag into…" : "Delete tag");
                     font-size: 16px;
                     font-weight: 600;
                     color: Theme.text;
@@ -229,7 +236,9 @@ export component TagEditDialog inherits Rectangle {
                 edit := LineEdit {
                     visible: TagEdit.mode != "delete";
                     height: TagEdit.mode != "delete" ? self.preferred-height : 0px;
-                    placeholder-text: TagEdit.mode == "merge" ? "The tag to merge it into" : "New name, e.g. Holidays|1998";
+                    placeholder-text: TagEdit.person
+                        ? (TagEdit.mode == "merge" ? "The person they are" : "New name")
+                        : (TagEdit.mode == "merge" ? "The tag to merge it into" : "New name, e.g. Holidays|1998");
                     enabled: !TagEdit.working;
                     edited(text) => { TagEdit.edited(text); }
                     accepted(text) => { TagEdit.submit(text, false); }

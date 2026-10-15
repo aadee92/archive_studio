@@ -169,6 +169,12 @@ pub struct PersonFaces {
     pub confirmed: usize,
     /// Unreviewed faces suggested as this person.
     pub suggested: usize,
+    /// The face that stands for them in a people list ([`Catalog::person_cover`]); `None`
+    /// while no face is confirmed as them.
+    pub cover: Option<FaceId>,
+    /// When a face was last named as them (ms since the Unix epoch); `None` for faces
+    /// named before this was kept.
+    pub last_named: Option<i64>,
 }
 
 /// Detects and embeds the faces in the image at `path`, highest score first, on the
@@ -351,23 +357,31 @@ impl Catalog {
         Ok(stmt.query_row([face.0], |row| row.get(0)).optional()?)
     }
 
-    /// Every person tag with confirmed or suggested faces, by path.
+    /// Every person tag with confirmed or suggested faces, by path, with their
+    /// [cover](Self::person_cover) (see [`people::arrange`](super::people::arrange) for
+    /// other orders).
     pub fn people_with_faces(&self) -> Result<Vec<PersonFaces>> {
-        let mut stmt = self.conn.prepare_cached(
+        let sql = format!(
             "SELECT g.id, g.path,
                  (SELECT count(*) FROM faces WHERE person = g.id),
-                 (SELECT count(*) FROM faces WHERE suggested = g.id AND person IS NULL AND NOT ignored)
+                 (SELECT count(*) FROM faces WHERE suggested = g.id AND person IS NULL AND NOT ignored),
+                 {cover},
+                 (SELECT max(named_at) FROM faces WHERE person = g.id)
              FROM tags g WHERE g.kind = 'person'
                  AND (EXISTS (SELECT 1 FROM faces WHERE person = g.id)
                       OR EXISTS (SELECT 1 FROM faces WHERE suggested = g.id AND person IS NULL AND NOT ignored))
              ORDER BY g.path COLLATE NOCASE",
-        )?;
+            cover = super::people::cover_of("g.id")
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(PersonFaces {
                 tag: TagId(row.get(0)?),
                 path: row.get(1)?,
                 confirmed: row.get::<_, i64>(2)? as usize,
                 suggested: row.get::<_, i64>(3)? as usize,
+                cover: row.get::<_, Option<i64>>(4)?.map(FaceId),
+                last_named: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -400,8 +414,10 @@ impl Catalog {
         for &face in faces {
             release(&tx, face, Some(person))?;
             tx.execute(
-                "UPDATE faces SET person = ?2, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL WHERE id = ?1",
-                [face.0, person.0],
+                "UPDATE faces SET person = ?2, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL,
+                     named_at = CASE WHEN person IS ?2 THEN named_at ELSE ?3 END
+                 WHERE id = ?1",
+                params![face.0, person.0, super::people::now_ms()],
             )?;
             tx.execute("DELETE FROM face_rejections WHERE face_id = ?1 AND tag_id = ?2", [face.0, person.0])?;
             tx.execute(

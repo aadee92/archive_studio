@@ -1,7 +1,8 @@
 //! The item context menu: Rotate left / right, Add tag…, front and back (pair as the back of
 //! the previous / next item of the view, swap, unpair), Find similar (Review ranked by how
 //! much pictures look like it: [`review::find_similar`](crate::review::find_similar)), Show
-//! in folder, Properties, Delete,
+//! in folder, Properties, Delete, and for a face confirmed as someone (People's grid) Set as
+//! cover ([`people::set_cover`](crate::people::set_cover)),
 //! for any item a page shows (a Review tile, a face in People, a recent capture in Acquire,
 //! the Details picture and its similar strip). Pages resolve the item under the pointer and
 //! call [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the
@@ -33,7 +34,7 @@ use crate::nav::Target;
 use crate::pipeline::{self, Handle};
 use crate::review::human_size;
 use crate::{AppWindow, ItemMenu, PropRow};
-use archive_core::catalog::{AssetId, Catalog, Source};
+use archive_core::catalog::{AssetId, Catalog, Source, TagId};
 use archive_core::desktop;
 use archive_core::media::{classify, MediaKind};
 use archive_core::ops::{self, Properties};
@@ -51,6 +52,8 @@ struct State {
     target: Option<Target>,
     /// The items it acts on when it was opened on a multi-selection (empty otherwise).
     items: Vec<PathBuf>,
+    /// Who the target's face is confirmed as, for "Set as cover" ([`offer_cover`]).
+    cover: Option<(TagId, String)>,
     /// The items the tag dialog adds to.
     tagging: Vec<PathBuf>,
     /// Every tag in the catalog, for the tag dialog's matches.
@@ -76,6 +79,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         pipeline,
         target: None,
         items: Vec::new(),
+        cover: None,
         tagging: Vec::new(),
         tags: Vec::new(),
         undo: Vec::new(),
@@ -149,13 +153,22 @@ pub fn show_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
     with_state(|s| {
         s.target = Some(target);
         s.items = if many { items } else { Vec::new() };
+        s.cover = None;
     });
     let menu = ui.global::<ItemMenu>();
+    menu.set_cover_for(SharedString::default());
     menu.set_count(count as i32);
     menu.set_can_rotate(rotatable);
     menu.set_can_pair_prev(at.is_some_and(|i| i > 0));
     menu.set_can_pair_next(at.is_some_and(|i| i + 1 < len));
     menu.set_serial(menu.get_serial() + 1);
+}
+
+/// Offers "Set as cover for `name`" in the menu just shown (right after [`show_menu`]): its
+/// target's face is confirmed as `person`.
+pub fn offer_cover(ui: &AppWindow, person: TagId, name: String) {
+    ui.global::<ItemMenu>().set_cover_for(name.as_str().into());
+    with_state(|s| s.cover = Some((person, name)));
 }
 
 /// An image whose file can be turned losslessly.
@@ -222,6 +235,10 @@ pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<Pa
         "properties" => properties(ui, target.path),
         "show-in-folder" => show_in_folder(ui, target.path),
         "find-similar" => crate::review::find_similar(ui, &target.path),
+        "set-cover" => match (target.face, with_state(|s| s.cover.clone()).flatten()) {
+            (Some(face), Some((person, name))) => crate::people::set_cover(ui, person, face, name),
+            _ => log::warn!("context menu: set-cover on {target:?} with no named face - ignored"),
+        },
         "open-external" => open_externally(ui, target.path),
         "pair-prev" => pair_with_neighbour(ui, target, -1),
         "pair-next" => pair_with_neighbour(ui, target, 1),

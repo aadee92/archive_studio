@@ -1,5 +1,8 @@
 //! Managing a tag from Review's tag tree: its right-click menu (Rename…, Merge into…,
-//! Delete…) opens the dialog for it (`TagEdit` / `TagEditDialog` in `ui/menu.slint`).
+//! Delete…) opens the dialog for it (`TagEdit` / `TagEditDialog` in `ui/menu.slint`). People's
+//! list opens the same dialog for a person ([`edit`]): its menu, or a person dragged onto
+//! another (Merge into…, filled in, to confirm). For a person the dialog says how many faces
+//! and pictures are theirs, read with the catalog's tags, and Merge offers only people.
 //!
 //! Each change is an [`archive_core::ops`] call on a worker: [`ops::rename_tag`] (onto a
 //! taken path the dialog offers to merge instead), [`ops::merge_tags`] (the box offers the
@@ -19,7 +22,9 @@ use crate::actions::{self, matching_tags};
 use crate::pipeline;
 use crate::review;
 use crate::{AppWindow, TagEdit};
-use archive_core::catalog::TagKind;
+use archive_core::catalog::faces::{FaceFilter, FaceOrder};
+use archive_core::catalog::people::{matching_people, PEOPLE};
+use archive_core::catalog::{Catalog, TagKind};
 use archive_core::ops::{self, Renamed};
 
 struct State {
@@ -48,7 +53,7 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     edit.on_action(move |path, count, children, action| {
         log::debug!("tag menu: {action} {path:?} (on {count} items, tags under it {children})");
         if let Some(ui) = weak.upgrade() {
-            open(&ui, path.into(), count.max(0) as usize, children, action.into());
+            open(&ui, path.into(), count.max(0) as usize, children, action.into(), None);
         }
     });
     let weak = ui.as_weak();
@@ -86,9 +91,42 @@ fn is_person(path: &str) -> bool {
     ops::parse_tag(path).0 == TagKind::Person
 }
 
+/// Opens the dialog for `action` ("rename", "merge" or "delete") on the person at `path`
+/// (from People), its box filled with `initial` (the person they were dropped on).
+pub fn edit(ui: &AppWindow, path: String, action: &str, initial: Option<String>) {
+    log::debug!("person {action} {path:?} (box {initial:?})");
+    open(ui, path, 0, false, action.to_owned(), initial);
+}
+
+/// "12 faces on 9 pictures".
+fn faces_on(faces: usize, pictures: usize) -> String {
+    let faces = if faces == 1 { "1 face".to_owned() } else { format!("{faces} faces") };
+    let pictures = if pictures == 1 { "1 picture".to_owned() } else { format!("{pictures} pictures") };
+    format!("{faces} on {pictures}")
+}
+
+/// What the dialog says it will do to a person who has `faces` named faces on `pictures`.
+fn person_message(action: &str, name: &str, faces: usize, pictures: usize) -> String {
+    let theirs = faces_on(faces, pictures);
+    match action {
+        "rename" => format!("{name}: {theirs}. A name alone keeps their place under People."),
+        "merge" => format!("{name}'s {theirs} become the person you pick, and {name} is deleted."),
+        _ => format!("Delete {name}? Their {theirs} go back to Unknown, and the tag comes off the pictures. This can't be undone."),
+    }
+}
+
+/// How many confirmed faces the person at `path` has, and on how many pictures.
+fn person_counts(catalog: &Catalog, path: &str) -> Result<(usize, usize), String> {
+    let err = |e: archive_core::catalog::Error| e.to_string();
+    let Some((tag, _, _)) = catalog.find_tag(path).map_err(err)? else { return Ok((0, 0)) };
+    let faces = catalog.faces(FaceFilter::Confirmed(tag), FaceOrder::Asset).map_err(err)?.len();
+    Ok((faces, catalog.tag_assets(tag).map_err(err)?.len()))
+}
+
 /// Opens the dialog for `action` on the tag at `path`, which `count` items carry (with the
-/// tags under it, if it has `children`), and reads the catalog's tags for it on a worker.
-fn open(ui: &AppWindow, path: String, count: usize, children: bool, action: String) {
+/// tags under it, if it has `children`), its box filled with `initial` (else the path for a
+/// rename), and reads the catalog's tags for it on a worker (and a person's counts).
+fn open(ui: &AppWindow, path: String, count: usize, children: bool, action: String, initial: Option<String>) {
     let Some((root, generation)) = with_state(|s| {
         s.generation += 1;
         s.path = path.clone();
@@ -98,10 +136,10 @@ fn open(ui: &AppWindow, path: String, count: usize, children: bool, action: Stri
     }) else {
         return;
     };
-    let person = is_person(&path);
+    let person = is_person(&path) && !children;
     let under = if children { " and the tags under it" } else { "" };
     let message = match action.as_str() {
-        "rename" if person => format!("On {}. Their faces keep the new name; a name alone keeps their place under People.", items(count)),
+        _ if person => "Reading…".to_owned(),
         "rename" => format!("On {}. The tags under it move along.", items(count)),
         "merge" => format!("Its {}{under} go to the tag you pick, and it is deleted.", items(count)),
         _ => {
@@ -112,25 +150,32 @@ fn open(ui: &AppWindow, path: String, count: usize, children: bool, action: Stri
     let edit = ui.global::<TagEdit>();
     edit.set_label(shown(&path).into());
     edit.set_message(message.into());
-    edit.set_initial(if action == "rename" { path.as_str().into() } else { SharedString::default() });
+    let initial = initial.or_else(|| (action == "rename").then(|| path.clone()));
+    edit.set_initial(initial.clone().unwrap_or_default().into());
+    edit.set_person(person);
     edit.set_matches(ModelRc::default());
     edit.set_error(SharedString::default());
     edit.set_taken(SharedString::default());
     edit.set_working(false);
-    edit.set_mode(action.into());
+    edit.set_mode(action.as_str().into());
     let weak = ui.as_weak();
     thread::spawn(move || {
         let read = actions::open_catalog(&root).and_then(|catalog| {
             let known = catalog.find_tag(&path).map_err(|e| e.to_string())?.is_some();
-            Ok((known, catalog.all_tags().map_err(|e| e.to_string())?))
+            let counts = if person { Some(person_counts(&catalog, &path)?) } else { None };
+            Ok((known, counts, catalog.all_tags().map_err(|e| e.to_string())?))
         });
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if with_state(|s| s.generation) != Some(generation) {
                 return;
             }
             match read {
-                Ok((known, tags)) => {
-                    log::debug!("tag edit dialog: {} tags in the catalog, {path:?} among them {known}", tags.len());
+                Ok((known, counts, tags)) => {
+                    log::debug!("tag edit dialog: {} tags in the catalog, {path:?} among them {known}; person counts {counts:?}", tags.len());
+                    if let Some((faces, pictures)) = counts {
+                        let message = person_message(&action, archive_core::catalog::people::display_name(&path), faces, pictures);
+                        ui.global::<TagEdit>().set_message(message.into());
+                    }
                     if !known {
                         let why = "This tag comes from folder names or another program's sidecar, not the catalog: change it there.";
                         ui.global::<TagEdit>().set_error(why.into());
@@ -153,6 +198,20 @@ fn edited(ui: &AppWindow, text: &str) {
     let offered: Vec<SharedString> = with_state(|s| {
         if s.mode != "merge" {
             return Vec::new();
+        }
+        if is_person(&s.path) {
+            // Only people, not the groups above them, and not this one.
+            let own = s.path.to_ascii_lowercase();
+            let people: Vec<&String> = s
+                .tags
+                .iter()
+                .filter(|t| {
+                    let lower = t.to_ascii_lowercase();
+                    is_person(t) && lower != own && !lower.eq_ignore_ascii_case(PEOPLE)
+                        && !s.tags.iter().any(|u| u.to_ascii_lowercase().starts_with(&format!("{lower}|")))
+                })
+                .collect();
+            return matching_people(&people, text, 6).into_iter().map(SharedString::from).collect();
         }
         // Not the tag itself or one under it.
         let own = s.path.to_ascii_lowercase();

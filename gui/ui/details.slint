@@ -92,6 +92,8 @@ export global DetailsBridge {
     // The face box right-clicked, for its menu (shown when `face-menu-serial` changes).
     in property <int> menu-face: -1;
     in property <string> menu-person;
+    // Confirmed as `menu-person` (not just suggested): can be their cover.
+    in property <bool> menu-named;
     in property <bool> menu-ignored;
     in property <int> face-menu-serial;
 
@@ -170,7 +172,8 @@ export global DetailsBridge {
     callback edit-assign(string);
     callback edit-cancel();
     // On face i, from the popup or its menu: "name" (open the popup), "not" (not who it is
-    // named or suggested as), "ignore", "delete" (the box altogether).
+    // named or suggested as), "ignore", "delete" (the box altogether), "cover" (the face stands
+    // for its person in People).
     callback face-action(int, string);
     // Right-click on face i: its menu.
     callback face-menu(int);
@@ -1066,6 +1069,11 @@ export component DetailsPage inherits Rectangle {
                 title: "Ignore";
                 enabled: !DetailsBridge.menu-ignored;
                 activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "ignore"); }
+            }
+            MenuItem {
+                title: DetailsBridge.menu-named ? "Set as cover for \{DetailsBridge.menu-person}" : "Set as cover";
+                enabled: DetailsBridge.menu-named;
+                activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "cover"); }
             }
             MenuSeparator { }
             MenuItem {
