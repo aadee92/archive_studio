@@ -16,7 +16,7 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, properties). `exif`: basic EXIF fields |
 | `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -51,7 +51,7 @@ is used by core as a path dependency.
 
 ## Pipeline (`archive_core::pipeline`)
 
-What happens to a file once it is in the library: register → orient → faces, then, once
+What happens to a file once it is in the library: register → orient → faces and signature, then, once
 the per-file stages are quiet, identify (suggestions and clusters) and XMP sidecar sync.
 
 - **Hosted, not a daemon**: a front end starts an `Engine` when it opens a library and drops
@@ -76,3 +76,25 @@ the per-file stages are quiet, identify (suggestions and clusters) and XMP sidec
 - **Models**: `$ARCHIVE_STUDIO_MODELS`, else `~/.local/share/archive-studio/models`:
   `orientation.onnx` and `buffalo_l/` (`det_10g.onnx`, `w600k_r50.onnx`). A stage whose
   model is missing is skipped.
+
+## Catalog concepts (`archive_core::catalog`)
+
+- **People are tags.** A person is a `person`-kind tag `People|<Name>`. Naming a face
+  (`name_faces`, `confirm_faces`) puts that tag on the asset as a user tag carrying the face
+  box as its region (written to sidecars as an MWG face region). Un-naming, renaming
+  (`rename_person`; onto an existing name merges), `merge_people` and `delete_person` keep
+  tags in step; a tag stays while any face on the asset is still that person. Taking the tag
+  off an asset un-names that person's faces there. Schema 4 backfilled tags for faces named
+  before this; `sync_person_tags` repairs. `face_boxes(asset)` gives boxes (0..1, displayed
+  image) with names for drawing.
+- **Front/back pairs** (`pairs`): `asset_pairs(front, back)`. Filled by naming when an asset
+  is first seen (`X-back.*` / `X_back` / `X back` with `X-front.*` or `X.*` in the same
+  directory, as the V850 / photo-duplex writes `photo-NNNN-front.png` / `-back.png`), or by
+  hand (`set_pair`). `back_of` / `front_of`.
+- **Trash** (`trash`): deleting moves the file and sidecar to
+  `.archive-studio/trash/<when>-<id>/<path>` and the asset row with it (kept, marked
+  trashed and missing, out of searches). `restore` undoes it; `empty_trash` deletes for good.
+  A front takes its back along.
+- **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
+  computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
+  candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).

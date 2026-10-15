@@ -7,6 +7,8 @@
 //! - [`devices`]: the backends and [`discover`](devices::discover).
 //! - [`catalog`]: the library database of assets and their tags, and tag search.
 //! - [`media`]: media kinds and file classification.
+//! - [`ops`]: what a front end does to one asset (rotate, delete to the trash, properties).
+//! - [`exif`]: the basic EXIF fields.
 //! - [`pipeline`]: what happens to files in the library (orient, faces, identify, sidecars),
 //!   run by an [`Engine`](pipeline::Engine) thread while a front end is open.
 //!
@@ -15,7 +17,9 @@
 pub mod catalog;
 pub mod device;
 pub mod devices;
+pub mod exif;
 pub mod media;
+pub mod ops;
 pub mod pipeline;
 mod resize;
 

@@ -1,9 +1,8 @@
 //! The processing pipeline: what happens to a file once it is in the library.
 //!
 //! ```text
-//! file appears ─ register ─ orient ─ faces ─┐
-//!                                           ├─ identify (library-wide, when quiet)
-//!                                           └─ sync sidecars (when quiet)
+//! file appears ─ register ─ orient ─┬─ faces ─────┬─ identify (library-wide, when quiet)
+//!                                    └─ signature └─ sync sidecars (when quiet)
 //! ```
 //!
 //! An [`Engine`] runs the pipeline on a thread for as long as its host (the GUI, the
@@ -20,6 +19,8 @@
 //!   for a format that can't be rewritten losslessly yet, waits for the user's review.
 //! - **faces**: detection and embedding into the catalog (after orient, so boxes are
 //!   upright).
+//! - **signature**: a perceptual hash and colour histogram for finding near-duplicates
+//!   ([`catalog::similar`]); needs no model.
 //! - **identify**: suggestions from the confirmed faces and clusters of the unknown ones,
 //!   after a batch rather than per face.
 //! - **sync**: tags into XMP sidecars.
@@ -45,6 +46,7 @@ use image::{DynamicImage, ImageDecoder, ImageReader};
 use notify::{RecursiveMode, Watcher};
 
 use crate::catalog::faces::{self as catalog_faces, NewFace, DEFAULT_MIN_SIMILARITY};
+use crate::catalog::similar::Signature;
 use crate::catalog::runs::{self, Due, Run, RunCounts, RunStatus, StageQuery};
 use crate::catalog::{AssetId, Catalog, DEFAULT_MIN_CONFIDENCE};
 use crate::media::{classify, MediaKind};
@@ -53,6 +55,10 @@ pub const ORIENT: &str = "orient";
 /// The orientation model's name; a different one makes every orient run due again.
 pub const ORIENT_VERSION: &str = "dio-v2-0.9882";
 pub const FACES: &str = "faces";
+/// Near-duplicate signatures ([`crate::catalog::similar`]).
+pub const SIGNATURE: &str = "signature";
+/// Changing how signatures are computed makes every signature run due again.
+pub const SIGNATURE_VERSION: &str = "dhash-hist-v1";
 /// Confidence from which a predicted rotation is applied without asking.
 pub const AUTO_ROTATE: f32 = 0.85;
 
@@ -169,6 +175,58 @@ fn faces_query(availability: Availability) -> StageQuery<'static> {
     // Without the orientation model, faces don't wait for it.
     let after = availability.orient.then_some(ORIENT);
     StageQuery { stage: FACES, version: catalog_faces::MODEL, kind: MediaKind::Image, after }
+}
+
+fn signature_query(availability: Availability) -> StageQuery<'static> {
+    // Upright first, like faces: rotated copies of a photo should match.
+    let after = availability.orient.then_some(ORIENT);
+    StageQuery { stage: SIGNATURE, version: SIGNATURE_VERSION, kind: MediaKind::Image, after }
+}
+
+/// How the signature stage stands (kept out of [`Status`] so hosts building one by hand
+/// keep compiling).
+pub fn signature_status(catalog: &Catalog, availability: Availability) -> crate::catalog::Result<RunCounts> {
+    catalog.run_counts(&signature_query(availability))
+}
+
+/// Rotates the asset's file `cw` degrees clockwise (90, 180 or 270) as the user's decision,
+/// without an engine: rewrites the file losslessly, turns its face and tag regions, and
+/// records the rotation as the user's, so the orientation model never redoes it. Safe while
+/// an engine runs on the library (its in-flight work on the old file is discarded), though
+/// a host with an engine can as well use [`Engine::rotate`].
+pub fn rotate_file(catalog: &Catalog, path: &Path, cw: u16) -> Result<(), String> {
+    let cw = cw % 360;
+    if cw % 90 != 0 || cw == 0 {
+        return Err("rotate by 90, 180 or 270 degrees".into());
+    }
+    let asset = catalog.find_asset(path).map_err(|e| e.to_string())?.ok_or("not in the library")?;
+    if !rotate::can_rotate(path) {
+        let ext = path.extension().map_or_else(String::new, |e| e.to_string_lossy().to_uppercase());
+        return Err(format!("{ext} files can't be rotated losslessly yet"));
+    }
+    let temp = rotate::temp_path(path);
+    rotate::rotate_into(path, &temp, cw).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        e.to_string()
+    })?;
+    let input = replace_rotated(catalog, asset, path, &temp, cw)?;
+    let detail = format!("turned {cw}° by you");
+    let run = Run { stage: ORIENT, version: ORIENT_VERSION, input: &input, status: RunStatus::User, value: Some(cw as i64), detail: &detail };
+    catalog.set_run(asset, &run).map_err(|e| e.to_string())
+}
+
+/// Moves the rotated `temp` over `path` and updates the catalog to match. Returns the new
+/// fingerprint.
+fn replace_rotated(catalog: &Catalog, asset: AssetId, path: &Path, temp: &Path, cw: u16) -> Result<String, String> {
+    std::fs::rename(temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(temp);
+        format!("replace {}: {e}", path.display())
+    })?;
+    let (size, mtime) = runs::stat(path).map_err(|e| e.to_string())?;
+    // Recorded now, so the watcher's report of our own write finds nothing new.
+    catalog.record_file(path, MediaKind::Image, size, mtime).map_err(|e| e.to_string())?;
+    catalog.rotate_regions(asset, cw).map_err(|e| e.to_string())?;
+    Ok(runs::fingerprint(size, mtime))
 }
 
 /// The pipeline's standing in `catalog`, read on any connection.
@@ -320,6 +378,7 @@ impl Lock {
 enum Stage {
     Orient,
     Faces,
+    Signature,
 }
 
 impl Stage {
@@ -327,6 +386,7 @@ impl Stage {
         match self {
             Self::Orient => ORIENT,
             Self::Faces => FACES,
+            Self::Signature => SIGNATURE,
         }
     }
 }
@@ -345,6 +405,7 @@ enum Outcome {
     /// The prediction, and the rotated file written next to the original if it applies.
     Orient(Due, Result<(Prediction, Option<PathBuf>), String>),
     Faces(Due, Result<Vec<NewFace>, String>),
+    Signature(Due, Result<Signature, String>),
 }
 
 struct Loaded {
@@ -404,6 +465,10 @@ fn work(job: Job, models: &Loaded) -> Outcome {
                 None => Err("no face model".into()),
             };
             Outcome::Faces(due, result)
+        }
+        Stage::Signature => {
+            let result = Signature::of_file(&due.path);
+            Outcome::Signature(due, result)
         }
     }
 }
@@ -525,6 +590,7 @@ impl Pipeline {
         match stage {
             Stage::Orient => orient_query(),
             Stage::Faces => faces_query(self.workers.availability),
+            Stage::Signature => signature_query(self.workers.availability),
         }
     }
 
@@ -541,7 +607,7 @@ impl Pipeline {
             Mode::Normal => self.workers.threads * 2,
         };
         let availability = self.workers.availability;
-        let stages = [(Stage::Orient, availability.orient), (Stage::Faces, availability.faces)];
+        let stages = [(Stage::Orient, availability.orient), (Stage::Faces, availability.faces), (Stage::Signature, true)];
         for (stage, available) in stages {
             if !available {
                 continue;
@@ -642,6 +708,27 @@ impl Pipeline {
                     Err(e) => self.fail(&due, Stage::Faces, e),
                 }
             }
+            Outcome::Signature(due, result) => {
+                self.known.remove(&(due.asset, Stage::Signature));
+                if !self.still_current(&due) {
+                    return;
+                }
+                let stored = result.and_then(|signature| self.catalog.set_signature(due.asset, &signature).map_err(|e| e.to_string()));
+                match stored {
+                    Ok(()) => {
+                        let run = Run {
+                            stage: SIGNATURE,
+                            version: SIGNATURE_VERSION,
+                            input: &due.input,
+                            status: RunStatus::Done,
+                            value: None,
+                            detail: "",
+                        };
+                        self.record(due.asset, &run);
+                    }
+                    Err(e) => self.fail(&due, Stage::Signature, e),
+                }
+            }
         }
     }
 
@@ -682,16 +769,9 @@ impl Pipeline {
     /// Moves the rotated `temp` over `path` and updates the catalog to match. Returns the
     /// new fingerprint.
     fn replace_rotated(&mut self, asset: AssetId, path: &Path, temp: &Path, cw: u16) -> Result<String, String> {
-        std::fs::rename(temp, path).map_err(|e| {
-            let _ = std::fs::remove_file(temp);
-            format!("replace {}: {e}", path.display())
-        })?;
-        let (size, mtime) = runs::stat(path).map_err(|e| e.to_string())?;
-        // Recorded now, so the watcher's report of our own write finds nothing new.
-        self.catalog.record_file(path, MediaKind::Image, size, mtime).map_err(|e| e.to_string())?;
-        self.catalog.rotate_regions(asset, cw).map_err(|e| e.to_string())?;
+        let input = replace_rotated(&self.catalog, asset, path, temp, cw)?;
         self.changed();
-        Ok(runs::fingerprint(size, mtime))
+        Ok(input)
     }
 
     fn record(&self, asset: AssetId, run: &Run) {
@@ -704,6 +784,7 @@ impl Pipeline {
         let version = match stage {
             Stage::Orient => ORIENT_VERSION,
             Stage::Faces => catalog_faces::MODEL,
+            Stage::Signature => SIGNATURE_VERSION,
         };
         let run = Run { stage: stage.name(), version, input: &due.input, status: RunStatus::Failed, value: None, detail: &error };
         self.record(due.asset, &run);
@@ -768,22 +849,9 @@ impl Pipeline {
     }
 
     fn user_rotate(&mut self, path: &Path, cw: u16) -> Result<(), String> {
-        let cw = cw % 360;
-        if cw % 90 != 0 || cw == 0 {
-            return Err("rotate by 90, 180 or 270 degrees".into());
-        }
-        let asset = self.catalog.find_asset(path).map_err(|e| e.to_string())?.ok_or("not in the library")?;
-        let temp = rotate::temp_path(path);
-        rotate::rotate_into(path, &temp, cw).map_err(|e| {
-            let _ = std::fs::remove_file(&temp);
-            e.to_string()
-        })?;
-        let input = self.replace_rotated(asset, path, &temp, cw)?;
-        let detail = format!("turned {cw}° by you");
-        let run =
-            Run { stage: ORIENT, version: ORIENT_VERSION, input: &input, status: RunStatus::User, value: Some(cw as i64), detail: &detail };
-        self.catalog.set_run(asset, &run).map_err(|e| e.to_string())?;
-        self.emit(Event::Rotated { path: path.to_owned(), cw, by_user: true });
+        rotate_file(&self.catalog, path, cw)?;
+        self.changed();
+        self.emit(Event::Rotated { path: path.to_owned(), cw: cw % 360, by_user: true });
         Ok(())
     }
 

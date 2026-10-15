@@ -20,8 +20,12 @@
 //! readers run alongside a writer.
 
 pub mod faces;
+pub mod pairs;
+pub mod people;
 pub mod query;
 pub mod runs;
+pub mod similar;
+pub mod trash;
 pub mod xmp;
 
 use std::fmt;
@@ -30,8 +34,16 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// 1: assets and tags. 2: faces. 3: file states and pipeline runs.
-const SCHEMA_VERSION: i32 = 3;
+/// 1: assets and tags. 2: faces. 3: file states and pipeline runs. 4: front/back pairs,
+/// image signatures, the trash, and person tags backfilled from confirmed faces.
+const SCHEMA_VERSION: i32 = 4;
+
+const SCHEMA_4: &str = "
+-- While the asset is in the trash: where it was (relative to the root) and when it was
+-- trashed (seconds since the epoch). Its path is then its place in the trash.
+ALTER TABLE assets ADD COLUMN trashed_from TEXT;
+ALTER TABLE assets ADD COLUMN trashed_at INTEGER;
+";
 
 const SCHEMA: &str = "
 CREATE TABLE assets (
@@ -101,6 +113,8 @@ pub enum Error {
     Invalid(String),
     /// The database was written by a newer Archive Studio.
     NewerSchema(i32),
+    /// A file operation (trash, restore) failed; the message says on what.
+    Io(String),
 }
 
 impl fmt::Display for Error {
@@ -111,6 +125,7 @@ impl fmt::Display for Error {
             Self::Path(path) => write!(f, "{} is not a UTF-8 path inside the library", path.display()),
             Self::Invalid(msg) => f.write_str(msg),
             Self::NewerSchema(v) => write!(f, "catalog schema {v} is newer than this build supports ({SCHEMA_VERSION})"),
+            Self::Io(msg) => f.write_str(msg),
         }
     }
 }
@@ -276,6 +291,15 @@ impl Catalog {
                 tx.execute_batch(schema)?;
             }
         }
+        if version < 4 {
+            tx.execute_batch(SCHEMA_4)?;
+            tx.execute_batch(pairs::SCHEMA)?;
+            tx.execute_batch(similar::SCHEMA)?;
+            // One-time backfills: libraries named people and scanned backs before these
+            // were kept in the catalog.
+            people::backfill_person_tags(&tx)?;
+            pairs::pair_all_by_name(&tx)?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -289,8 +313,12 @@ impl Catalog {
     /// every path the catalog takes), adding it if it isn't in the catalog yet.
     pub fn asset(&self, path: &Path) -> Result<AssetId> {
         let rel = self.relative(path)?;
-        self.conn.prepare_cached("INSERT INTO assets (path) VALUES (?1) ON CONFLICT (path) DO NOTHING")?.execute([&rel])?;
-        Ok(AssetId(self.conn.prepare_cached("SELECT id FROM assets WHERE path = ?1")?.query_row([&rel], |row| row.get(0))?))
+        let added = self.conn.prepare_cached("INSERT INTO assets (path) VALUES (?1) ON CONFLICT (path) DO NOTHING")?.execute([&rel])?;
+        let id = AssetId(self.conn.prepare_cached("SELECT id FROM assets WHERE path = ?1")?.query_row([&rel], |row| row.get(0))?);
+        if added > 0 {
+            pairs::pair_by_name(&self.conn, id, &rel)?;
+        }
+        Ok(id)
     }
 
     /// The id of the asset at `path`, if the catalog has it.
@@ -404,8 +432,16 @@ impl Catalog {
 
     /// The user takes `tag` off `asset`. If a detector proposed it, that is remembered as a
     /// rejection, so the detector can't put it back.
+    ///
+    /// Taking a person tag off also un-names that person's faces on the asset (they go
+    /// back to unreviewed), so faces and `People|…` tags never disagree.
     pub fn remove_tag(&mut self, asset: AssetId, tag: TagId) -> Result<()> {
         let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE faces SET person = NULL, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL
+             WHERE asset_id = ?1 AND person = ?2",
+            [asset.0, tag.0],
+        )?;
         let detected: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2 AND source <> 'user')",
             [asset.0, tag.0],
@@ -422,6 +458,29 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The user puts the tag at `path` on `asset`, creating it as `kind` if needed (see
+    /// [`tag`](Self::tag)). For naming a face use [`name_faces`](Self::name_faces) instead,
+    /// which keeps the face and its tag together.
+    pub fn add_tag_path(&self, asset: AssetId, path: &str, kind: TagKind) -> Result<TagId> {
+        let tag = self.tag(path, kind)?;
+        self.add_tag(asset, tag, None)?;
+        Ok(tag)
+    }
+
+    /// The user takes the tag at `path` off `asset` (see [`remove_tag`](Self::remove_tag)).
+    /// False if there is no such tag.
+    pub fn remove_tag_path(&mut self, asset: AssetId, path: &str) -> Result<bool> {
+        let Some((tag, _, _)) = self.find_tag(path)? else { return Ok(false) };
+        self.remove_tag(asset, tag)?;
+        Ok(true)
+    }
+
+    /// Whether the asset is in the [trash](trash).
+    pub fn is_trashed(&self, asset: AssetId) -> Result<bool> {
+        let mut stmt = self.conn.prepare_cached("SELECT trashed_from IS NOT NULL FROM assets WHERE id = ?1")?;
+        Ok(stmt.query_row([asset.0], |row| row.get(0))?)
     }
 
     /// Replaces everything `detector` found on `asset` with `found`, so re-running a
@@ -491,7 +550,7 @@ impl Catalog {
     pub fn search(&self, query: &str, min_confidence: f32) -> Result<Vec<PathBuf>> {
         let expr = query::parse(query).map_err(Error::Query)?;
         let (condition, values) = query::to_sql(&expr, min_confidence);
-        let sql = format!("SELECT a.path FROM assets a WHERE {condition} ORDER BY a.path");
+        let sql = format!("SELECT a.path FROM assets a WHERE a.trashed_from IS NULL AND ({condition}) ORDER BY a.path");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| row.get::<_, String>(0))?;
         rows.map(|rel| Ok(self.root.join(rel?))).collect()

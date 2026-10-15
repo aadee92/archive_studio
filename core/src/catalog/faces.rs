@@ -493,6 +493,13 @@ fn release(tx: &Transaction, face: FaceId, keep: Option<TagId>) -> Result<()> {
              AND NOT EXISTS (SELECT 1 FROM faces WHERE asset_id = ?1 AND person = ?2 AND id <> ?3)",
         params![asset, person, face.0, USER],
     )?;
+    // The tag stays for another face of theirs there: it takes that face's box.
+    tx.execute(
+        "UPDATE asset_tags SET (x, y, w, h) = (SELECT x, y, w, h FROM faces WHERE asset_id = ?1 AND person = ?2 AND id <> ?3 ORDER BY id LIMIT 1)
+         WHERE asset_id = ?1 AND tag_id = ?2 AND source = ?4
+             AND EXISTS (SELECT 1 FROM faces WHERE asset_id = ?1 AND person = ?2 AND id <> ?3)",
+        params![asset, person, face.0, USER],
+    )?;
     Ok(())
 }
 

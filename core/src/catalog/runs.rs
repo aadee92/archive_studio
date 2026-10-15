@@ -282,15 +282,7 @@ impl Catalog {
         let row = stmt
             .query_row(params![asset.0, stage], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)))
             .optional()?;
-        Ok(row.map(|(status, value, detail)| {
-            let status = match status.as_str() {
-                "done" => RunStatus::Done,
-                "user" => RunStatus::User,
-                "review" => RunStatus::Review,
-                _ => RunStatus::Failed,
-            };
-            (status, value, detail)
-        }))
+        Ok(row.map(|(status, value, detail)| (status_of(&status), value, detail)))
     }
 
     /// The present assets whose current file has a run of `stage` with `status`, by path:
@@ -346,5 +338,49 @@ impl Catalog {
             )?
             .execute(params![key, delta, reset])?;
         Ok(())
+    }
+
+    /// Every stage's last run on `asset`, by stage name.
+    pub fn stage_runs(&self, asset: AssetId) -> Result<Vec<StageRun>> {
+        let sql = format!(
+            "SELECT r.stage, r.version, r.status, r.value, r.detail, r.at, r.input = {FINGERPRINT} AND NOT a.missing
+             FROM stage_runs r JOIN assets a ON a.id = r.asset_id WHERE r.asset_id = ?1 ORDER BY r.stage"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([asset.0], |row| {
+            Ok(StageRun {
+                stage: row.get(0)?,
+                version: row.get(1)?,
+                status: status_of(row.get_ref(2)?.as_str()?),
+                value: row.get(3)?,
+                detail: row.get(4)?,
+                at: row.get(5)?,
+                current: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// A stage's last run on an asset, for a properties view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageRun {
+    pub stage: String,
+    pub version: String,
+    pub status: RunStatus,
+    pub value: Option<i64>,
+    pub detail: String,
+    /// Seconds since the epoch.
+    pub at: i64,
+    /// It ran on the file as it is now (rather than on an older version of it).
+    pub current: bool,
+}
+
+fn status_of(name: &str) -> RunStatus {
+    match name {
+        "done" => RunStatus::Done,
+        "user" => RunStatus::User,
+        "review" => RunStatus::Review,
+        _ => RunStatus::Failed,
     }
 }

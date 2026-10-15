@@ -169,6 +169,36 @@ fn engine_watches_rotates_and_holds_the_library() {
     assert!(again.is_ok());
 }
 
+#[test]
+fn the_engine_signs_images_and_finds_near_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let picture = |w: u32, h: u32, flip: bool| {
+        image::RgbImage::from_fn(w, h, |x, y| {
+            let x = if flip { w - 1 - x } else { x };
+            let v = (x * 200 / w + y * 50 / h) as u8;
+            image::Rgb([v, v / 2, 255 - v])
+        })
+    };
+    picture(160, 120, false).save(root.join("a.png")).unwrap();
+    picture(80, 60, false).save(root.join("a-small.png")).unwrap();
+    picture(160, 120, true).save(root.join("b.png")).unwrap();
+    let (send, events) = mpsc::channel();
+    let send = Mutex::new(send);
+    let engine =
+        Engine::start(&root, Config { threads: 2, models: Models::default() }, move |e| send.lock().unwrap().send(e).unwrap()).unwrap();
+    expect(&events, "idle", |e| matches!(e, Event::Idle));
+    drop(engine);
+
+    let catalog = open(&root);
+    let id = |name: &str| catalog.find_asset(&root.join(name)).unwrap().unwrap();
+    let all = [id("a.png"), id("a-small.png"), id("b.png")];
+    let counts = signature_status(&catalog, Availability::default()).unwrap();
+    assert_eq!((counts.done, counts.pending), (3, 0));
+    let found = catalog.similar(all[0], &all, 5).unwrap();
+    assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [all[1]]);
+}
+
 impl Event {
     fn clone_ready(&self) -> Availability {
         match self {
