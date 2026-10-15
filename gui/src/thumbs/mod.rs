@@ -29,7 +29,7 @@ pub mod sched;
 mod writer;
 
 #[allow(unused_imports)] // used by capture backends
-pub use decode::{decode, decode_preview, fit, write_tiff_with_reduced_page};
+pub use decode::{decode, decode_full, decode_preview, dimensions, fit, write_tiff_with_reduced_page};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};

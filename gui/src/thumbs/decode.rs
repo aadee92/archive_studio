@@ -39,6 +39,25 @@ pub fn decode(path: &Path, kind: MediaKind, edge: u32) -> Option<RgbImage> {
     decode_from(BufReader::with_capacity(64 << 10, File::open(path).ok()?), edge)
 }
 
+/// The stored size of the image at `path` (before EXIF orientation: the longest edge is
+/// the same either way), from its header.
+pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
+    ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
+/// [`decode`] at full resolution, for looking closely (zoom), unless that is more than
+/// `max_pixels`: then as large as fits them. `None` if the size can't be read.
+pub fn decode_full(path: &Path, kind: MediaKind, max_pixels: u64) -> Option<RgbImage> {
+    let (w, h) = dimensions(path)?;
+    let pixels = u64::from(w) * u64::from(h);
+    let edge = if pixels <= max_pixels {
+        w.max(h)
+    } else {
+        (f64::from(w.max(h)) * (max_pixels as f64 / pixels as f64).sqrt()).floor() as u32
+    };
+    decode(path, kind, edge.max(1))
+}
+
 /// [`decode`] of a file already read into memory (by an I/O thread).
 pub fn decode_bytes(bytes: &[u8], kind: MediaKind, edge: u32) -> Option<RgbImage> {
     if kind != MediaKind::Image {
@@ -481,6 +500,19 @@ mod tests {
             assert_eq!(thumb_image.dimensions(), thumb, "{w}x{h}");
             assert!(near(*thumb_image.get_pixel(thumb.0 / 2, 2), RED) && near(*thumb_image.get_pixel(thumb.0 / 2, thumb.1 - 3), BLUE));
         }
+    }
+
+    #[test]
+    fn full_decode_is_full_size_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "big.jpg", &jpeg_bytes(&halves(2000, 1000, RED, BLUE)));
+        assert_eq!(dimensions(&path), Some((2000, 1000)));
+        assert_eq!(decode_full(&path, MediaKind::Image, 4_000_000).unwrap().dimensions(), (2000, 1000));
+        // Over the budget: as large as fits it, same aspect.
+        let capped = decode_full(&path, MediaKind::Image, 500_000).unwrap();
+        assert_eq!(capped.dimensions(), (1000, 500));
+        assert!(near(*capped.get_pixel(500, 10), RED) && near(*capped.get_pixel(500, 490), BLUE));
+        assert!(decode_full(&dir.path().join("missing.jpg"), MediaKind::Image, 1).is_none());
     }
 
     #[test]

@@ -35,6 +35,15 @@ export global DetailsBridge {
     in property <string> info;      // kind, size, dimensions once decoded
     in property <image> image;
     in property <bool> image-ready;
+    // Longest edge of the file itself, in pixels (0 until known): what 100% zoom is.
+    in property <int> full-edge;
+    // Zoomed in past what `image` resolves: a sharper picture of part of it (`detail`), and
+    // where (fractions of the image); none if `tile-w` is 0.
+    in property <image> tile;
+    in property <float> tile-x;
+    in property <float> tile-y;
+    in property <float> tile-w;
+    in property <float> tile-h;
     in property <bool> loading;
     in property <bool> is-image;
     // The rotation the orient stage proposes for review, degrees clockwise; 0 = none.
@@ -77,6 +86,9 @@ export global DetailsBridge {
     callback accept();
     callback keep();
     callback rotate(int);   // degrees clockwise
+    // The part of the picture in view (fractions: left, top, right, bottom) and the width it
+    // is shown at in physical pixels, when zoomed in past `image`; all 0 when no longer.
+    callback detail(float, float, float, float, float);
     // Right-click on the picture (0) or on the other side next to it (1): the item menu.
     callback context-menu(int);
     // Show the other side instead.
@@ -163,41 +175,152 @@ component IconButton inherits Rectangle {
     }
 }
 
-// A picture fitted in its box, with its faces drawn over it, and (`dog-ear`) a turned-down
-// corner that flips to the other side of the photo.
+// A picture in its box, fitted or zoomed, with its faces drawn over it, and (`dog-ear`) a
+// turned-down corner that flips to the other side of the photo.
+//
+// Wheel zooms around the pointer, drag pans while it is larger than the box, double-click
+// toggles between fitted and 100% (one pixel of the file per pixel of the screen) at the
+// point clicked (or calls `open` if not `double-click-zooms`).
 component Picture inherits Rectangle {
     in property <image> source;
     in property <[DetailFace]> faces;
     in property <int> flash-face: -1;
     in property <int> flash-step;
     in property <bool> dog-ear;
+    // Longest edge of the file itself, in pixels: what 100% is (0: that of `source`).
+    in property <int> full-edge;
+    in property <bool> double-click-zooms: true;
+    // The zoom, two-way so both sides of a photo shown together move as one: how many times
+    // the fitted size it is shown, and the point of it (fractions) at the box's center.
+    in-out property <float> zoom: 1;
+    in-out property <float> cx: 0.5;
+    in-out property <float> cy: 0.5;
+    // Asks for a sharper `tile` (`region`) when zoomed in past what `source` resolves.
+    in property <bool> detail;
+    // That picture of part of the image, and where (fractions of it); none if `tile-w` is 0.
+    in property <image> tile;
+    in property <float> tile-x;
+    in property <float> tile-y;
+    in property <float> tile-w;
+    in property <float> tile-h;
     callback pressed();
     // Right-click; the pointer's window position is in `ItemMenu`.
     callback menu();
     callback flip();
-    // Double-click.
+    // Double-click, unless it zooms.
     callback open();
+    // The part of the image in view (fractions: left, top, right, bottom) and how wide the whole
+    // image is shown, in physical pixels; settled for a moment. All 0: no detail wanted.
+    callback region(float, float, float, float, float);
 
-    // Where `image-fit: contain` puts the picture: scaled to fit, centered.
-    // Face boxes are placed in these coordinates, so they follow resizes.
+    clip: true;
+
+    // A pixel of the screen, as a logical length.
+    property <length> device-pixel: 1phx;
+
+    // Where `image-fit: contain` would put the picture: scaled to fit, centered.
     property <float> aspect: root.source.width / Math.max(1, root.source.height);
-    property <length> shown-width: Math.min(self.width, self.height * self.aspect);
-    property <length> shown-height: self.shown-width / self.aspect;
-    property <length> shown-x: (self.width - self.shown-width) / 2;
-    property <length> shown-y: (self.height - self.shown-height) / 2;
+    property <length> fit-width: Math.min(self.width, self.height * self.aspect);
+    property <length> fit-height: self.fit-width / self.aspect;
+    // The zoom at which a pixel of the file is a pixel of the screen, and the bounds.
+    out property <float> one-to-one: (root.full-edge > 0 ? root.full-edge : Math.max(root.source.width, root.source.height)) * self.device-pixel
+        / Math.max(1px, Math.max(self.fit-width, self.fit-height));
+    property <float> min-zoom: Math.min(1, self.one-to-one);
+    property <float> max-zoom: Math.max(4, self.one-to-one * 8);
+    // The zoom in percent of the file's own pixels.
+    out property <int> percent: self.one-to-one > 0 ? Math.round(root.zoom / self.one-to-one * 100) : 100;
+    out property <bool> fitted: Math.abs(root.zoom - 1) < 0.001;
+    // Larger than the box: dragging (and the arrow keys) pan.
+    out property <bool> pannable: self.shown-width > self.width + 0.5px || self.shown-height > self.height + 0.5px;
+
+    // Where the picture is shown: centered on (`cx`, `cy`), but never leaving a gap at an edge
+    // it could cover (centered if smaller than the box). Face boxes are placed in these
+    // coordinates, so they follow resizes, zoom and pan.
+    property <length> shown-width: self.fit-width * root.zoom;
+    property <length> shown-height: self.fit-height * root.zoom;
+    property <length> shown-x: root.place(root.cx, self.width, self.shown-width);
+    property <length> shown-y: root.place(root.cy, self.height, self.shown-height);
+
+    pure function place(c: float, box: length, size: length) -> length {
+        return size <= box ? (box - size) / 2 : Math.max(box - size, Math.min(0px, box / 2 - c * size));
+    }
+    // `c` kept where `place` doesn't override it, so a pan back starts at once.
+    pure function bound(c: float, box: length, size: length) -> float {
+        return size <= box ? 0.5 : Math.max(box / 2 / size, Math.min(1 - box / 2 / size, c));
+    }
+
+    // Zooms to `z` (within bounds), keeping the point of the picture at (`x`, `y`) of the box there.
+    public function zoom-to(z: float, x: length, y: length) {
+        let fx = (x - root.shown-x) / Math.max(1px, root.shown-width);
+        let fy = (y - root.shown-y) / Math.max(1px, root.shown-height);
+        let nz = Math.max(root.min-zoom, Math.min(root.max-zoom, z));
+        let w = root.fit-width * nz;
+        let h = root.fit-height * nz;
+        root.zoom = nz;
+        root.cx = root.bound((root.width / 2 - x) / Math.max(1px, w) + fx, root.width, w);
+        root.cy = root.bound((root.height / 2 - y) / Math.max(1px, h) + fy, root.height, h);
+    }
+    // Zooms by `factor` around the box's center.
+    public function zoom-by(factor: float) {
+        root.zoom-to(root.zoom * factor, root.width / 2, root.height / 2);
+    }
+    // Moves the picture by (`dx`, `dy`) from where it is.
+    public function pan(dx: length, dy: length) {
+        root.pan-from(root.shown-x + dx, root.shown-y + dy);
+    }
+    // Puts the picture's top left corner at (`x`, `y`), as far as it goes.
+    function pan-from(x: length, y: length) {
+        root.cx = root.bound((root.width / 2 - x) / Math.max(1px, root.shown-width), root.width, root.shown-width);
+        root.cy = root.bound((root.height / 2 - y) / Math.max(1px, root.shown-height), root.height, root.shown-height);
+    }
+
+    // The detail wanted: shown larger than `source` has pixels for, and the file has more.
+    property <bool> wants-detail: root.detail && root.visible
+        && root.full-edge > Math.max(root.source.width, root.source.height)
+        && root.shown-width / root.device-pixel > root.source.width * 1.05;
+    property <float> view-left: Math.max(0, -root.shown-x / Math.max(1px, root.shown-width));
+    property <float> view-top: Math.max(0, -root.shown-y / Math.max(1px, root.shown-height));
+    property <float> view-right: Math.min(1, (root.width - root.shown-x) / Math.max(1px, root.shown-width));
+    property <float> view-bottom: Math.min(1, (root.height - root.shown-y) / Math.max(1px, root.shown-height));
+    property <string> view: root.wants-detail
+        ? "\{root.view-left} \{root.view-top} \{root.view-right} \{root.view-bottom} \{root.shown-width / root.device-pixel}" : "";
+    // Asked once the view has settled, not on every step of a wheel spin or drag.
+    changed view => { settle.restart(); }
+    settle := Timer {
+        interval: 150ms;
+        running: false;
+        triggered => {
+            self.stop();
+            if (root.wants-detail) {
+                root.region(root.view-left, root.view-top, root.view-right, root.view-bottom, root.shown-width / root.device-pixel);
+            } else {
+                root.region(0, 0, 0, 0, 0);
+            }
+        }
+    }
 
     Image {
-        width: parent.width;
-        height: parent.height;
+        x: root.shown-x;
+        y: root.shown-y;
+        width: root.shown-width;
+        height: root.shown-height;
         source: root.source;
-        image-fit: contain;
+        image-fit: fill;
+    }
+    if root.detail && root.tile-w > 0 && root.wants-detail: Image {
+        x: root.shown-x + root.tile-x * root.shown-width;
+        y: root.shown-y + root.tile-y * root.shown-height;
+        width: root.tile-w * root.shown-width;
+        height: root.tile-h * root.shown-height;
+        source: root.tile;
+        image-fit: fill;
     }
     for face[i] in root.faces: FaceBox {
         x: root.shown-x + face.x * root.shown-width;
         y: root.shown-y + face.y * root.shown-height;
         width: face.w * root.shown-width;
         height: face.h * root.shown-height;
-        room-below: root.shown-y + root.shown-height - self.y - self.height;
+        room-below: Math.min(root.shown-y + root.shown-height, root.height) - self.y - self.height;
         name: face.name;
         show-box: DetailsBridge.show-boxes;
         show-name: DetailsBridge.show-names;
@@ -205,16 +328,45 @@ component Picture inherits Rectangle {
         lit: i == root.flash-face && Math.mod(root.flash-step, 2) == 0 && root.flash-step > 0;
     }
     TouchArea {
-        double-clicked => { root.open(); }
+        // Where the picture was when the drag began.
+        property <length> drag-x;
+        property <length> drag-y;
+        mouse-cursor: !root.pannable ? default : self.pressed ? grabbing : grab;
+        double-clicked => {
+            if (!root.double-click-zooms) {
+                root.open();
+            } else if (root.fitted) {
+                root.zoom-to(root.one-to-one, self.mouse-x, self.mouse-y);
+            } else {
+                root.zoom-to(1, self.mouse-x, self.mouse-y);
+            }
+        }
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down) {
                 root.pressed();
+            }
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.drag-x = root.shown-x;
+                self.drag-y = root.shown-y;
             }
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
                 ItemMenu.x = self.absolute-position.x + self.mouse-x;
                 ItemMenu.y = self.absolute-position.y + self.mouse-y;
                 root.menu();
             }
+        }
+        moved => {
+            if (self.pressed && root.pannable) {
+                root.pan-from(self.drag-x + self.mouse-x - self.pressed-x, self.drag-y + self.mouse-y - self.pressed-y);
+            }
+        }
+        scroll-event(event) => {
+            if (event.delta-y == 0) {
+                return reject;
+            }
+            // One wheel notch (60 px) zooms by about a quarter.
+            root.zoom-to(root.zoom * Math.pow(2, event.delta-y / 180px), self.mouse-x, self.mouse-y);
+            accept
         }
     }
     // The photo's corner, turned down: there is a back to see.
@@ -385,13 +537,34 @@ component SimilarStrip inherits VerticalLayout {
 export component DetailsPage inherits Rectangle {
     background: Theme.bg;
 
-    // Take the keyboard when shown, so Esc reaches us (not a field on a hidden page).
+    // Take the keyboard when shown, so Esc reaches us (not a field on a hidden page). Left,
+    // it lets go of the zoom (and the sharper picture held for it).
     changed visible => {
         UiLog.debug("details", "visible = \{self.visible ? "yes" : "no"}");
         if (self.visible) {
             keys.focus();
+        } else {
+            self.fit();
         }
     }
+
+    // The zoom, shared by both sides of a photo shown together (see `Picture`); another item
+    // shown (a step, a flip, an open) starts fitted.
+    property <float> zoom: 1;
+    property <float> cx: 0.5;
+    property <float> cy: 0.5;
+    function fit() {
+        self.zoom = 1;
+        self.cx = 0.5;
+        self.cy = 0.5;
+    }
+    // The zoom for the bottom bar, copied: bound, it would depend on the picture's size,
+    // which depends on the bar's height.
+    property <string> zoom-label;
+    property <string> zoom-now: pic.fitted ? "Fit · \{pic.percent}%" : "\{pic.percent}%";
+    changed zoom-now => { self.zoom-label = self.zoom-now; }
+    property <string> shown-path: DetailsBridge.path;
+    changed shown-path => { self.fit(); }
 
     // Flash: 6 half-pulses of 250 ms (3 pulses in 1.5 s) whenever Rust bumps the serial.
     property <int> flash-serial: DetailsBridge.flash-serial;
@@ -410,6 +583,36 @@ export component DetailsPage inherits Rectangle {
                 UiLog.debug("details", "\{event.text == Key.Escape ? "Esc" : "Alt+Left"} → back (page visible \{root.visible ? "yes" : "no"}, has item \{DetailsBridge.has-item ? "yes" : "no"})");
                 NavBridge.back();
                 return accept;
+            }
+            // Zoom: + / - around the center, 0 fits, 1 shows the file's pixels 1:1.
+            if (DetailsBridge.image-ready && !event.modifiers.alt) {
+                if (event.text == "+" || event.text == "=") {
+                    pic.zoom-by(1.25);
+                    return accept;
+                }
+                if (event.text == "-") {
+                    pic.zoom-by(0.8);
+                    return accept;
+                }
+                if (event.text == "0") {
+                    root.fit();
+                    return accept;
+                }
+                if (event.text == "1") {
+                    pic.zoom-to(pic.one-to-one, pic.width / 2, pic.height / 2);
+                    return accept;
+                }
+            }
+            // Zoomed in, the arrows pan (a tenth of the box); fitted, Left / Right step.
+            if (DetailsBridge.image-ready && pic.pannable && !event.modifiers.alt && !event.modifiers.control) {
+                if (event.text == Key.LeftArrow || event.text == Key.RightArrow) {
+                    pic.pan((event.text == Key.LeftArrow ? 1 : -1) * pic.width / 10, 0);
+                    return accept;
+                }
+                if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                    pic.pan(0, (event.text == Key.UpArrow ? 1 : -1) * pic.height / 10);
+                    return accept;
+                }
             }
             // Another item of the view it was opened from.
             if (!event.modifiers.alt && !event.modifiers.control && DetailsBridge.scope-count > 1) {
@@ -488,7 +691,9 @@ export component DetailsPage inherits Rectangle {
                 property <bool> pair: DetailsBridge.side-by-side && DetailsBridge.other-ready;
                 // The front goes on the left: this item, unless it is the back.
                 property <bool> this-left: !self.pair || !DetailsBridge.is-back;
-                if DetailsBridge.image-ready: Picture {
+                // Not in an `if`: the keys zoom it.
+                pic := Picture {
+                    visible: DetailsBridge.image-ready;
                     x: stage.this-left ? 12px : stage.width / 2 + 6px;
                     y: 12px;
                     width: stage.pair ? stage.width / 2 - 18px : stage.width - 24px;
@@ -498,6 +703,17 @@ export component DetailsPage inherits Rectangle {
                     flash-face: DetailsBridge.flash-face;
                     flash-step: root.flash-step;
                     dog-ear: DetailsBridge.other-side != "" && !stage.pair;
+                    full-edge: DetailsBridge.full-edge;
+                    zoom <=> root.zoom;
+                    cx <=> root.cx;
+                    cy <=> root.cy;
+                    detail: true;
+                    tile: DetailsBridge.tile;
+                    tile-x: DetailsBridge.tile-x;
+                    tile-y: DetailsBridge.tile-y;
+                    tile-w: DetailsBridge.tile-w;
+                    tile-h: DetailsBridge.tile-h;
+                    region(left, top, right, bottom, width) => { DetailsBridge.detail(left, top, right, bottom, width); }
                     pressed => { keys.focus(); }
                     menu => { DetailsBridge.context-menu(0); }
                     flip => { DetailsBridge.flip(); }
@@ -509,6 +725,11 @@ export component DetailsPage inherits Rectangle {
                     height: stage.height - 24px;
                     source: DetailsBridge.other-image;
                     faces: DetailsBridge.other-faces;
+                    zoom <=> root.zoom;
+                    cx <=> root.cx;
+                    cy <=> root.cy;
+                    // Double-click shows this side instead.
+                    double-click-zooms: false;
                     pressed => { keys.focus(); }
                     menu => { DetailsBridge.context-menu(1); }
                     open => { DetailsBridge.flip(); }
@@ -563,6 +784,13 @@ export component DetailsPage inherits Rectangle {
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.keep(); }
                     }
+                }
+                // The zoom, in percent of the file's pixels.
+                if DetailsBridge.image-ready && DetailsBridge.is-image: Text {
+                    vertical-alignment: center;
+                    text: root.zoom-label;
+                    color: Theme.text-muted;
+                    font-size: 12px;
                 }
                 if DetailsBridge.faces.length > 0: Text {
                     vertical-alignment: center;

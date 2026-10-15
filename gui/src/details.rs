@@ -21,6 +21,12 @@
 //! The pictures of the next items are decoded ahead on a prefetch thread, so a step shows
 //! the new one at once (else its thumbnail until it is decoded).
 //!
+//! The picture zooms and pans (the page does that: wheel, drag, double-click, + / - / 0 / 1).
+//! Zoomed in past what the decoded picture resolves, the page asks for the part in view
+//! ([`detail`]): the file is decoded at full resolution on a worker (once, kept while zoomed
+//! in on it: one at a time, at most [`FULL_PIXELS`]), and that part of it, no larger than it
+//! is shown, is drawn over the picture.
+//!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
 //! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
 //! engine if it runs here, else the core directly). That can take a second (the file is
@@ -36,6 +42,7 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
+use image::RgbImage;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::actions;
@@ -53,6 +60,9 @@ use archive_core::pipeline::ORIENT;
 const EDGE: u32 = 4096;
 /// The other side, shown at most half as wide.
 const OTHER_EDGE: u32 = 2048;
+/// Most pixels decoded for zooming in (~300 MB of RGB): a larger file is decoded as large
+/// as fits them.
+const FULL_PIXELS: u64 = 100_000_000;
 /// Items in the similar strip.
 const SIMILAR: usize = 12;
 /// Items in the filmstrip on either side of the shown one (more than fit a 4K screen).
@@ -106,6 +116,29 @@ thread_local! {
 static LOADING: AtomicU64 = AtomicU64::new(0);
 /// Retires filmstrip thumbnail workers of earlier items.
 static FILM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The shown picture at full resolution, for zooming in past [`EDGE`] ([`detail`]): one at a
+/// time, decoded on first need, dropped when no longer zoomed in.
+struct Full {
+    path: PathBuf,
+    stamp: Stamp,
+    image: RgbImage,
+}
+
+static FULL: Mutex<Option<Full>> = Mutex::new(None);
+/// Retires detail requests of an earlier view (or item).
+static DETAIL: AtomicU64 = AtomicU64::new(0);
+
+/// The view of a zoomed picture: the part of it in view (fractions), and the width the whole
+/// picture is shown at, in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    width: f32,
+}
 
 /// What the engine is asked to do with the shown file.
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +213,13 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
             nav::context_menu(&ui, target);
         }
     });
+    let weak = ui.as_weak();
+    details.on_detail(move |left, top, right, bottom, width| {
+        let view = (right > left && bottom > top && width > 0.0).then_some(View { left, top, right, bottom, width });
+        if let Some(ui) = weak.upgrade() {
+            detail(&ui, view);
+        }
+    });
     details.set_film(SHOWN.with_borrow(|shown| ModelRc::from(shown.film.clone())));
     let weak = ui.as_weak();
     details.on_step(move |delta| {
@@ -207,7 +247,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 }
 
 /// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
-/// TODO: zoom, metadata editing.
+/// TODO: metadata editing.
 pub fn show(ui: &AppWindow, mut target: Target) {
     locate(&mut target);
     log::debug!("details: show {target:?}");
@@ -243,6 +283,8 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_info(info.as_str().into());
     details.set_image(slint::Image::default());
     details.set_image_ready(false);
+    details.set_full_edge(0);
+    detail(ui, None);
     details.set_faces(ModelRc::default());
     details.set_flash_face(-1);
     details.set_review_cw(0);
@@ -489,6 +531,8 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
     forget(path);
     if this {
         SHOWN.with_borrow_mut(|shown| shown.decoded = false);
+        // The page asks again for the new file once its picture is up.
+        detail(ui, None);
         load(ui);
     } else if other && ui.global::<DetailsBridge>().get_side_by_side() {
         load_other(ui);
@@ -576,6 +620,7 @@ fn load(ui: &AppWindow) {
             return;
         }
         let pixels = decode(&path, kind);
+        let full_edge = thumbs::dimensions(&path).map_or(0, |(w, h)| w.max(h));
         log::debug!(
             "details: load #{generation} read in {:?}: decoded {}, {} faces, review {:?}, other side {:?}",
             started.elapsed(),
@@ -602,6 +647,7 @@ fn load(ui: &AppWindow) {
             match pixels {
                 Some(pixels) => {
                     details.set_info(format!("{info} · {} × {}", pixels.width(), pixels.height()).into());
+                    details.set_full_edge(full_edge.max(pixels.width()).max(pixels.height()) as i32);
                     // Already up if it was prefetched.
                     if !decoded {
                         details.set_image(slint::Image::from_rgb8(pixels));
@@ -757,6 +803,87 @@ fn prefetch_thread() {
         drop(prefetch);
         PREFETCH_CHANGED.notify_all();
     }
+}
+
+/// The page's zoomed `view` of the shown picture, settled (`None`: no longer zoomed in past
+/// it): draws the part in view from the file at full resolution, decoded on a worker the first
+/// time (the latest view wins). With `None`, drops that and the decoded file.
+fn detail(ui: &AppWindow, view: Option<View>) {
+    let generation = DETAIL.fetch_add(1, Ordering::Relaxed) + 1;
+    let path = SHOWN.with_borrow(|shown| shown.path().filter(|_| shown.kind == Some(MediaKind::Image)).map(Path::to_path_buf));
+    let (Some(view), Some(path)) = (view, path) else {
+        let details = ui.global::<DetailsBridge>();
+        if details.get_tile_w() > 0.0 {
+            log::debug!("details: zoomed out - detail dropped");
+        }
+        details.set_tile(slint::Image::default());
+        details.set_tile_w(0.0);
+        // Not here: a decode in flight holds the lock.
+        thread::spawn(move || {
+            let mut full = FULL.lock().unwrap();
+            if DETAIL.load(Ordering::Relaxed) == generation {
+                *full = None;
+            }
+        });
+        return;
+    };
+    log::trace!("details: detail #{generation} {view:?}");
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        // One decode at a time; the requests queued behind it find it done.
+        let mut full = FULL.lock().unwrap();
+        if DETAIL.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        let stamp = stamp(&path);
+        if !full.as_ref().is_some_and(|f| f.path == path && stamp.is_some() && f.stamp == stamp) {
+            // The one held goes first: only one at a time.
+            *full = None;
+            let started = std::time::Instant::now();
+            let Some(image) = thumbs::decode_full(&path, MediaKind::Image, FULL_PIXELS) else {
+                log::warn!("details: {} could not be decoded at full resolution", path.display());
+                return;
+            };
+            log::debug!("details: {} decoded at full resolution ({}x{}) in {:?}", path.display(), image.width(), image.height(), started.elapsed());
+            *full = Some(Full { path: path.clone(), stamp, image });
+        }
+        if DETAIL.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        let Some(f) = full.as_ref() else { return };
+        let (tile, [x, y, w, h]) = region(&f.image, view);
+        drop(full);
+        let pixels = Pixels::clone_from_slice(tile.as_raw(), tile.width(), tile.height());
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if DETAIL.load(Ordering::Relaxed) != generation || SHOWN.with_borrow(|shown| shown.path() != Some(path.as_path())) {
+                return;
+            }
+            let details = ui.global::<DetailsBridge>();
+            details.set_tile(slint::Image::from_rgb8(pixels));
+            details.set_tile_x(x);
+            details.set_tile_y(y);
+            details.set_tile_w(w);
+            details.set_tile_h(h);
+        });
+    });
+}
+
+/// The part of `full` to draw for `view`: what is in view and a quarter of that around it
+/// (for a short pan), no larger than it is shown; and where it is, in fractions of `full`.
+fn region(full: &RgbImage, view: View) -> (RgbImage, [f32; 4]) {
+    let (w, h) = full.dimensions();
+    let span = |from: f32, to: f32, size: u32| {
+        let margin = (to - from) / 4.0;
+        let start = (((from - margin).clamp(0.0, 1.0) * size as f32).floor() as u32).min(size - 1);
+        let end = (((to + margin).clamp(0.0, 1.0) * size as f32).ceil() as u32).clamp(start + 1, size);
+        (start, end - start)
+    };
+    let (x, cw) = span(view.left, view.right, w);
+    let (y, ch) = span(view.top, view.bottom, h);
+    let crop = image::imageops::crop_imm(full, x, y, cw, ch).to_image();
+    let edge = (cw.max(ch) as f32 * view.width / w as f32).ceil() as u32;
+    let tile = thumbs::fit(&crop, edge.max(1));
+    (tile, [x as f32 / w as f32, y as f32 / h as f32, cw as f32 / w as f32, ch as f32 / h as f32])
 }
 
 /// Decodes the other side of the photo and reads its faces, for the side-by-side view.
@@ -962,6 +1089,25 @@ mod tests {
         assert!(prefetch.ready(Path::new("a"), None).is_none(), "file gone");
         prefetch.put(Path::new("a"), changed, &pixels);
         assert_eq!(prefetch.ready.len(), 1, "replaced");
+    }
+
+    #[test]
+    fn region_is_the_view_with_a_margin_no_larger_than_shown() {
+        let full = RgbImage::from_fn(1000, 500, |x, _| image::Rgb([(x / 4) as u8, 0, 0]));
+        // The middle half across, the top half down, shown 2000 px wide (2× the file).
+        let view = View { left: 0.25, top: 0.0, right: 0.75, bottom: 0.5, width: 2000.0 };
+        let (tile, rect) = region(&full, view);
+        // A quarter of the view around it, within the image: 125 px each side, 62.5 down.
+        assert_eq!(tile.dimensions(), (750, 313), "full resolution: shown larger than the file");
+        assert_eq!(rect, [0.125, 0.0, 0.75, 0.626]);
+        assert_eq!(tile.get_pixel(0, 0)[0], (125 / 4) as u8);
+        // Shown at 500 px wide (half the file): scaled down to that.
+        let (tile, _) = region(&full, View { width: 500.0, ..view });
+        assert_eq!(tile.dimensions(), (375, 157));
+        // A sliver at the edge still makes a tile.
+        let (tile, rect) = region(&full, View { left: 1.0, top: 1.0, right: 1.0, bottom: 1.0, width: 1000.0 });
+        assert_eq!(tile.dimensions(), (1, 1));
+        assert_eq!(rect, [0.999, 0.998, 0.001, 0.002]);
     }
 
     #[test]
