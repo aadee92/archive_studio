@@ -155,12 +155,18 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
     let _ = HANDLE.set(handle.clone());
 
     let (relay_root, weak) = (root.clone(), ui.as_weak());
-    let _ = thread::Builder::new().name("pipeline-relay".into()).spawn(move || relay(&relay_root, receive, weak));
+    let _ = thread::Builder::new().name("pipeline-relay".into()).spawn(move || {
+        log::debug!("pipeline relay started");
+        relay(&relay_root, receive, weak);
+        log::debug!("pipeline relay stopped (every sender gone)");
+    });
 
     let starter = handle.clone();
     let _ = thread::Builder::new().name("pipeline-start".into()).spawn(move || {
         let events = starter.notes.clone();
-        let started = Engine::start(&root, Config::default(), move |event| {
+        let config = Config::default();
+        log::info!("starting the pipeline engine ({} workers, models {:?})", config.threads, Models::dir());
+        let started = Engine::start(&root, config, move |event| {
             let _ = events.send(Note::Event(event));
         });
         let result = started.map(|engine| *starter.engine.lock().unwrap() = Some(Arc::new(engine)));
@@ -184,6 +190,7 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
     HOST.set(Some(host.clone()));
     ui.global::<PipelineBridge>().on_toggle_pause(|| {
         with_host(|h| {
+            log::info!("pipeline {} by the user", if h.paused.get() { "resumed" } else { "paused" });
             h.paused.set(!h.paused.get());
             h.apply_mode();
         })
@@ -195,6 +202,9 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
 /// Stops the engine (if it runs here) and waits for its thread. Called at app exit.
 pub fn shutdown() {
     let engine = HOST.with_borrow(|host| host.as_ref().and_then(|h| h.handle.engine.lock().unwrap().take()));
+    if engine.is_some() {
+        log::info!("stopping the pipeline engine");
+    }
     drop(engine);
 }
 
@@ -223,6 +233,7 @@ impl Host {
         let mode = self.wanted_mode();
         if let Some(engine) = self.handle.engine() {
             if self.mode.replace(Some(mode)) != Some(mode) {
+                log::debug!("pipeline mode {mode:?}");
                 engine.set_mode(mode);
             }
         }
@@ -234,13 +245,17 @@ impl Host {
         if let Some(started) = batch.started {
             *self.state.borrow_mut() = match started {
                 Ok(()) => {
+                    log::info!("pipeline engine running");
                     // Catching up until it says otherwise.
                     self.busy.set(true);
                     EngineState::Running
                 }
-                Err(e) if e.contains("already processing") => EngineState::Elsewhere,
+                Err(e) if e.contains("already processing") => {
+                    log::info!("pipeline not started here: {e}");
+                    EngineState::Elsewhere
+                }
                 Err(e) => {
-                    eprintln!("pipeline: not started: {e}");
+                    log::warn!("pipeline: not started: {e}");
                     EngineState::Off(e)
                 }
             };
@@ -260,6 +275,7 @@ impl Host {
             details::file_changed(&ui, &path);
         }
         if batch.identified {
+            log::debug!("pipeline identified faces: refreshing People if shown");
             people::refresh_if_shown(&ui);
         }
         if let Some(busy) = batch.busy {
@@ -376,18 +392,15 @@ impl Digest {
         };
         self.engine = true;
         match event {
-            Event::CatchUp { added, changed, missing } => {
-                if added + changed + missing > 0 {
-                    eprintln!("pipeline: catch-up: {added} new, {changed} changed, {missing} missing");
-                }
-            }
+            // Logged by the engine itself (`archive_core::pipeline`).
+            Event::CatchUp { .. } => {}
             Event::Ready(availability) => {
                 self.ready = Some(availability);
                 let missing: Vec<&str> =
                     [(ORIENT, availability.orient), (FACES, availability.faces)].into_iter().filter(|s| !s.1).map(|s| s.0).collect();
                 if !missing.is_empty() {
                     let dir = Models::dir().map_or_else(|| "the models directory".to_owned(), |d| d.display().to_string());
-                    eprintln!("pipeline: no model for {} in {dir}; skipping", missing.join(", "));
+                    log::warn!("pipeline: no model for {} in {dir}; skipping", missing.join(", "));
                 }
             }
             Event::Rotated { path, .. } => {
@@ -398,12 +411,10 @@ impl Digest {
                 self.files.entry(path).or_insert(false);
             }
             Event::Failed { path, stage, error } => {
-                let message = format!("{stage} failed: {}: {error}", show(&path));
-                eprintln!("pipeline: {message}");
-                self.message = Some(message);
+                // Logged by the engine itself, as are warnings.
+                self.message = Some(format!("{stage} failed: {}: {error}", show(&path)));
             }
             Event::Warning(warning) => {
-                eprintln!("pipeline: warning: {warning}");
                 self.message = Some(format!("Warning: {warning}"));
             }
             Event::Identified { .. } => self.identified = true,
@@ -456,7 +467,7 @@ fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
             if let (Some(catalog), Some(availability)) = (&catalog, availability) {
                 match pipeline::status(catalog, availability) {
                     Ok(status) => batch.status = Some(status),
-                    Err(e) => eprintln!("pipeline: status: {e}"),
+                    Err(e) => log::warn!("pipeline: status: {e}"),
                 }
             }
             (owed, counted) = (false, Some(Instant::now()));
@@ -471,7 +482,17 @@ fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
             && batch.status.is_none()
             && batch.message.is_none();
         if !nothing {
-            let _ = ui.upgrade_in_event_loop(move |_| with_host(|h| h.apply(batch)));
+            log::trace!(
+                "relay batch: {} files, {} rotated, identified {}, busy {:?}, status {}",
+                batch.files.len(),
+                batch.rotated.len(),
+                batch.identified,
+                batch.busy,
+                batch.status.is_some()
+            );
+            if let Err(e) = ui.upgrade_in_event_loop(move |_| with_host(|h| h.apply(batch))) {
+                log::debug!("pipeline relay: batch not delivered: {e}");
+            }
         }
     }
 }

@@ -319,7 +319,7 @@ fn save_photos(
     let (mut summary, mut warning) = (String::new(), None);
     duplex.process(bed, dpi, grid, backs, &mut |event| match event {
         Event::Log(line) => {
-            eprintln!("v850: {line}");
+            log::info!("photo-duplex: {line}");
             if warning.is_none() {
                 warning = line.lines().find_map(|l| {
                     let l = l.trim();

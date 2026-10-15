@@ -9,4 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 archive-core = { path = "../core" }
+archive-logging = { path = "../logging" }
+log = "0.4"
 rustyline = "17"

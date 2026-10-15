@@ -548,11 +548,16 @@ impl Pipeline {
     }
 
     fn emit(&self, event: Event) {
+        log_event(&event);
         (self.sink)(event);
     }
 
     fn run(mut self, receive: mpsc::Receiver<Msg>) {
-        match catch_up(&self.catalog) {
+        log::info!("pipeline engine for {}: {} workers, {:?}", self.catalog.root().display(), self.workers.threads, self.workers.availability);
+        let started = Instant::now();
+        let caught_up = catch_up(&self.catalog);
+        log::debug!("catch-up took {:?}", started.elapsed());
+        match caught_up {
             Ok((added, changed, missing)) => self.emit(Event::CatchUp { added, changed, missing }),
             Err(e) => self.emit(Event::Warning(format!("catch-up: {e}"))),
         }
@@ -568,11 +573,17 @@ impl Pipeline {
             let first = match receive.recv_timeout(wait) {
                 Ok(msg) => Some(msg),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    log::info!("pipeline engine stopped (channel closed)");
+                    return;
+                }
             };
             for msg in first.into_iter().chain(receive.try_iter()) {
                 match msg {
-                    Msg::Command(Command::Shutdown) => return,
+                    Msg::Command(Command::Shutdown) => {
+                        log::info!("pipeline engine stopped");
+                        return;
+                    }
                     Msg::Command(command) => self.command(command),
                     Msg::Fs(Ok(event)) => self.watched(event),
                     Msg::Fs(Err(e)) => self.emit(Event::Warning(format!("file watcher: {e}"))),
@@ -670,7 +681,12 @@ impl Pipeline {
         match outcome {
             Outcome::Orient(due, result) => {
                 self.known.remove(&(due.asset, Stage::Orient));
+                match &result {
+                    Ok((p, temp)) => log::debug!("orient {}: {}° ({:.0}%){}", due.path.display(), p.cw, p.confidence * 100.0, if temp.is_some() { ", rewritten" } else { "" }),
+                    Err(e) => log::debug!("orient {}: error {e}", due.path.display()),
+                }
                 if !self.still_current(&due) {
+                    log::debug!("orient {}: file changed meanwhile, result dropped", due.path.display());
                     if let Ok((_, Some(temp))) = result {
                         let _ = std::fs::remove_file(temp);
                     }
@@ -682,7 +698,12 @@ impl Pipeline {
             }
             Outcome::Faces(due, result) => {
                 self.known.remove(&(due.asset, Stage::Faces));
+                match &result {
+                    Ok(found) => log::debug!("faces {}: {} found", due.path.display(), found.len()),
+                    Err(e) => log::debug!("faces {}: error {e}", due.path.display()),
+                }
                 if !self.still_current(&due) {
+                    log::debug!("faces {}: file changed meanwhile, result dropped", due.path.display());
                     return;
                 }
                 let stored = result.and_then(|found| {
@@ -710,7 +731,13 @@ impl Pipeline {
             }
             Outcome::Signature(due, result) => {
                 self.known.remove(&(due.asset, Stage::Signature));
+                if let Err(e) = &result {
+                    log::debug!("signature {}: error {e}", due.path.display());
+                } else {
+                    log::trace!("signature {}: done", due.path.display());
+                }
                 if !self.still_current(&due) {
+                    log::debug!("signature {}: file changed meanwhile, result dropped", due.path.display());
                     return;
                 }
                 let stored = result.and_then(|signature| self.catalog.set_signature(due.asset, &signature).map_err(|e| e.to_string()));
@@ -792,17 +819,30 @@ impl Pipeline {
     }
 
     fn command(&mut self, command: Command) {
+        match &command {
+            Command::Add(path) => log::debug!("command: add {}", path.display()),
+            Command::Rotate(path, cw, _) => log::debug!("command: rotate {} {cw}°", path.display()),
+            Command::Accept(path, _) => log::debug!("command: accept {}", path.display()),
+            Command::Keep(path, _) => log::debug!("command: keep {}", path.display()),
+            Command::RetryFailed => log::info!("command: retry failed"),
+            Command::SetMode(mode) => log::debug!("command: mode {mode:?}"),
+            Command::Shutdown => {}
+        }
         match command {
             Command::Add(path) => {
                 let since = Instant::now().checked_sub(SETTLE).unwrap_or_else(Instant::now);
                 self.pending.insert(path, Pending { since, last: None, trusted: true });
             }
             Command::Rotate(path, cw, reply) => {
-                let _ = reply.send(self.user_rotate(&path, cw));
+                let result = self.user_rotate(&path, cw);
+                log::debug!("rotate {} {cw}°: {result:?}", path.display());
+                let _ = reply.send(result);
             }
             Command::Accept(path, reply) => {
                 let proposed = self.review_of(&path).and_then(|(_, cw)| cw.ok_or_else(|| "nothing to accept".to_owned()));
-                let _ = reply.send(proposed.and_then(|cw| self.user_rotate(&path, cw)));
+                let result = proposed.and_then(|cw| self.user_rotate(&path, cw));
+                log::debug!("accept {}: {result:?}", path.display());
+                let _ = reply.send(result);
             }
             Command::Keep(path, reply) => {
                 let result = self.review_of(&path).and_then(|(asset, _)| {
@@ -817,6 +857,7 @@ impl Pipeline {
                     };
                     self.catalog.set_run(asset, &run).map_err(|e| e.to_string())
                 });
+                log::debug!("keep {}: {result:?}", path.display());
                 let _ = reply.send(result);
             }
             Command::RetryFailed => {
@@ -927,6 +968,7 @@ impl Pipeline {
     /// Identify and sidecar sync, once the per-file stages have been quiet for a while.
     fn library_stages(&mut self) {
         if self.workers.availability.faces && self.catalog.pipeline_value(FACES_SINCE_IDENTIFY).unwrap_or(0) > 0 {
+            let started = Instant::now();
             let identified = (|| {
                 let suggested = self.catalog.refresh_suggestions(DEFAULT_MIN_SIMILARITY)?;
                 let params = faces::cluster::Params { min_faces: 2, ..Default::default() };
@@ -935,7 +977,10 @@ impl Pipeline {
                 Ok::<_, crate::catalog::Error>((suggested, clusters))
             })();
             match identified {
-                Ok((suggested, clusters)) => self.emit(Event::Identified { suggested, clusters }),
+                Ok((suggested, clusters)) => {
+                    log::debug!("identify took {:?}", started.elapsed());
+                    self.emit(Event::Identified { suggested, clusters })
+                }
                 Err(e) => self.emit(Event::Warning(format!("identify: {e}"))),
             }
         }
@@ -962,6 +1007,29 @@ impl Pipeline {
             self.idle = true;
             self.emit(Event::Idle);
         }
+    }
+}
+
+/// The engine's reports, as they go to the host: summaries at info, stage failures and
+/// warnings at warn, per-file news at debug (`Updated` at trace: thousands in a catch-up).
+fn log_event(event: &Event) {
+    match event {
+        Event::CatchUp { added, changed, missing } if added + changed + missing > 0 => {
+            log::info!("catch-up: {added} new, {changed} changed, {missing} missing")
+        }
+        Event::CatchUp { .. } => log::info!("catch-up: library unchanged"),
+        Event::Ready(availability) => log::info!("ready: {availability:?}"),
+        Event::Rotated { path, cw, by_user } => {
+            log::debug!("rotated {} {cw}° ({})", path.display(), if *by_user { "by the user" } else { "by orient" })
+        }
+        Event::Review { path, stage, detail } => log::debug!("{stage} wants review: {}: {detail}", path.display()),
+        Event::Failed { path, stage, error } => log::warn!("{stage} failed: {}: {error}", path.display()),
+        Event::Updated(path) => log::trace!("updated {}", path.display()),
+        Event::Identified { suggested, clusters } => log::info!("identified: {suggested} faces suggested, {clusters} clusters"),
+        Event::Synced { written } => log::info!("synced {written} sidecars"),
+        Event::Warning(warning) => log::warn!("{warning}"),
+        Event::Busy => log::debug!("busy"),
+        Event::Idle => log::info!("idle: all caught up"),
     }
 }
 

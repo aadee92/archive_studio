@@ -17,3 +17,12 @@ export struct ScrollRestore {
     row: int,
     offset: length,
 }
+
+// Diagnostics: what happens in the UI that Rust wouldn't otherwise see (pure-Slint state such
+// as list scrolling and model sizes, keys, overlays), passed to the log (`src/nav.rs`).
+// `source` says where, e.g. "people.list".
+export global UiLog {
+    callback debug(/* source */ string, /* message */ string);
+    // For what changes continuously (scroll positions).
+    callback trace(string, string);
+}

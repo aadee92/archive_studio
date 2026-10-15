@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, SharedString, VecModel};
 
@@ -119,6 +119,20 @@ pub(crate) struct Snapshot {
     offset: f32,
 }
 
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "People {{ person {}, {} faces selected, scroll anchor face {:?} +{:.0}px, shift anchor {:?} }}",
+            self.person,
+            self.selected.len(),
+            self.anchor.map(|id| id.0),
+            self.offset,
+            self.anchor_click.map(|id| id.0)
+        )
+    }
+}
+
 thread_local! {
     static GRID: RefCell<Option<Rc<FaceGrid>>> = const { RefCell::new(None) };
 }
@@ -154,47 +168,96 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
 
     let bridge = ui.global::<PeopleBridge>();
     bridge.set_rows(ModelRc::from(grid.clone()));
-    bridge.on_select(|key| with_grid(|g| g.load(Some(key))));
+    bridge.on_select(|key| {
+        log::debug!("person list click: key {key} ({})", person_label(key));
+        with_grid(|g| g.load(Some(key), "person picked in the list"))
+    });
     bridge.on_columns_changed(|n| {
         with_grid(|g| {
             // Also sent each time the page is shown; only a change re-lays the grid.
-            if g.columns.replace(n.max(1) as usize) != n.max(1) as usize {
+            let before = g.columns.replace(n.max(1) as usize);
+            if before != n.max(1) as usize {
+                log::debug!("face grid columns {before} -> {n}: model reset");
                 g.notify.reset();
             }
         })
     });
     bridge.on_open(|row, col| {
-        with_grid(|g| {
-            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.position(row, col).map(|i| g.target(i))) {
+        with_grid(|g| match (g.ui.upgrade(), g.position(row, col)) {
+            (Some(ui), Some(i)) => {
+                let target = g.target(i);
+                log::debug!("face double-click at row {row} col {col}: face #{i} -> open");
                 nav::open(&ui, target);
             }
+            (_, None) => log::debug!("face double-click at row {row} col {col}: no face there ({} faces) - ignored", g.faces.borrow().len()),
+            (None, _) => log::debug!("face double-click: window gone - ignored"),
         })
     });
     bridge.on_context_menu(|row, col| {
-        with_grid(|g| {
-            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.position(row, col).map(|i| g.target(i))) {
+        with_grid(|g| match (g.ui.upgrade(), g.position(row, col)) {
+            (Some(ui), Some(i)) => {
+                let target = g.target(i);
                 nav::context_menu(&ui, target);
             }
+            _ => log::debug!("face right-click at row {row} col {col}: no face there - no menu"),
         })
     });
-    bridge.on_click(|row, col, extend, toggle| with_grid(|g| g.click(g.position(row, col), extend, toggle)));
+    bridge.on_click(|row, col, extend, toggle| {
+        with_grid(|g| {
+            let at = g.position(row, col);
+            log::debug!("face click at row {row} col {col} -> {at:?} (shift {extend}, ctrl {toggle})");
+            g.click(at, extend, toggle)
+        })
+    });
     bridge.on_drag_begin(|keep| {
+        log::debug!("face drag begins (keep selection {keep})");
         with_grid(|g| {
             *g.drag_base.borrow_mut() = if keep { g.selection.borrow().clone() } else { BTreeSet::new() };
         })
     });
-    bridge.on_drag_to(|r0, r1, c0, c1| with_grid(|g| g.drag_to(r0, r1, c0, c1)));
-    bridge.on_select_all(|| with_grid(|g| g.set_selection((0..g.faces.borrow().len()).collect())));
-    bridge.on_clear_selection(|| with_grid(|g| g.set_selection(BTreeSet::new())));
-    bridge.on_name_edited(|text| with_grid(|g| g.offer_names(&text)));
-    bridge.on_assign(|name| with_grid(|g| g.assign(&name)));
-    bridge.on_ignore(|| with_grid(|g| g.ignore()));
+    bridge.on_drag_to(|r0, r1, c0, c1| {
+        log::trace!("face drag rows {r0}..={r1} cols {c0}..={c1}");
+        with_grid(|g| g.drag_to(r0, r1, c0, c1))
+    });
+    bridge.on_select_all(|| {
+        log::debug!("select all faces");
+        with_grid(|g| g.set_selection((0..g.faces.borrow().len()).collect()))
+    });
+    bridge.on_clear_selection(|| {
+        log::debug!("clear face selection");
+        with_grid(|g| g.set_selection(BTreeSet::new()))
+    });
+    bridge.on_name_edited(|text| {
+        log::trace!("name box: {text:?}");
+        with_grid(|g| g.offer_names(&text))
+    });
+    bridge.on_assign(|name| {
+        log::debug!("assign {name:?} to the selected faces");
+        with_grid(|g| g.assign(&name))
+    });
+    bridge.on_ignore(|| {
+        log::debug!("ignore the selected faces");
+        with_grid(|g| g.ignore())
+    });
+}
+
+/// `Alice (3)` for a person key, from the list on screen, for the log.
+fn person_label(key: i32) -> String {
+    let mut found = None;
+    with_grid(|g| {
+        if let Some(ui) = g.ui.upgrade() {
+            let people = ui.global::<PeopleBridge>().get_people();
+            found = people.iter().find(|p| p.key == key).map(|p| format!("{} ({})", p.name, p.count));
+        }
+    });
+    found.unwrap_or_else(|| "not in the list".to_owned())
 }
 
 /// The page was picked in the sidebar: faces get named elsewhere (and found by scans), so
 /// the catalog is re-read.
 pub fn entered() {
-    with_grid(|g| g.load(None));
+    log::debug!("people page shown from the sidebar: re-reading the catalog");
+    with_grid(|g| g.load(None, "page shown"));
 }
 
 pub(crate) fn snapshot() -> Option<Snapshot> {
@@ -221,12 +284,18 @@ pub(crate) fn restore(snapshot: Snapshot) {
         let Some(ui) = g.ui.upgrade() else { return };
         let bridge = ui.global::<PeopleBridge>();
         if bridge.get_selected() == snapshot.person && !bridge.get_loading() {
+            log::debug!("restore {snapshot:?}: same person on screen, applying now and re-reading the list");
             g.apply_restore(snapshot);
             g.load_people();
         } else {
+            log::debug!(
+                "restore {snapshot:?}: on screen person {} (loading {}), reloading first",
+                bridge.get_selected(),
+                bridge.get_loading()
+            );
             let person = snapshot.person;
             *g.restore.borrow_mut() = Some(snapshot);
-            g.load(Some(person));
+            g.load(Some(person), "back to this person");
         }
     });
 }
@@ -238,10 +307,11 @@ pub fn refresh_if_shown(ui: &AppWindow) {
     if ui.get_page() == nav::PEOPLE {
         with_grid(|g| {
             let working = !g.selection.borrow().is_empty() || g.faces.borrow().iter().any(|f| f.mask.is_some());
+            log::debug!("pipeline grouped faces; page shown, working {working}: re-reading {}", if working { "the list" } else { "everything" });
             if working {
                 g.load_people();
             } else {
-                g.load(None);
+                g.load(None, "pipeline grouped faces");
             }
         });
     }
@@ -249,12 +319,19 @@ pub fn refresh_if_shown(ui: &AppWindow) {
 
 impl FaceGrid {
     /// Reads the people and the faces of `key` (the current selection if `None`) on a worker.
-    fn load(&self, key: Option<i32>) {
+    fn load(&self, key: Option<i32>, why: &str) {
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<PeopleBridge>();
         let key = key.unwrap_or_else(|| bridge.get_selected());
+        let generation = self.generation.get() + 1;
+        log::debug!(
+            "load #{generation} person {key} ({why}); on screen {}, was loading {}",
+            bridge.get_selected(),
+            bridge.get_loading()
+        );
         if key != bridge.get_selected() {
             // A different person: don't show the last one's faces under the new name.
+            log::debug!("load #{generation}: another person, clearing the grid (model reset)");
             bridge.set_selected(key);
             self.faces.borrow_mut().clear();
             self.clear_selection();
@@ -263,29 +340,54 @@ impl FaceGrid {
         }
         bridge.set_loading(true);
 
-        let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let (root, weak) = (self.root.clone(), self.ui.clone());
-        thread::spawn(move || {
+        let spawned = thread::Builder::new().name("people-load".into()).spawn(move || {
+            let started = Instant::now();
             let loaded = read(&root, key);
-            let _ = weak.upgrade_in_event_loop(move |_| {
+            match &loaded {
+                Ok(l) => log::debug!(
+                    "load #{generation} read: {} people, person {} {:?}, {} faces in {:?}",
+                    l.people.items.len(),
+                    l.selected,
+                    l.title,
+                    l.faces.len(),
+                    started.elapsed()
+                ),
+                Err(e) => log::warn!("load #{generation} failed after {:?}: {e}", started.elapsed()),
+            }
+            let posted = weak.upgrade_in_event_loop(move |_| {
                 with_grid(|g| {
                     if g.generation.get() == generation {
                         g.show(loaded)
+                    } else {
+                        log::debug!("load #{generation} result dropped: load #{} superseded it", g.generation.get());
                     }
                 })
             });
+            if let Err(e) = posted {
+                log::debug!("load #{generation} result not delivered: {e}");
+            }
         });
+        if let Err(e) = spawned {
+            log::error!("load #{generation}: can't start a thread: {e}");
+        }
     }
 
     /// Re-reads only the people list (counts after naming faces), on a worker.
     fn load_people(&self) {
         let root = self.root.clone();
         let weak = self.ui.clone();
-        thread::spawn(move || {
+        log::debug!("re-reading the people list only");
+        let _ = thread::Builder::new().name("people-list".into()).spawn(move || {
+            let started = Instant::now();
             let people = Catalog::open(&Catalog::default_path(&root), &root).map_err(|e| e.to_string()).and_then(|c| read_people(&c));
-            if let Ok(people) = people {
-                let _ = weak.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
+            match people {
+                Ok(people) => {
+                    log::debug!("people list read: {} people in {:?}", people.items.len(), started.elapsed());
+                    let _ = weak.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
+                }
+                Err(e) => log::warn!("people list: {e}"),
             }
         });
     }
@@ -297,10 +399,19 @@ impl FaceGrid {
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(e) => {
+                log::warn!("people load failed, grid left as it was: {e}");
                 bridge.set_status_text(format!("Catalog: {e}").into());
                 return;
             }
         };
+        log::debug!(
+            "show person {} {:?}: {} people, {} faces (model reset, selection cleared); restore pending: {}",
+            loaded.selected,
+            loaded.title,
+            loaded.people.items.len(),
+            loaded.faces.len(),
+            self.restore.borrow().as_ref().map_or_else(|| "none".to_owned(), |s| format!("{s:?}"))
+        );
         self.show_people(loaded.people);
         bridge.set_selected(loaded.selected);
         bridge.set_person_name(if loaded.selected == UNKNOWN { SharedString::default() } else { loaded.title.as_str().into() });
@@ -310,9 +421,10 @@ impl FaceGrid {
         self.clear_selection();
         self.notify.reset();
         self.publish_status();
-        let restore = self.restore.take();
-        if let Some(snapshot) = restore.filter(|s| s.person == loaded.selected) {
-            self.apply_restore(snapshot);
+        match self.restore.take() {
+            Some(snapshot) if snapshot.person == loaded.selected => self.apply_restore(snapshot),
+            Some(snapshot) => log::debug!("restore {snapshot:?} dropped: person {} was loaded instead", loaded.selected),
+            None => {}
         }
     }
 
@@ -321,12 +433,28 @@ impl FaceGrid {
         let Some(ui) = self.ui.upgrade() else { return };
         let position: HashMap<FaceId, usize> = self.faces.borrow().iter().enumerate().map(|(i, f)| (f.id, i)).collect();
         self.anchor.set(snapshot.anchor_click.and_then(|id| position.get(&id).copied()));
-        self.set_selection(snapshot.selected.iter().filter_map(|id| position.get(id).copied()).collect());
-        if let Some(&first) = snapshot.anchor.and_then(|id| position.get(&id)) {
-            let bridge = ui.global::<PeopleBridge>();
-            let serial = bridge.get_restore().serial + 1;
-            let row = (first / self.columns.get()) as i32;
-            bridge.set_restore(ScrollRestore { serial, row, offset: snapshot.offset });
+        let selection: BTreeSet<usize> = snapshot.selected.iter().filter_map(|id| position.get(id).copied()).collect();
+        let selected = selection.len();
+        self.set_selection(selection);
+        match snapshot.anchor.and_then(|id| position.get(&id)) {
+            Some(&first) => {
+                let bridge = ui.global::<PeopleBridge>();
+                let serial = bridge.get_restore().serial + 1;
+                let row = (first / self.columns.get()) as i32;
+                log::debug!(
+                    "restore applied: {selected} of {} faces selected, scroll to row {row} +{:.0}px (serial {serial}, {} rows)",
+                    snapshot.selected.len(),
+                    snapshot.offset,
+                    self.row_count()
+                );
+                bridge.set_restore(ScrollRestore { serial, row, offset: snapshot.offset });
+            }
+            None => log::debug!(
+                "restore applied: {selected} of {} faces selected; scroll anchor {:?} not in the grid ({} faces), scroll left as is",
+                snapshot.selected.len(),
+                snapshot.anchor.map(|id| id.0),
+                position.len()
+            ),
         }
     }
 
@@ -344,6 +472,12 @@ impl FaceGrid {
 
     fn show_people(&self, people: People) {
         let Some(ui) = self.ui.upgrade() else { return };
+        log::debug!(
+            "people list model replaced: {} rows [{}], {} person tags",
+            people.items.len(),
+            people.items.iter().take(12).map(|p| format!("{}:{}({})", p.key, p.name, p.count)).collect::<Vec<_>>().join(", "),
+            people.names.len()
+        );
         ui.global::<PeopleBridge>().set_people(ModelRc::new(VecModel::from(people.items)));
         *self.names.borrow_mut() =
             people.names.into_iter().map(|(display, path)| Name { display, path }).collect();
@@ -478,19 +612,28 @@ impl FaceGrid {
     }
 
     fn assign(&self, name: &str) {
-        let Some((path, label)) = self.resolve(name) else { return };
+        let Some((path, label)) = self.resolve(name) else {
+            log::debug!("assign {name:?}: not a person name - ignored");
+            return;
+        };
         if !self.names.borrow().iter().any(|n| n.path.eq_ignore_ascii_case(&path)) {
             // So the next selection is offered this name before the writer reports back.
             self.names.borrow_mut().push(Name { display: label.clone(), path: path.clone() });
         }
         if let Some((change, faces, paths)) = self.mask_selection(label.into(), false) {
-            let _ = self.writer.send(Change::Name { change, faces, paths, path });
+            log::debug!("change {change}: name {} faces {:?} as {path:?} ({} pictures)", faces.len(), ids(&faces), paths.len());
+            if self.writer.send(Change::Name { change, faces, paths, path }).is_err() {
+                log::error!("change {change}: the people writer thread is gone; not saved");
+            }
         }
     }
 
     fn ignore(&self) {
         if let Some((change, faces, paths)) = self.mask_selection("Ignored".into(), true) {
-            let _ = self.writer.send(Change::Ignore { change, faces, paths });
+            log::debug!("change {change}: ignore {} faces {:?}", faces.len(), ids(&faces));
+            if self.writer.send(Change::Ignore { change, faces, paths }).is_err() {
+                log::error!("change {change}: the people writer thread is gone; not saved");
+            }
         }
     }
 
@@ -499,6 +642,7 @@ impl FaceGrid {
     fn mask_selection(&self, label: SharedString, ignored: bool) -> Option<(u64, Vec<FaceId>, Vec<PathBuf>)> {
         let selection = std::mem::take(&mut *self.selection.borrow_mut());
         if selection.is_empty() {
+            log::debug!("{label}: no faces selected - ignored");
             return None;
         }
         let change = self.changes.get() + 1;
@@ -526,8 +670,12 @@ impl FaceGrid {
     /// The writer applied `change`, or failed to: then its masks come off.
     fn changed(&self, change: u64, result: Result<People, String>) {
         match result {
-            Ok(people) => self.show_people(people),
+            Ok(people) => {
+                log::debug!("change {change} saved");
+                self.show_people(people)
+            }
             Err(e) => {
+                log::warn!("change {change} not saved, unmasking its faces: {e}");
                 let columns = self.columns.get();
                 let mut rows = BTreeSet::new();
                 for (i, face) in self.faces.borrow_mut().iter_mut().enumerate() {
@@ -603,7 +751,8 @@ impl Model for FaceGrid {
 /// people list as it now is; once changes stop coming, refreshes the suggestions.
 fn spawn_writer(root: PathBuf, ui: slint::Weak<AppWindow>) -> mpsc::Sender<Change> {
     let (send, receive) = mpsc::channel::<Change>();
-    thread::spawn(move || {
+    let spawned = thread::Builder::new().name("people-writer".into()).spawn(move || {
+        log::debug!("people writer started");
         let mut catalog = None;
         let mut pending_refresh = false;
         loop {
@@ -626,17 +775,39 @@ fn spawn_writer(root: PathBuf, ui: slint::Weak<AppWindow>) -> mpsc::Sender<Chang
                 }
             };
             if catalog.is_none() {
-                catalog = Catalog::open(&Catalog::default_path(&root), &root).ok();
+                catalog = match Catalog::open(&Catalog::default_path(&root), &root) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        log::warn!("people writer: can't open the catalog: {e}");
+                        None
+                    }
+                };
             }
+            let started = Instant::now();
             let (id, result) = match catalog.as_mut() {
                 Some(c) => apply(c, change),
                 None => (change_id(&change), Err("can't open the catalog".to_owned())),
             };
+            match &result {
+                Ok(people) => log::debug!("change {id} written in {:?}; {} people now", started.elapsed(), people.items.len()),
+                Err(e) => log::warn!("change {id} failed: {e}"),
+            }
             pending_refresh |= result.is_ok();
-            let _ = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.changed(id, result)));
+            if let Err(e) = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.changed(id, result))) {
+                log::debug!("change {id}: result not delivered: {e}");
+            }
         }
+        log::debug!("people writer stopped (channel closed)");
     });
+    if let Err(e) = spawned {
+        log::error!("people writer: can't start a thread: {e}");
+    }
     send
+}
+
+/// Face ids for the log (the first few).
+fn ids(faces: &[FaceId]) -> Vec<i64> {
+    faces.iter().take(20).map(|f| f.0).collect()
 }
 
 fn change_id(change: &Change) -> u64 {
@@ -662,12 +833,19 @@ fn apply(catalog: &mut Catalog, change: Change) -> (u64, Result<People, String>)
 
 /// Suggestions from the faces confirmed so far; the counts change with them.
 fn refresh(catalog: &mut Catalog, ui: &slint::Weak<AppWindow>) {
-    if let Err(e) = catalog.refresh_suggestions(DEFAULT_MIN_SIMILARITY) {
-        eprintln!("people: suggestions: {e}");
-        return;
+    let started = Instant::now();
+    match catalog.refresh_suggestions(DEFAULT_MIN_SIMILARITY) {
+        Ok(n) => log::debug!("suggestions refreshed in {:?}: {n:?}", started.elapsed()),
+        Err(e) => {
+            log::warn!("people: suggestions: {e}");
+            return;
+        }
     }
-    if let Ok(people) = read_people(catalog) {
-        let _ = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
+    match read_people(catalog) {
+        Ok(people) => {
+            let _ = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
+        }
+        Err(e) => log::warn!("people list after suggestions: {e}"),
     }
 }
 

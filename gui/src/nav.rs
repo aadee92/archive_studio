@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 
-use crate::{actions, details, people, review, AppWindow, NavBridge};
+use crate::{actions, details, people, review, AppWindow, NavBridge, UiLog};
 use archive_core::catalog::faces::FaceId;
 
 /// Sidebar indices of the pages (`AppWindow.page`); 0 is Acquire.
@@ -43,6 +43,21 @@ impl Target {
     }
 }
 
+impl std::fmt::Debug for Target {
+    /// For the log: `"/lib/a.jpg" face 12 from "Review · Images" (40 items, #3)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self.path)?;
+        if let Some(face) = self.face {
+            write!(f, " face {}", face.0)?;
+        }
+        write!(f, " from {:?} ({} items", self.scope.label, self.scope.len)?;
+        match self.scope.current {
+            Some(i) => write!(f, ", #{i})"),
+            None => write!(f, ")"),
+        }
+    }
+}
+
 /// The items a view showed when something was opened from it, as filtered and ordered there:
 /// what the "similar in your filter" strip on the Details page draws from. Listing them is
 /// deferred ([`paths`](Self::paths)) since a Review filter can match hundreds of thousands
@@ -54,7 +69,6 @@ pub struct Scope {
     pub label: String,
     pub len: usize,
     /// The opened item's position among them, if it is one of them.
-    #[allow(dead_code)] // Not needed by the similar strip (which goes by similarity).
     pub current: Option<usize>,
     items: Rc<dyn Fn() -> Vec<PathBuf>>,
 }
@@ -77,6 +91,7 @@ impl Scope {
 }
 
 /// A view as it was left: enough to show it again just so.
+#[derive(Debug)]
 enum View {
     /// Nothing more to it than the page (Acquire; Details with nothing open).
     Page(i32),
@@ -90,6 +105,9 @@ thread_local! {
 }
 
 pub fn install(ui: &AppWindow) {
+    let ui_log = ui.global::<UiLog>();
+    ui_log.on_debug(|source, message| log::debug!(target: "archive_studio::ui", "{source}: {message}"));
+    ui_log.on_trace(|source, message| log::trace!(target: "archive_studio::ui", "{source}: {message}"));
     let nav = ui.global::<NavBridge>();
     let weak = ui.as_weak();
     nav.on_navigate(move |page| {
@@ -107,6 +125,7 @@ pub fn install(ui: &AppWindow) {
 
 /// Shows `target` on the Details page; Back returns to the view it was opened from.
 pub fn open(ui: &AppWindow, target: Target) {
+    log::debug!("open {target:?} (from page {})", ui.get_page());
     leave(ui);
     details::show(ui, target);
     ui.set_page(DETAILS);
@@ -115,8 +134,10 @@ pub fn open(ui: &AppWindow, target: Target) {
 /// The sidebar: shows `page` as it is now (People re-reads the catalog).
 pub fn go(ui: &AppWindow, page: i32) {
     if page == ui.get_page() {
+        log::debug!("go {page}: already shown");
         return;
     }
+    log::debug!("go {page} (from page {})", ui.get_page());
     leave(ui);
     ui.set_page(page);
     if page == PEOPLE {
@@ -126,7 +147,11 @@ pub fn go(ui: &AppWindow, page: i32) {
 
 /// Back to the view left last, as it was.
 pub fn back(ui: &AppWindow) {
-    let Some(view) = HISTORY_STACK.with_borrow_mut(Vec::pop) else { return };
+    let Some(view) = HISTORY_STACK.with_borrow_mut(Vec::pop) else {
+        log::debug!("back: history empty, nothing to do (page {})", ui.get_page());
+        return;
+    };
+    log::debug!("back from page {} to {view:?} (history now {})", ui.get_page(), depth());
     publish(ui);
     match view {
         View::Page(page) => ui.set_page(page),
@@ -149,6 +174,7 @@ pub fn back(ui: &AppWindow) {
 /// pointer: every page forwards right-clicks on items here with the item resolved (see
 /// `actions`).
 pub fn context_menu(ui: &AppWindow, target: Target) {
+    log::debug!("context menu for {target:?} (page {})", ui.get_page());
     actions::show_menu(ui, target);
 }
 
@@ -167,13 +193,19 @@ fn leave(ui: &AppWindow) {
         _ => None,
     }
     .unwrap_or(View::Page(page));
+    log::debug!("leave: push {view:?} (history now {})", depth() + 1);
     HISTORY_STACK.with_borrow_mut(|history| {
         if history.len() == HISTORY {
+            log::debug!("history full: oldest view dropped");
             history.remove(0);
         }
         history.push(view);
     });
     publish(ui);
+}
+
+fn depth() -> usize {
+    HISTORY_STACK.with_borrow(Vec::len)
 }
 
 fn publish(ui: &AppWindow) {

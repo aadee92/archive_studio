@@ -79,9 +79,41 @@ fn main() {
             std::process::exit(2);
         }
     };
+    start_logging(&args);
     if let Err(e) = run(args) {
-        eprintln!("{e}");
+        log::error!("{e}");
         std::process::exit(1);
+    }
+    log::info!("exit");
+}
+
+/// The logger: stderr filtered by `ARCHIVE_STUDIO_LOG` (default `warn`: the shell prints the
+/// engine's reports itself), and `<root>/.archive-studio/logs/archive.log`, which gets
+/// `debug` for the shell, the catalog and ops, `info` for the rest.
+fn start_logging(args: &Args) {
+    let started = archive_logging::init(archive_logging::Config {
+        dir: Some(archive_logging::dir_for(&args.root)),
+        file_name: "archive.log",
+        stderr_default: "warn",
+        file_minimum: "info,archive=debug,archive_core::ops=debug,archive_core::catalog=debug,panic=debug",
+    });
+    log::info!(
+        "archive shell {} ({}), pid {}, library {}, commands {:?}, until idle {}",
+        env!("CARGO_PKG_VERSION"),
+        archive_logging::GIT_HASH,
+        std::process::id(),
+        args.root.display(),
+        args.commands,
+        args.until_idle
+    );
+    match (&started.file, &started.file_error) {
+        (Some(file), _) => log::info!("log file {} (local time, UTC{})", file.display(), archive_logging::utc_offset()),
+        (None, Some(e)) => log::warn!("no log file: {e}"),
+        (None, None) => {}
+    }
+    log::info!("stderr filter {:?} (set {})", started.stderr_filter, archive_logging::ENV);
+    if let Some(e) = started.env_error {
+        log::warn!("{e}");
     }
 }
 
@@ -222,6 +254,7 @@ impl Shell {
     fn execute(&mut self, line: &str) -> bool {
         let words: Vec<&str> = line.split_whitespace().collect();
         let Some((&command, rest)) = words.split_first() else { return true };
+        log::debug!("command: {line}");
         let result = match command {
             "quit" | "exit" | "q" => return false,
             "help" | "?" => {
@@ -261,6 +294,7 @@ impl Shell {
             _ => Err(format!("unknown command {command}; try help")),
         };
         if let Err(e) = result {
+            log::debug!("command {command} failed: {e}");
             println!("{e}");
         }
         true

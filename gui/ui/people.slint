@@ -1,6 +1,6 @@
 import { ListView, LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { ScrollRestore } from "nav.slint";
+import { ScrollRestore, UiLog } from "nav.slint";
 import { ItemMenu } from "menu.slint";
 
 // A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
@@ -152,6 +152,7 @@ export component PeoplePage inherits Rectangle {
     // (Whether the catalog is re-read on showing the page, or the view left is restored,
     // is up to `nav.rs`.)
     changed visible => {
+        UiLog.debug("people", "visible = \{self.visible ? "yes" : "no"}; \{root.lists-state()}");
         if (self.visible) {
             PeopleBridge.columns-changed(self.columns);
         }
@@ -171,6 +172,31 @@ export component PeoplePage inherits Rectangle {
     }
 
     background: Theme.bg;
+
+    // Diagnostics (UiLog): the lists' models and scroll state, so the log shows a list that
+    // is empty, scrolled past its end, or not where Rust thinks it is.
+    pure function lists-state() -> string {
+        return "people list: \{PeopleBridge.people.length} rows, content-y \{plist.content-y / 1px} of height \{plist.content-height / 1px} in \{plist.visible-height / 1px}; "
+            + "faces: \{PeopleBridge.rows.length} rows × \{root.columns}, content-y \{list.content-y / 1px} of height \{list.content-height / 1px} in \{list.visible-height / 1px}; "
+            + "selected \{PeopleBridge.selected}, loading \{PeopleBridge.loading ? "yes" : "no"}, empty \{PeopleBridge.empty ? "yes" : "no"}";
+    }
+    property <int> people-rows: PeopleBridge.people.length;
+    changed people-rows => { UiLog.debug("people.list", "people model: \{self.people-rows} rows; \{root.lists-state()}"); }
+    property <int> face-rows: PeopleBridge.rows.length;
+    changed face-rows => { UiLog.debug("people.faces", "face model: \{self.face-rows} rows"); }
+    property <int> selected-key: PeopleBridge.selected;
+    changed selected-key => { UiLog.debug("people.list", "highlighted person key = \{self.selected-key}"); }
+    property <bool> loading: PeopleBridge.loading;
+    changed loading => { UiLog.debug("people", "loading = \{self.loading ? "yes" : "no"}"); }
+    // Scrolled further than the content goes (a list that looks blank).
+    property <bool> people-past-end: -plist.content-y > Math.max(0px, plist.content-height - plist.visible-height) + 1px;
+    changed people-past-end => { UiLog.debug("people.list", "scrolled past the end: \{self.people-past-end ? "yes" : "no"}; \{root.lists-state()}"); }
+    property <bool> faces-past-end: -list.content-y > Math.max(0px, list.content-height - list.visible-height) + 1px;
+    changed faces-past-end => { UiLog.debug("people.faces", "scrolled past the end: \{self.faces-past-end ? "yes" : "no"}; \{root.lists-state()}"); }
+    property <length> people-scroll: plist.content-y;
+    changed people-scroll => { UiLog.trace("people.list", "content-y \{self.people-scroll / 1px} of height \{plist.content-height / 1px} in \{plist.visible-height / 1px}"); }
+    property <length> faces-scroll: list.content-y;
+    changed faces-scroll => { UiLog.trace("people.faces", "content-y \{self.faces-scroll / 1px} of height \{list.content-height / 1px} in \{list.visible-height / 1px}"); }
 
     pure function row-at(y: length) -> int {
         return y < 0 || Math.mod(y / 1px, root.row-height / 1px) < root.gap / 1px ? -1 : Math.floor(y / root.row-height);
@@ -254,6 +280,7 @@ export component PeoplePage inherits Rectangle {
                                 return accept;
                             }
                             if (event.text == Key.Escape) {
+                                UiLog.debug("people.name-box", "Esc: clear the name and the selection");
                                 self.text = "";
                                 root.match-index = -1;
                                 PeopleBridge.name-edited("");
@@ -291,8 +318,8 @@ export component PeoplePage inherits Rectangle {
                     border-color: Theme.border;
                     clip: true;
 
-                    ListView {
-                        for person in PeopleBridge.people: Rectangle {
+                    plist := ListView {
+                        for person[i] in PeopleBridge.people: Rectangle {
                             height: 30px;
                             background: PeopleBridge.selected == person.key ? Theme.accent-soft
                                 : person-ta.has-hover ? Theme.hover : transparent;
@@ -320,7 +347,13 @@ export component PeoplePage inherits Rectangle {
 
                             person-ta := TouchArea {
                                 mouse-cursor: pointer;
+                                changed pressed => {
+                                    if (self.pressed) {
+                                        UiLog.debug("people.list", "press on row \{i} (key \{person.key}, \{person.name})");
+                                    }
+                                }
                                 clicked => {
+                                    UiLog.debug("people.list", "click on row \{i} (key \{person.key}, \{person.name}); \{root.lists-state()}");
                                     name-box.text = "";
                                     PeopleBridge.select(person.key);
                                 }
@@ -418,6 +451,7 @@ export component PeoplePage inherits Rectangle {
                             }
                         }
                         double-clicked => {
+                            UiLog.debug("people.faces", "double-click at \{self.mouse-x / 1px},\{self.mouse-y / 1px}");
                             PeopleBridge.open(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                         }
                         scroll-event(event) => {

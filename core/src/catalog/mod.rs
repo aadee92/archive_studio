@@ -237,6 +237,23 @@ pub struct Catalog {
     canonical_root: PathBuf,
 }
 
+/// Logs a change to the catalog with its outcome (debug; a failure at warn) and passes the
+/// outcome on.
+pub(crate) fn logged<T: std::fmt::Debug>(what: std::fmt::Arguments, result: Result<T>) -> Result<T> {
+    match &result {
+        Ok(value) => log::debug!("{what} -> {value:?}"),
+        Err(e) => log::warn!("{what} failed: {e}"),
+    }
+    result
+}
+
+/// Face ids for the log: the first few, and how many there are.
+pub(crate) fn face_ids(faces: &[faces::FaceId]) -> String {
+    let shown: Vec<String> = faces.iter().take(16).map(|f| f.0.to_string()).collect();
+    let more = if faces.len() > 16 { format!(", … ({} in all)", faces.len()) } else { String::new() };
+    format!("[{}{more}]", shown.join(", "))
+}
+
 impl Catalog {
     /// `<root>/.archive-studio/catalog.sqlite`.
     pub fn default_path(root: &Path) -> PathBuf {
@@ -284,7 +301,14 @@ impl Catalog {
         // Each version's additions, applied in turn from the database's version.
         let version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
+            log::error!("catalog {}: schema {version} is newer than this build ({SCHEMA_VERSION})", root.display());
             return Err(Error::NewerSchema(version));
+        }
+        if version < SCHEMA_VERSION {
+            match version {
+                0 => log::info!("catalog for {}: creating (schema {SCHEMA_VERSION})", root.display()),
+                _ => log::info!("catalog for {}: migrating schema {version} -> {SCHEMA_VERSION}", root.display()),
+            }
         }
         for (added_in, schema) in [(1, SCHEMA), (2, faces::SCHEMA), (3, runs::SCHEMA)] {
             if version < added_in {
@@ -297,8 +321,9 @@ impl Catalog {
             tx.execute_batch(similar::SCHEMA)?;
             // One-time backfills: libraries named people and scanned backs before these
             // were kept in the catalog.
-            people::backfill_person_tags(&tx)?;
-            pairs::pair_all_by_name(&tx)?;
+            let tagged = people::backfill_person_tags(&tx)?;
+            let paired = pairs::pair_all_by_name(&tx)?;
+            log::info!("catalog migration to schema 4: {tagged:?} person tags backfilled, {paired:?} front/back pairs");
         }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -406,6 +431,7 @@ impl Catalog {
     /// Renames a tag and everything under it (`People|Fam` → `People|Family` also renames
     /// `People|Fam|Alice`). Fails, changing nothing, if a new path is already taken.
     pub fn rename_tag(&mut self, tag: TagId, new_path: &str) -> Result<()> {
+        log::debug!("rename_tag {} -> {new_path:?}", tag.0);
         let new_path = normalize_tag(new_path)?;
         let tx = self.conn.transaction()?;
         let old: String = tx.query_row("SELECT path FROM tags WHERE id = ?1", [tag.0], |row| row.get(0))?;
@@ -436,6 +462,7 @@ impl Catalog {
     /// Taking a person tag off also un-names that person's faces on the asset (they go
     /// back to unreviewed), so faces and `People|…` tags never disagree.
     pub fn remove_tag(&mut self, asset: AssetId, tag: TagId) -> Result<()> {
+        log::debug!("remove_tag {} from asset {}", tag.0, asset.0);
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE faces SET person = NULL, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL

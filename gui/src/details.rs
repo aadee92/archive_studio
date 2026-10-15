@@ -80,7 +80,7 @@ thread_local! {
 }
 
 /// What the engine is asked to do with the shown file.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Action {
     Accept,
     Keep,
@@ -112,6 +112,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     details.on_rotate(move |cw| ask(&weak, Action::Rotate(cw.rem_euclid(360) as u16)));
     let weak = ui.as_weak();
     details.on_context_menu(move |side| {
+        log::debug!("details: right-click on side {side}");
         let target = SHOWN.with_borrow(|shown| {
             let target = shown.target.clone()?;
             match side {
@@ -125,6 +126,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     details.on_flip(move || {
+        log::debug!("details: flip to the other side");
         if let Some(ui) = weak.upgrade() {
             flip(&ui);
         }
@@ -139,6 +141,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     details.on_open_similar(move |i| {
+        log::debug!("details: double-click on similar #{i}");
         if let (Some(ui), Some(target)) = (weak.upgrade(), similar_target(i)) {
             nav::open(&ui, target);
         }
@@ -154,6 +157,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 /// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
 /// TODO: zoom, metadata editing.
 pub fn show(ui: &AppWindow, target: Target) {
+    log::debug!("details: show {target:?}");
     let path = target.path.clone();
     let kind = classify(&path);
     let name: SharedString = path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into());
@@ -200,6 +204,7 @@ pub fn show(ui: &AppWindow, target: Target) {
 
 /// Shows nothing (the item shown is gone and there is nowhere to go back to).
 fn clear(ui: &AppWindow) {
+    log::debug!("details: cleared (item gone, nowhere to go back to)");
     SHOWN.with_borrow_mut(|shown| {
         shown.target = None;
         shown.generation += 1;
@@ -279,6 +284,9 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
         }
         (this, shown.other.as_deref() == Some(path), shown.similar.iter().any(|p| p == path))
     });
+    if this || other || similar {
+        log::debug!("details: {} changed (shown {this}, other side {other}, similar {similar})", path.display());
+    }
     if this {
         load(ui);
     } else if other && ui.global::<DetailsBridge>().get_side_by_side() {
@@ -305,6 +313,7 @@ pub fn files_gone(ui: &AppWindow, gone: &[PathBuf]) {
         )
     });
     if this {
+        log::debug!("details: the item shown left the library (page {})", ui.get_page());
         if ui.get_page() == nav::DETAILS && nav::can_go_back(ui) {
             nav::back(ui);
         } else {
@@ -352,17 +361,28 @@ fn load(ui: &AppWindow) {
 
     let root = root();
     let weak = ui.as_weak();
+    log::debug!("details: load #{generation} {}", path.display());
     thread::spawn(move || {
+        let started = std::time::Instant::now();
         let catalog = root.filter(|_| kind == MediaKind::Image).and_then(|root| open_catalog(&root));
         let review = catalog.as_ref().and_then(|c| orient_review(c, &path));
         let faces = catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default();
         let other = if kind == MediaKind::Image { read_other_side(catalog.as_ref(), &path) } else { None };
         drop(catalog);
         let pixels = thumbs::decode(&path, kind, EDGE).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+        log::debug!(
+            "details: load #{generation} read in {:?}: decoded {}, {} faces, review {:?}, other side {:?}",
+            started.elapsed(),
+            pixels.as_ref().map_or_else(|| "nothing".to_owned(), |p| format!("{}x{}", p.width(), p.height())),
+            faces.len(),
+            review,
+            other
+        );
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let Some((info, flash)) = SHOWN.with_borrow_mut(|shown| {
                 (shown.generation == generation).then(|| (shown.info.clone(), if pixels.is_some() { shown.flash.take() } else { None }))
             }) else {
+                log::debug!("details: load #{generation} superseded - dropped");
                 return;
             };
             let details = ui.global::<DetailsBridge>();
@@ -384,6 +404,9 @@ fn load(ui: &AppWindow) {
             // Ignored faces (not a face, a stranger) aren't drawn, unless that's the one asked for.
             let faces: Vec<&FaceInfo> = faces.iter().filter(|f| !f.ignored || Some(f.id) == flash).collect();
             let flash_at = flash.and_then(|id| faces.iter().position(|f| f.id == id));
+            if let Some(id) = flash {
+                log::debug!("details: flash face {} -> box {flash_at:?}", id.0);
+            }
             details.set_faces(ModelRc::new(VecModel::from(faces.iter().map(|f| f.face.clone()).collect::<Vec<_>>())));
             if let Some(i) = flash_at {
                 details.set_flash_face(i as i32);
@@ -449,6 +472,7 @@ fn load_similar(ui: &AppWindow) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         let found = open_catalog(&root).map(|c| similar(&c, &path, &candidates)).unwrap_or_default();
+        log::debug!("details: {} similar among {} in {:?}", found.len(), candidates.len(), scope.label);
         let items: Vec<(PathBuf, f32, Option<Pixels>)> = found
             .into_iter()
             .map(|(path, score)| {
@@ -534,6 +558,7 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
     let Some(path) = SHOWN.with_borrow(|shown| shown.path().map(Path::to_path_buf)) else { return };
     let Some((root, pipeline)) = CONTEXT.with_borrow(|c| c.as_ref().map(|c| (c.root.clone(), c.pipeline.clone()))) else { return };
     let engine = pipeline.engine();
+    log::debug!("details: {action:?} on {} (engine here: {})", path.display(), engine.is_some());
     if engine.is_none() && !matches!(action, Action::Rotate(_)) {
         ui.global::<DetailsBridge>().set_message("The pipeline isn't running in this window".into());
         return;
@@ -549,6 +574,10 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
             (Action::Keep, Some(engine)) => engine.keep(&path),
             (_, None) => Err("The pipeline isn't running in this window".to_owned()),
         };
+        match &result {
+            Ok(()) => log::info!("details: {action:?} {} done", path.display()),
+            Err(e) => log::warn!("details: {action:?} {}: {e}", path.display()),
+        }
         if result.is_ok() {
             // "N rotations to review" (a rotation is reported, a kept file isn't).
             pipeline.recount();
@@ -563,7 +592,6 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
                 // The picture itself is reloaded when the rotated file is reported.
                 Ok(()) => details.set_review_cw(0),
                 Err(e) => {
-                    eprintln!("{}: {e}", path.display());
                     details.set_message(e.into());
                 }
             }

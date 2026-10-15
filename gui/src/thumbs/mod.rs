@@ -200,6 +200,16 @@ impl ThumbCache {
             io: Condvar::new(),
         });
         let disk = db.and_then(DiskCache::open);
+        log::debug!(
+            "thumbnails: {} cpu + {} io threads, disk cache {}",
+            threads.decode.max(1),
+            threads.io.max(1),
+            match (db, &disk) {
+                (Some(path), Some(_)) => path.display().to_string(),
+                (Some(path), None) => format!("{} unusable (off)", path.display()),
+                (None, _) => "off".to_owned(),
+            }
+        );
         let compressed: Compressed = Arc::new(Mutex::new(Lru::new(COMPRESSED_BUDGET)));
         let writer = Arc::new(Writer::spawn(disk.clone(), compressed.clone(), WRITE_QUEUE_CAP));
         let ctx = Ctx { pipeline: pipeline.clone(), writer: writer.clone(), on_ready };
@@ -302,6 +312,7 @@ impl ThumbCache {
         if self.shut_down.replace(true) {
             return;
         }
+        log::debug!("thumbnails: shutting down");
         self.pipeline.sched.lock().unwrap().closed = true;
         self.pipeline.cpu.notify_all();
         self.pipeline.io.notify_all();

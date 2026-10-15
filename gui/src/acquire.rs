@@ -78,6 +78,7 @@ pub fn install(ui: &AppWindow, out_dir: &Path, pipeline: Handle) -> Rc<Acquire> 
     bridge.on_start_all(move || (0..t.tiles.row_count()).for_each(|row| t.start(row)));
     let t = this.clone();
     bridge.on_open_recent(move |row, slot| {
+        log::debug!("acquire: double-click on recent {slot} of device {row}");
         if let (Some(ui), Some(target)) = (t.ui.upgrade(), t.recent_target(row as usize, slot as usize)) {
             nav::open(&ui, target);
         }
@@ -113,6 +114,11 @@ impl Acquire {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut devices = self.devices.borrow_mut();
         *devices = devices::discover(&self.out_dir);
+        log::info!(
+            "devices: {} found [{}]",
+            devices.len(),
+            devices.iter().map(|d| d.name()).collect::<Vec<_>>().join(", ")
+        );
 
         let tiles: Vec<DeviceTile> = devices.iter().map(|d| tile_for(d.as_ref())).collect();
         self.tiles.set_vec(tiles);
@@ -129,6 +135,7 @@ impl Acquire {
         let mut devices = self.devices.borrow_mut();
         for mut device in devices::hotplug(&self.out_dir, &devices) {
             let row = devices.len();
+            log::info!("devices: {} plugged in (row {row})", device.name());
             self.tiles.push(tile_for(device.as_ref()));
             device.start_preview(self.sink_for(row));
             devices.push(device);
@@ -141,8 +148,10 @@ impl Acquire {
             return;
         };
         if tile.state != DeviceState::Previewing {
+            log::debug!("device {row}: start ignored, not previewing");
             return;
         }
+        log::info!("device {row} {}: acquire", device.name());
         // TODO: output layout / naming, e.g. <out>/<date>/<device>/<seq>.tif
         device.start_acquire(&self.out_dir, self.sink_for(row));
         tile.state = DeviceState::Acquiring;
@@ -156,8 +165,10 @@ impl Acquire {
             return;
         };
         if tile.state != DeviceState::Previewing || !tile.alt_enabled {
+            log::debug!("device {row}: alt action ignored (previewing {}, enabled {})", tile.state == DeviceState::Previewing, tile.alt_enabled);
             return;
         }
+        log::info!("device {row} {}: {}", device.name(), tile.alt_action);
         device.start_alt(&self.out_dir, self.sink_for(row));
         tile.state = DeviceState::Acquiring;
         self.tiles.set_row_data(row, tile);
@@ -166,6 +177,7 @@ impl Acquire {
 
     fn stop(&self, row: usize) {
         if let Some(device) = self.devices.borrow_mut().get_mut(row) {
+            log::info!("device {row} {}: stop", device.name());
             device.stop();
         }
         if let Some(mut tile) = self.tiles.row_data(row) {
@@ -205,6 +217,7 @@ impl Acquire {
                     return;
                 }
                 DeviceEvent::Saved { path, thumb, image } => {
+                    log::info!("device {row}: saved {}", path.display());
                     // Seeds the review grid from memory, so it never decodes the file.
                     if let Some(image) = image {
                         let large = thumbs::fit(&image, Tier::Large.edge());
@@ -218,7 +231,19 @@ impl Acquire {
                     Some(thumb) => Update::Recent(buffer(&thumb), path),
                     None => return,
                 },
-                other => Update::Event(other),
+                other => {
+                    match &other {
+                        DeviceEvent::Error(e) => log::warn!("device {row}: error: {e}"),
+                        // Can tick every second (a tape's time code).
+                        DeviceEvent::Status(s) => log::trace!("device {row}: status {s}"),
+                        DeviceEvent::Started => log::info!("device {row}: acquisition started"),
+                        DeviceEvent::Finished => log::info!("device {row}: acquisition finished"),
+                        DeviceEvent::Captured(n) => log::debug!("device {row}: captured {n}"),
+                        DeviceEvent::AltAction(label, enabled) => log::debug!("device {row}: alt action {label:?} enabled {enabled}"),
+                        _ => {}
+                    }
+                    Update::Event(other)
+                }
             };
             let _ = ui.upgrade_in_event_loop(move |ui| deliver(ui, update));
         })

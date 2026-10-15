@@ -342,6 +342,11 @@ impl Catalog {
     /// The user says these faces are `person` (a person tag). Each face's region goes on its
     /// asset as a user tag.
     pub fn confirm_faces(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
+        let result = self.confirm_faces_inner(faces, person);
+        super::logged(format_args!("confirm_faces {} as person {}", super::face_ids(faces), person.0), result)
+    }
+
+    fn confirm_faces_inner(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
         let kind: String = self.conn.query_row("SELECT kind FROM tags WHERE id = ?1", [person.0], |row| row.get(0))?;
         if kind != TagKind::Person.name() {
             return Err(Error::Invalid(format!("tag {} is a {kind}, not a person", person.0)));
@@ -369,6 +374,11 @@ impl Catalog {
     /// dropped and not offered again; the next [`refresh_suggestions`](Self::refresh_suggestions)
     /// may offer someone else.
     pub fn reject_suggestions(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.reject_suggestions_inner(faces);
+        super::logged(format_args!("reject_suggestions {}", super::face_ids(faces)), result)
+    }
+
+    fn reject_suggestions_inner(&mut self, faces: &[FaceId]) -> Result<()> {
         let tx = self.conn.transaction()?;
         for &face in faces {
             tx.execute(
@@ -384,11 +394,21 @@ impl Catalog {
 
     /// The user says these faces aren't worth naming (not a face, a stranger in a crowd).
     pub fn ignore_faces(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.ignore_faces_inner(faces);
+        super::logged(format_args!("ignore_faces {}", super::face_ids(faces)), result)
+    }
+
+    fn ignore_faces_inner(&mut self, faces: &[FaceId]) -> Result<()> {
         self.set_unnamed(faces, true)
     }
 
     /// Undoes a confirmation or an ignore: the faces are unreviewed again.
     pub fn unreview_faces(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.unreview_faces_inner(faces);
+        super::logged(format_args!("unreview_faces {}", super::face_ids(faces)), result)
+    }
+
+    fn unreview_faces_inner(&mut self, faces: &[FaceId]) -> Result<()> {
         self.set_unnamed(faces, false)
     }
 

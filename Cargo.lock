@@ -249,6 +249,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "libc",
+ "log",
  "notify",
  "nusb",
  "orientation",
@@ -261,10 +262,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "archive-logging"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "archive-studio-cli"
 version = "0.1.0"
 dependencies = [
  "archive-core",
+ "archive-logging",
+ "log",
  "rustyline",
 ]
 
@@ -273,10 +284,12 @@ name = "archive-studio-gui"
 version = "0.1.0"
 dependencies = [
  "archive-core",
+ "archive-logging",
  "fast_image_resize",
  "image",
  "jpeg-decoder",
  "libc",
+ "log",
  "png",
  "rusqlite",
  "slint",

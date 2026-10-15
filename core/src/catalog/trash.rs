@@ -58,6 +58,11 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 impl Catalog {
     /// Moves `asset` to the trash, and its back if it is a front. Returns what was trashed.
     pub fn trash(&mut self, asset: AssetId) -> Result<Vec<Trashed>> {
+        let result = self.trash_inner(asset);
+        super::logged(format_args!("trash asset {}", asset.0), result)
+    }
+
+    fn trash_inner(&mut self, asset: AssetId) -> Result<Vec<Trashed>> {
         let mut assets = vec![asset];
         assets.extend(self.back_of(asset)?);
         let at = now();
@@ -105,6 +110,11 @@ impl Catalog {
     /// Puts a trashed asset back where it was, with its back if that is in the trash too.
     /// Fails if something else now occupies its old path. Returns the restored paths.
     pub fn restore(&mut self, asset: AssetId) -> Result<Vec<PathBuf>> {
+        let result = self.restore_inner(asset);
+        super::logged(format_args!("restore asset {}", asset.0), result)
+    }
+
+    fn restore_inner(&mut self, asset: AssetId) -> Result<Vec<PathBuf>> {
         let mut assets = vec![asset];
         assets.extend(self.back_of(asset)?);
         let mut restored = Vec::new();
@@ -137,6 +147,11 @@ impl Catalog {
     /// Deletes for good what was trashed at least `older_than` ago (everything with
     /// `Duration::ZERO`): files, sidecars and catalog data. Returns how many assets.
     pub fn empty_trash(&mut self, older_than: Duration) -> Result<usize> {
+        let result = self.empty_trash_inner(older_than);
+        super::logged(format_args!("empty_trash older than {older_than:?}"), result)
+    }
+
+    fn empty_trash_inner(&mut self, older_than: Duration) -> Result<usize> {
         let cutoff = now() - older_than.as_secs() as i64;
         let trash_root = self.root.join(TRASH_DIR);
         let mut removed = 0;

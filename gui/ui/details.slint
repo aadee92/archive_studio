@@ -1,7 +1,7 @@
 import { Button, CheckBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
-import { NavBridge } from "nav.slint";
+import { NavBridge, UiLog } from "nav.slint";
 import { ItemMenu } from "menu.slint";
 
 // A face found in the shown image: its box as fractions of the (orientation-corrected)
@@ -293,6 +293,7 @@ export component DetailsPage inherits Rectangle {
 
     // Take the keyboard when shown, so Esc reaches us (not a field on a hidden page).
     changed visible => {
+        UiLog.debug("details", "visible = \{self.visible ? "yes" : "no"}");
         if (self.visible) {
             keys.focus();
         }
@@ -309,8 +310,10 @@ export component DetailsPage inherits Rectangle {
     }
 
     keys := FocusScope {
+        changed has-focus => { UiLog.debug("details", "keyboard focus \{self.has-focus ? "taken" : "lost"} (page visible \{root.visible ? "yes" : "no"})"); }
         key-pressed(event) => {
             if (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
+                UiLog.debug("details", "\{event.text == Key.Escape ? "Esc" : "Alt+Left"} → back (page visible \{root.visible ? "yes" : "no"}, has item \{DetailsBridge.has-item ? "yes" : "no"})");
                 NavBridge.back();
                 return accept;
             }
@@ -328,7 +331,10 @@ export component DetailsPage inherits Rectangle {
                     alignment: center;
                     IconButton {
                         icon: @image-url("icons/back.svg");
-                        clicked => { NavBridge.back(); }
+                        clicked => {
+                            UiLog.debug("details", "back arrow clicked");
+                            NavBridge.back();
+                        }
                     }
                 }
                 VerticalLayout {

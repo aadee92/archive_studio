@@ -327,13 +327,19 @@ impl FilterWorker {
     fn spawn(deliver: impl Fn(Filtered) + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel::<(u64, Index, Query)>();
         let _ = thread::Builder::new().name("review-filter".into()).spawn(move || {
+            log::debug!("review filter thread started");
             while let Ok(mut request) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
+                    log::debug!("refilter #{} skipped: #{} queued behind it", request.0, newer.0);
                     request = newer;
                 }
                 let (generation, index, query) = request;
-                deliver(Filtered::compute(&index, &query, generation));
+                let started = Instant::now();
+                let result = Filtered::compute(&index, &query, generation);
+                log::debug!("refilter #{generation} on the filter thread: {} shown in {:?}", result.visible.len(), started.elapsed());
+                deliver(result);
             }
+            log::debug!("review filter thread stopped (channel closed)");
         });
         Self { tx }
     }
@@ -509,22 +515,27 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
         })
     });
     bridge.on_open(|row, col| {
-        with_grid(|g| {
-            if let Some(id) = g.id_at(row, col) {
+        with_grid(|g| match g.id_at(row, col) {
+            Some(id) => {
+                log::debug!("review double-click at row {row} col {col}: entry {id} -> open");
                 g.open(id)
             }
+            None => log::debug!("review double-click at row {row} col {col}: no tile there - ignored"),
         })
     });
     bridge.on_context_menu(|row, col| {
         with_grid(|g| {
             if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.id_at(row, col).and_then(|id| g.target(id))) {
                 nav::context_menu(&ui, target);
+            } else {
+                log::debug!("review right-click at row {row} col {col}: no tile there - no menu");
             }
         })
     });
 
     let debounce = Timer::default();
     bridge.on_filter_changed(move |text, tag, kind, sort| {
+        log::debug!("review filter changed: search {text:?}, tags {tag:?}, kind {kind}, sort {sort}");
         let query = Query::new(text.to_string(), tag.to_string(), kind, Sort::from_index(sort));
         debounce.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
             with_grid(|g| g.set_query(query.clone()))
@@ -550,6 +561,23 @@ pub(crate) struct Snapshot {
     /// rather than pixels, so it holds if the column count changed meanwhile.
     anchor: Option<PathBuf>,
     offset: f32,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, selected {:?}, scroll anchor {:?} +{:.0}px }}",
+            self.search.as_str(),
+            self.tag.as_str(),
+            self.selected_tag.as_str(),
+            self.kind,
+            self.sort,
+            self.selected,
+            self.anchor,
+            self.offset
+        )
+    }
 }
 
 pub(crate) fn snapshot() -> Option<Snapshot> {
@@ -586,9 +614,18 @@ pub fn shutdown() {
 /// that, the pipeline's reports keep the grid current ([`update_files`]).
 /// TODO: build the grid from the catalog instead of rescanning on every launch.
 fn spawn_indexer(root: PathBuf, ui: slint::Weak<AppWindow>) {
-    thread::spawn(move || {
+    let _ = thread::Builder::new().name("review-indexer".into()).spawn(move || {
+        let started = Instant::now();
+        log::debug!("indexer: walking {}", root.display());
+        let mut found = 0;
         walk(root, |batch, done| {
-            let _ = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.append(batch, done)));
+            found += batch.len();
+            if done {
+                log::info!("indexer: {found} media files in {:?}", started.elapsed());
+            }
+            if let Err(e) = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.append(batch, done))) {
+                log::debug!("indexer: batch not delivered: {e}");
+            }
         })
     });
 }
@@ -965,6 +1002,7 @@ impl GridModel {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let query = self.query.borrow().clone();
+        log::debug!("refilter #{generation} of {} entries ({})", self.entries.borrow().len(), if self.entries.borrow().len() < self.sync_limit { "here" } else { "on the filter thread" });
         if self.entries.borrow().len() < self.sync_limit {
             let result = Filtered::compute(&self.entries.borrow(), &query, generation);
             self.apply_filtered(result);
@@ -977,8 +1015,10 @@ impl GridModel {
     /// Shows a refilter result unless a newer one was requested; returns whether it did.
     fn apply_filtered(&self, result: Filtered) -> bool {
         if result.generation != self.generation.get() {
+            log::debug!("refilter #{} result dropped: #{} is newer", result.generation, self.generation.get());
             return false;
         }
+        log::debug!("refilter #{} applied: {} shown (model reset)", result.generation, result.visible.len());
         self.pending.set(false);
         let behind = self.entries.borrow().len() - result.upto;
         *self.visible.borrow_mut() = result.visible;
@@ -1133,6 +1173,7 @@ impl GridModel {
         let bridge = ui.global::<ReviewBridge>();
         let now = (bridge.get_search_text(), bridge.get_tag_text(), bridge.get_kind_filter(), bridge.get_sort_index());
         let refilter = now != (s.search.clone(), s.tag.clone(), s.kind, s.sort);
+        log::debug!("review restore {s:?} (refilter {refilter})");
         bridge.set_search_text(s.search.clone());
         bridge.set_tag_text(s.tag.clone());
         bridge.set_selected_tag(s.selected_tag);
@@ -1154,12 +1195,15 @@ impl GridModel {
         }
         let Some((anchor, offset)) = self.restore.take() else { return };
         let Some(slot) = anchor
-            .and_then(|path| self.id_of(&path))
+            .as_ref()
+            .and_then(|path| self.id_of(path))
             .and_then(|id| self.slot_of.borrow().get(id as usize).copied())
             .filter(|&slot| slot != HIDDEN)
         else {
+            log::debug!("review restore: scroll anchor {anchor:?} not shown - scroll left as is");
             return;
         };
+        log::debug!("review restore: scroll to row {} +{offset:.0}px", slot as usize / self.columns.get());
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<ReviewBridge>();
         let serial = bridge.get_restore().serial + 1;

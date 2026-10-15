@@ -70,8 +70,13 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     let weak = ui.as_weak();
     menu.on_action(move |action| {
         let target = with_state(|s| s.target.clone()).flatten();
-        if let (Some(ui), Some(target)) = (weak.upgrade(), target) {
-            act(&ui, &action, target);
+        match (weak.upgrade(), target) {
+            (Some(ui), Some(target)) => {
+                log::debug!("context menu action {action:?} on {target:?}");
+                act(&ui, &action, target);
+            }
+            (_, None) => log::warn!("context menu action {action:?} with no item - ignored"),
+            (None, _) => {}
         }
     });
     let weak = ui.as_weak();
@@ -82,12 +87,14 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     menu.on_tag_submit(move |text| {
+        log::debug!("tag dialog: submit {text:?}");
         if let Some(ui) = weak.upgrade() {
             add_tag(&ui, text.trim());
         }
     });
     let weak = ui.as_weak();
     menu.on_tag_cancel(move || {
+        log::debug!("tag dialog: cancel (closing)");
         if let Some(ui) = weak.upgrade() {
             ui.global::<ItemMenu>().set_tag_open(false);
             with_state(|s| s.tagging = None);
@@ -95,6 +102,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     menu.on_props_close(move || {
+        log::debug!("properties dialog: close");
         if let Some(ui) = weak.upgrade() {
             ui.global::<ItemMenu>().set_props_open(false);
             with_state(|s| s.props_generation += 1);
@@ -102,6 +110,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     menu.on_notice_clicked(move || {
+        log::debug!("notice action clicked (undo)");
         if let Some(ui) = weak.upgrade() {
             undo(&ui);
         }
@@ -122,8 +131,10 @@ pub fn show_menu(ui: &AppWindow, target: Target) {
 /// the file takes to rewrite: call it on a worker.
 pub fn rotate(root: &Path, pipeline: &Handle, path: &Path, cw: u16) -> Result<(), String> {
     if let Some(engine) = pipeline.engine() {
+        log::debug!("rotate {} {cw}° by the engine", path.display());
         return engine.rotate(path, cw);
     }
+    log::debug!("rotate {} {cw}° by the core (no engine here)", path.display());
     let catalog = open(root)?;
     let asset = catalog.asset(path).map_err(|e| e.to_string())?;
     ops::rotate(&catalog, asset, cw)?;
@@ -150,7 +161,7 @@ fn act(ui: &AppWindow, action: &str, target: Target) {
         "delete" => delete(ui, target.path),
         "tag" => open_tag_dialog(ui, target.path),
         "properties" => properties(ui, target.path),
-        other => eprintln!("context menu: unknown action {other:?}"),
+        other => log::warn!("context menu: unknown action {other:?}"),
     }
 }
 
@@ -160,11 +171,12 @@ fn rotate_item(ui: &AppWindow, path: PathBuf, cw: u16) {
     thread::spawn(move || {
         let result = rotate(&root, &pipeline, &path, cw);
         if result.is_ok() {
+            log::info!("rotated {} {cw}°", path.display());
             pipeline.recount();
         }
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if let Err(e) = result {
-                eprintln!("{}: {e}", path.display());
+                log::warn!("rotate {}: {e}", path.display());
                 notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, None);
             }
         });
@@ -185,6 +197,10 @@ fn delete(ui: &AppWindow, path: PathBuf) {
             Ok((asset, trashed.len()))
         });
         pipeline.recount();
+        match &result {
+            Ok((asset, n)) => log::info!("deleted {} (asset {}, {n} files to the trash)", path.display(), asset.0),
+            Err(e) => log::warn!("delete {}: {e}", path.display()),
+        }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
             Ok((asset, n)) => {
                 let what = if n > 1 { format!("{} and its back", file_name(&path)) } else { file_name(&path) };
@@ -202,6 +218,10 @@ fn undo(ui: &AppWindow) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         let result = open(&root).and_then(|mut catalog| catalog.restore(asset).map_err(|e| e.to_string()));
+        match &result {
+            Ok(paths) => log::info!("undo: restored asset {} ({paths:?})", asset.0),
+            Err(e) => log::warn!("undo: restore asset {}: {e}", asset.0),
+        }
         if let Ok(paths) = &result {
             for path in paths {
                 pipeline::changed(path, false);
@@ -215,6 +235,7 @@ fn undo(ui: &AppWindow) {
 }
 
 fn notify(ui: &AppWindow, text: String, error: bool, undo: Option<AssetId>) {
+    log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if undo.is_some() { " [Undo]" } else { "" });
     let menu = ui.global::<ItemMenu>();
     menu.set_notice(text.into());
     menu.set_notice_error(error);
@@ -242,6 +263,7 @@ fn hide_notice(ui: &AppWindow) {
 
 fn open_tag_dialog(ui: &AppWindow, path: PathBuf) {
     let Some((root, _)) = context() else { return };
+    log::debug!("tag dialog: open for {}", path.display());
     let menu = ui.global::<ItemMenu>();
     menu.set_tag_for(file_name(&path).into());
     menu.set_tag_matches(ModelRc::default());
@@ -251,7 +273,11 @@ fn open_tag_dialog(ui: &AppWindow, path: PathBuf) {
     with_state(|s| s.tagging = Some(path));
     let weak = ui.as_weak();
     thread::spawn(move || {
-        let tags = open(&root).and_then(|c| c.all_tags().map_err(|e| e.to_string())).unwrap_or_default();
+        let tags = open(&root).and_then(|c| c.all_tags().map_err(|e| e.to_string())).unwrap_or_else(|e| {
+            log::warn!("tag dialog: reading the tags: {e}");
+            Vec::new()
+        });
+        log::debug!("tag dialog: {} known tags", tags.len());
         let _ = weak.upgrade_in_event_loop(move |_| {
             with_state(|s| s.tags = tags);
         });
@@ -285,8 +311,12 @@ fn offer_tags(ui: &AppWindow, text: &str) {
 }
 
 fn add_tag(ui: &AppWindow, text: &str) {
-    let Some((Some(path), (root, _))) = with_state(|s| s.tagging.clone()).zip(context()) else { return };
+    let Some((Some(path), (root, _))) = with_state(|s| s.tagging.clone()).zip(context()) else {
+        log::debug!("add tag {text:?}: no item being tagged - ignored");
+        return;
+    };
     if text.is_empty() {
+        log::debug!("add tag: empty - ignored");
         return;
     }
     let menu = ui.global::<ItemMenu>();
@@ -297,6 +327,10 @@ fn add_tag(ui: &AppWindow, text: &str) {
             let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
             ops::add_tag(&catalog, asset, &text).map_err(|e| e.to_string())
         });
+        match &result {
+            Ok(_) => log::info!("tagged {}: {text:?}", path.display()),
+            Err(e) => log::warn!("tag {} {text:?}: {e}", path.display()),
+        }
         if result.is_ok() {
             pipeline::changed(&path, false);
         }
@@ -323,6 +357,7 @@ fn properties(ui: &AppWindow, path: PathBuf) {
         s.props_generation
     })
     .unwrap_or_default();
+    log::debug!("properties dialog: open #{generation} for {}", path.display());
     let menu = ui.global::<ItemMenu>();
     menu.set_props_title(file_name(&path).into());
     menu.set_props(ModelRc::default());
@@ -338,7 +373,11 @@ fn properties(ui: &AppWindow, path: PathBuf) {
         });
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if with_state(|s| s.props_generation) != Some(generation) {
+                log::debug!("properties #{generation}: dialog closed or reopened meanwhile - dropped");
                 return;
+            }
+            if let Err(e) = &rows {
+                log::warn!("properties: {e}");
             }
             let menu = ui.global::<ItemMenu>();
             menu.set_props_loading(false);

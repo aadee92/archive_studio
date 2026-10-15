@@ -18,6 +18,7 @@ Archive Studio is a headless core with thin front ends.
 |---|---|---|
 | `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag, properties). `exif`: basic EXIF fields |
 | `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces |
+| `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
@@ -25,7 +26,7 @@ Archive Studio is a headless core with thin front ends.
 | `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
 | `utils/*.py`, `utils/*.sh` | | Standalone scripts |
 
-The root `Cargo.toml` is a workspace of `core` and `gui` sharing one `Cargo.lock` and
+The root `Cargo.toml` is a workspace of `core`, `gui`, `cli` and `logging` sharing one `Cargo.lock` and
 `target/`. `utils/` is excluded: each crate there builds on its own with its own lockfile and
 is used by core as a path dependency.
 
@@ -98,3 +99,21 @@ the per-file stages are quiet, identify (suggestions and clusters) and XMP sidec
 - **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
   computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
   candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).
+
+## Logging
+
+Every crate logs through the `log` facade; `core` depends on nothing more (no logger).
+The front ends install `archive_logging` at startup:
+
+- **stderr**, filtered by `ARCHIVE_STUDIO_LOG` in `RUST_LOG` syntax (`debug`,
+  `info,archive_studio=trace,archive_core=debug`); default `info` for the GUI, `warn` for the
+  shell (which prints the engine's reports itself).
+- **A file in the library**: `<library>/.archive-studio/logs/archive-studio.log` (GUI) or
+  `archive.log` (shell), rotated on every start and at 16 MB, the last 5 kept
+  (`….log.1` is the previous run). It gets everything stderr gets plus, whatever the
+  variable says, `debug` for the front end's own modules, `archive_core::ops` and
+  `archive_core::catalog` (user actions and catalog changes), and panics with backtraces.
+  Lines: `2026-10-15 14:03:12.345 DEBUG [thread] module::path: message`, local time.
+- Levels in core: info for catch-up / identify summaries and idle, warn for stage failures
+  and engine warnings, debug for per-file stage results (`archive_core::pipeline`), catalog
+  changes with their arguments and outcomes, and schema migrations (info).

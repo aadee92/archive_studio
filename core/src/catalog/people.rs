@@ -81,6 +81,11 @@ impl Catalog {
     /// Names `faces` as the person `name` means ([`person`](Self::person)), tagging their
     /// assets. Returns the person.
     pub fn name_faces(&mut self, faces: &[FaceId], name: &str) -> Result<TagId> {
+        let result = self.name_faces_inner(faces, name);
+        super::logged(format_args!("name_faces {} as {name:?}", super::face_ids(faces)), result)
+    }
+
+    fn name_faces_inner(&mut self, faces: &[FaceId], name: &str) -> Result<TagId> {
         let person = self.person(name)?;
         self.confirm_faces(faces, person)?;
         Ok(person)
@@ -90,6 +95,11 @@ impl Catalog {
     /// `People|Family|Al` → `People|Family|Alice`) or a full path. If that person already
     /// exists, the two are [merged](Self::merge_people) into it. Returns the person now.
     pub fn rename_person(&mut self, person: TagId, new_name: &str) -> Result<TagId> {
+        let result = self.rename_person_inner(person, new_name);
+        super::logged(format_args!("rename_person {} to {new_name:?}", person.0), result)
+    }
+
+    fn rename_person_inner(&mut self, person: TagId, new_name: &str) -> Result<TagId> {
         let old = self.person_tag_path(person)?;
         let new_path = if new_name.contains('|') {
             person_path(new_name)?
@@ -115,6 +125,11 @@ impl Catalog {
     /// `from` and `into` are the same person: `from`'s faces, suggestions, rejections and
     /// tags move to `into`, and `from` is deleted. `from` must have no people under it.
     pub fn merge_people(&mut self, from: TagId, into: TagId) -> Result<()> {
+        let result = self.merge_people_inner(from, into);
+        super::logged(format_args!("merge_people {} into {}", from.0, into.0), result)
+    }
+
+    fn merge_people_inner(&mut self, from: TagId, into: TagId) -> Result<()> {
         if from == into {
             return Ok(());
         }
@@ -145,6 +160,11 @@ impl Catalog {
     /// Deletes a person: their faces go back to unreviewed, suggestions of them are
     /// dropped, and their tag comes off every asset. The person must have no people under it.
     pub fn delete_person(&mut self, person: TagId) -> Result<()> {
+        let result = self.delete_person_inner(person);
+        super::logged(format_args!("delete_person {}", person.0), result)
+    }
+
+    fn delete_person_inner(&mut self, person: TagId) -> Result<()> {
         self.childless_person(person)?;
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -162,6 +182,11 @@ impl Catalog {
     /// rejected by hand, or the catalog predates person tags). Returns how many were added.
     /// Runs once on its own when an older catalog is upgraded.
     pub fn sync_person_tags(&mut self) -> Result<usize> {
+        let result = self.sync_person_tags_inner();
+        super::logged(format_args!("sync_person_tags"), result)
+    }
+
+    fn sync_person_tags_inner(&mut self) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let n = backfill_person_tags(&tx)?;
         tx.commit()?;

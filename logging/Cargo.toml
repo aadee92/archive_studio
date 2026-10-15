@@ -1,0 +1,12 @@
+[package]
+name = "archive-logging"
+version = "0.1.0"
+edition = "2021"
+description = "Archive Studio's logger: stderr + a rotating file in the library, set up by the front ends"
+
+[lib]
+name = "archive_logging"
+
+[dependencies]
+libc = "0.2"
+log = { version = "0.4", features = ["std"] }

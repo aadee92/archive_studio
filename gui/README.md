@@ -8,6 +8,48 @@ ARCHIVE_STUDIO_MOCK=ff680,ff680,ff680,ff680 cargo run   # 4 simulated FF-680s �
 ARCHIVE_STUDIO_MOCK=ff680,vhs,reel,hi8 cargo run        # mixed scanners + video
 ```
 
+## Logs
+
+Each run writes `<library>/.archive-studio/logs/archive-studio.log` (the previous four runs
+are `archive-studio.log.1` … `.4`; a file is also rotated at 16 MB). It always has this app's
+`debug` lines, whatever stderr shows, so after something odd happened, look there first
+(`.1` if the app was restarted since). The first lines give the version and commit, the
+library, the log file and the Slint version / display.
+
+```sh
+ARCHIVE_STUDIO_LOG=debug cargo run --release -- DIR       # stderr too (default: info)
+ARCHIVE_STUDIO_LOG=info,archive_studio=trace cargo run -- DIR   # + scroll positions, keys typed
+ARCHIVE_STUDIO_LOG=info,archive_core::pipeline=debug cargo run -- DIR  # per-file stage results
+ARCHIVE_STUDIO_PAGE=2 cargo run -- DIR                     # start on People (1 Review)
+tail -f DIR/.archive-studio/logs/archive-studio.log
+```
+
+What is in it (targets `archive_studio::<module>`):
+
+- `nav`: every open / go / back with the page, the history depth and the snapshot pushed or
+  restored (Review: filters, selection, scroll anchor; People: person, faces selected, scroll
+  anchor; Details: the item and its scope).
+- `people`: page shown, each load (which person, why, generation), its result (people, faces,
+  time) or why it was dropped, model resets, Back restores (requested vs. applied), clicks on
+  the list and the grid (row → person / face, or why it was ignored), naming / ignoring
+  (change number, face ids) and the writer thread's results, suggestion refreshes.
+- `ui`: what Slint does without telling Rust otherwise (`UiLog` in `ui/nav.slint`): the page
+  shown, the People lists' row counts and scroll state (content-y vs. content and visible
+  height, and when a list is scrolled past its end), the loading flag, presses and clicks on
+  people, keys (Esc, Enter, Tab, shortcuts; which handler took Esc, and keys nobody handled),
+  the Details page's keyboard focus, the context menu shown, the tag / properties dialogs and
+  the notice appearing and going.
+- `review`, `details`, `actions`, `acquire`, `pipeline`, `thumbs`: filter changes and
+  refilters, double-click opens, context-menu actions and their results, device events,
+  worker threads starting and stopping, failures.
+- `archive_core::…`: catalog changes (naming, renaming, merging, tagging, trash / restore)
+  with their arguments and outcomes, pipeline summaries and failures.
+- `stderr`: whatever libraries print to stderr themselves (fd 2 is captured, and still shown).
+- `panic`: panics, with the thread and a backtrace.
+
+Thumbnail decodes, preview frames and per-file pipeline updates are trace or not logged, so
+the file stays readable.
+
 Launcher icon (GNOME and other freedesktop desktops; the window matches it via the
 `archive-studio` app id):
 

@@ -112,9 +112,11 @@ impl Writer {
                 state.written += batch.len() as u64;
             }
             state.finished = true;
+            log::debug!("thumbnail writer stopped: {} written, {} dropped", state.written, state.dropped);
             worker.idle.notify_all();
         });
-        if spawned.is_err() {
+        if let Err(e) = &spawned {
+            log::warn!("thumbnail writer: can't start a thread ({e}); thumbnails won't be cached on disk");
             shared.state.lock().unwrap().closed = true;
         }
         Self { shared, cap }

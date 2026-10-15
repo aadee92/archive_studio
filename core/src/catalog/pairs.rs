@@ -124,6 +124,11 @@ impl Catalog {
 
     /// The user pairs `back` with `front`, replacing any pairing either had.
     pub fn set_pair(&mut self, front: AssetId, back: AssetId) -> Result<()> {
+        let result = self.set_pair_inner(front, back);
+        super::logged(format_args!("set_pair front {} back {}", front.0, back.0), result)
+    }
+
+    fn set_pair_inner(&mut self, front: AssetId, back: AssetId) -> Result<()> {
         if front == back {
             return Err(super::Error::Invalid("a photo can't be its own back".into()));
         }

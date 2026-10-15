@@ -5,6 +5,7 @@
 
 import { Button, LineEdit, ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { UiLog } from "nav.slint";
 
 // One line of the Properties dialog; a heading starts a section.
 export struct PropRow {
@@ -63,9 +64,15 @@ export component TagDialog inherits Rectangle {
     background: #0000002a;
     // The backdrop: clicking it cancels; it keeps clicks off the page below.
     TouchArea {
-        clicked => { ItemMenu.tag-cancel(); }
+        clicked => {
+            UiLog.debug("tag-dialog", "backdrop clicked: cancel");
+            ItemMenu.tag-cancel();
+        }
     }
-    init => { edit.focus(); }
+    init => {
+        UiLog.debug("tag-dialog", "created; focusing the tag box");
+        edit.focus();
+    }
 
     card := Card {
         width: Math.min(420px, root.width - 40px);
@@ -76,6 +83,7 @@ export component TagDialog inherits Rectangle {
         keys := FocusScope {
             key-pressed(event) => {
                 if (event.text == Key.Escape) {
+                    UiLog.debug("tag-dialog", "Esc: cancel");
                     ItemMenu.tag-cancel();
                     return accept;
                 }
@@ -138,9 +146,15 @@ export component TagDialog inherits Rectangle {
 export component PropertiesDialog inherits Rectangle {
     background: #0000002a;
     TouchArea {
-        clicked => { ItemMenu.props-close(); }
+        clicked => {
+            UiLog.debug("properties-dialog", "backdrop clicked: close");
+            ItemMenu.props-close();
+        }
     }
-    init => { keys.focus(); }
+    init => {
+        UiLog.debug("properties-dialog", "created; focusing it");
+        keys.focus();
+    }
 
     Card {
         width: Math.min(640px, root.width - 40px);
@@ -151,6 +165,7 @@ export component PropertiesDialog inherits Rectangle {
         keys := FocusScope {
             key-pressed(event) => {
                 if (event.text == Key.Escape) {
+                    UiLog.debug("properties-dialog", "Esc: close");
                     ItemMenu.props-close();
                     return accept;
                 }

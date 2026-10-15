@@ -30,7 +30,12 @@ use crate::pipeline::{self, ORIENT};
 /// losslessly; see [`pipeline::rotate_file`].
 pub fn rotate(catalog: &Catalog, asset: AssetId, cw: u16) -> Result<(), String> {
     let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
-    pipeline::rotate_file(catalog, &path, cw)
+    let result = pipeline::rotate_file(catalog, &path, cw);
+    match &result {
+        Ok(()) => log::debug!("rotate asset {} ({}) {cw}°: done", asset.0, path.display()),
+        Err(e) => log::warn!("rotate asset {} ({}) {cw}°: {e}", asset.0, path.display()),
+    }
+    result
 }
 
 /// Moves the asset (and its back, if it is a front) to the library's trash; see
@@ -54,7 +59,17 @@ pub fn parse_tag(text: &str) -> (TagKind, String) {
 /// The user puts the tag they typed on the asset (see [`parse_tag`]); a person is found as
 /// [`Catalog::person`] finds one. Returns the tag.
 pub fn add_tag(catalog: &Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<TagId> {
-    match parse_tag(text) {
+    let parsed = parse_tag(text);
+    let result = add_parsed_tag(catalog, asset, parsed.clone());
+    match &result {
+        Ok(tag) => log::debug!("add_tag {text:?} ({:?} {:?}) to asset {}: tag {}", parsed.0, parsed.1, asset.0, tag.0),
+        Err(e) => log::warn!("add_tag {text:?} to asset {}: {e}", asset.0),
+    }
+    result
+}
+
+fn add_parsed_tag(catalog: &Catalog, asset: AssetId, parsed: (TagKind, String)) -> crate::catalog::Result<TagId> {
+    match parsed {
         (TagKind::Person, path) => {
             let person = catalog.person(&path)?;
             catalog.add_tag(asset, person, None)?;
