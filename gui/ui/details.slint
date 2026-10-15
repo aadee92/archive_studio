@@ -1,6 +1,17 @@
-import { Button } from "std-widgets.slint";
+import { Button, CheckBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
+import { NavBridge } from "nav.slint";
+
+// A face found in the shown image: its box as fractions of the (orientation-corrected)
+// image, and who it is, if someone said so.
+export struct DetailFace {
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    name: string,
+}
 
 export global DetailsBridge {
     in property <bool> has-item;
@@ -19,117 +30,298 @@ export global DetailsBridge {
     // Why the last request failed.
     in property <string> message;
 
+    // Faces in the image, drawn over it; the toggles in the bottom bar (kept across items).
+    in property <[DetailFace]> faces;
+    in-out property <bool> show-boxes: true;
+    in-out property <bool> show-names: true;
+    // The face (index in `faces`) to flash when `flash-serial` changes: the one double-clicked
+    // in People. It flashes even with the boxes turned off.
+    in property <int> flash-face: -1;
+    in property <int> flash-serial;
+
+    // Hooks for later features, filled by Rust but not shown yet:
+    // the view the item was opened from ("similar in your filter" strip; the items
+    // themselves are `details::scope()` on the Rust side) ...
+    in property <string> scope-label;
+    in property <int> scope-count;
+    // ... and the other side of a two-sided photo (`photo-NNNN-front` / `-back`), "" if none,
+    // for a flip button and a side-by-side view.
+    in property <string> other-side;
+
     callback open-external();
     callback accept();
     callback keep();
     callback rotate(int);   // degrees clockwise
+    // Right-click on the picture. Hook for the item context menu (not implemented yet).
+    callback context-menu();
 }
 
-// One item, enlarged. Filled by double-clicking a tile in Review.
+// A face's box over the picture, with the person's name under it.
+component FaceBox inherits Rectangle {
+    in property <string> name;
+    in property <bool> show-box;
+    in property <bool> show-name;
+    // Flashing: drawn regardless of the toggles; `lit` is the bright half of a pulse.
+    in property <bool> flashing;
+    in property <bool> lit;
+    // Room under the box before the picture's bottom edge; the label goes above if short.
+    in property <length> room-below;
+
+    property <bool> box-on: root.show-box || root.flashing;
+
+    // Dark outline, then the light (or highlighted) box inside it, legible on any picture.
+    Rectangle {
+        visible: root.box-on;
+        border-radius: 3px;
+        border-width: root.lit ? 4px : 3px;
+        border-color: #00000080;
+        background: root.lit ? #facc1540 : transparent;
+        animate background, border-width { duration: 120ms; }
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
+            border-radius: 2px;
+            border-width: root.lit ? 3px : 1.5px;
+            border-color: root.lit ? #facc15 : root.flashing ? #fde68a : #ffffffe0;
+            animate border-color, border-width { duration: 120ms; }
+        }
+    }
+
+    if root.name != "" && (root.show-name || root.flashing): Rectangle {
+        property <length> above: -self.height - 3px;
+        width: Math.max(label.preferred-width + 10px, 24px);
+        height: 18px;
+        x: (root.width - self.width) / 2;
+        y: root.room-below < self.height + 3px ? above : root.height + 3px;
+        border-radius: 4px;
+        background: root.lit ? #facc15 : #1f2328c8;
+        label := Text {
+            text: root.name;
+            font-size: 11px;
+            font-weight: 600;
+            color: root.lit ? #1f2328 : #ffffff;
+        }
+    }
+}
+
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    callback clicked;
+
+    width: 32px;
+    height: 32px;
+    border-radius: Theme.radius;
+    background: ta.pressed ? Theme.accent-soft : ta.has-hover ? Theme.hover : transparent;
+    Image {
+        source: root.icon;
+        width: 20px;
+        height: 20px;
+        colorize: ta.has-hover ? Theme.accent : Theme.text;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// One item, enlarged. Opened by double-clicking an item in Review, a face in People or a
+// recent capture in Acquire; the back arrow (or Esc) returns to that view as it was.
 export component DetailsPage inherits Rectangle {
     background: Theme.bg;
 
-    VerticalLayout {
-        padding: 20px;
-        padding-bottom: 0px;
-        spacing: 14px;
+    // Take the keyboard when shown, so Esc reaches us (not a field on a hidden page).
+    changed visible => {
+        if (self.visible) {
+            keys.focus();
+        }
+    }
 
-        HorizontalLayout {
-            spacing: 12px;
-            VerticalLayout {
-                horizontal-stretch: 1;
-                Text {
-                    text: DetailsBridge.has-item ? DetailsBridge.name : "Details";
-                    font-size: 20px;
-                    font-weight: 600;
-                    color: Theme.text;
-                    overflow: elide;
-                }
-                Text { text: DetailsBridge.path; color: Theme.text-muted; overflow: elide; }
+    // Flash: 6 half-pulses of 250 ms (3 pulses in 1.5 s) whenever Rust bumps the serial.
+    property <int> flash-serial: DetailsBridge.flash-serial;
+    property <int> flash-step: 0;
+    changed flash-serial => { self.flash-step = 6; }
+    Timer {
+        interval: 250ms;
+        running: root.flash-step > 0;
+        triggered => { root.flash-step -= 1; }
+    }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
+                NavBridge.back();
+                return accept;
             }
-            if DetailsBridge.has-item: HorizontalLayout {
-                alignment: center;
-                spacing: 8px;
-                // Rotating rewrites the file, which the pipeline in this window does.
-                if DetailsBridge.is-image && PipelineBridge.running: Button {
-                    text: "Rotate left";
-                    enabled: !DetailsBridge.working;
-                    clicked => { DetailsBridge.rotate(270); }
-                }
-                if DetailsBridge.is-image && PipelineBridge.running: Button {
-                    text: "Rotate right";
-                    enabled: !DetailsBridge.working;
-                    clicked => { DetailsBridge.rotate(90); }
-                }
-                Button {
-                    text: "Open externally";
-                    clicked => { DetailsBridge.open-external(); }
-                }
-            }
+            reject
         }
 
-        Rectangle {
-            vertical-stretch: 1;
-            background: Theme.surface;
-            border-radius: Theme.radius;
-            border-width: 1px;
-            border-color: Theme.border;
-            clip: true;
+        VerticalLayout {
+            padding: 20px;
+            padding-bottom: 0px;
+            spacing: 14px;
 
-            if DetailsBridge.image-ready: Image {
-                x: 12px;
-                y: 12px;
-                width: parent.width - 24px;
-                height: parent.height - 24px;
-                source: DetailsBridge.image;
-                image-fit: contain;
+            HorizontalLayout {
+                spacing: 12px;
+                if NavBridge.can-go-back: VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: @image-url("icons/back.svg");
+                        clicked => { NavBridge.back(); }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    Text {
+                        text: DetailsBridge.has-item ? DetailsBridge.name : "Details";
+                        font-size: 20px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        overflow: elide;
+                    }
+                    Text { text: DetailsBridge.path; color: Theme.text-muted; overflow: elide; }
+                }
+                // Hook: a front / back flip button goes here when `DetailsBridge.other-side`
+                // is set, and a side-by-side toggle next to it.
+                if DetailsBridge.has-item: HorizontalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    // Rotating rewrites the file, which the pipeline in this window does.
+                    if DetailsBridge.is-image && PipelineBridge.running: Button {
+                        text: "Rotate left";
+                        enabled: !DetailsBridge.working;
+                        clicked => { DetailsBridge.rotate(270); }
+                    }
+                    if DetailsBridge.is-image && PipelineBridge.running: Button {
+                        text: "Rotate right";
+                        enabled: !DetailsBridge.working;
+                        clicked => { DetailsBridge.rotate(90); }
+                    }
+                    Button {
+                        text: "Open externally";
+                        clicked => { DetailsBridge.open-external(); }
+                    }
+                }
             }
-            if !DetailsBridge.image-ready: Text {
-                text: !DetailsBridge.has-item ? "Double-click an item in Review to see it here"
-                    : DetailsBridge.loading ? "Loading…" : "No preview for this file";
-                color: Theme.text-muted;
-            }
-        }
 
-        HorizontalLayout {
-            height: 34px;
-            spacing: 8px;
-            Text {
-                vertical-alignment: center;
-                text: DetailsBridge.info;
-                color: Theme.text-muted;
-                font-size: 12px;
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.surface;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+
+                if DetailsBridge.image-ready: Rectangle {
+                    x: 12px;
+                    y: 12px;
+                    width: parent.width - 24px;
+                    height: parent.height - 24px;
+
+                    // Where `image-fit: contain` puts the picture: scaled to fit, centered.
+                    // Face boxes are placed in these coordinates, so they follow resizes.
+                    property <float> aspect: DetailsBridge.image.width / Math.max(1, DetailsBridge.image.height);
+                    property <length> shown-width: Math.min(self.width, self.height * self.aspect);
+                    property <length> shown-height: self.shown-width / self.aspect;
+                    property <length> shown-x: (self.width - self.shown-width) / 2;
+                    property <length> shown-y: (self.height - self.shown-height) / 2;
+
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: DetailsBridge.image;
+                        image-fit: contain;
+                    }
+                    for face[i] in DetailsBridge.faces: FaceBox {
+                        x: parent.shown-x + face.x * parent.shown-width;
+                        y: parent.shown-y + face.y * parent.shown-height;
+                        width: face.w * parent.shown-width;
+                        height: face.h * parent.shown-height;
+                        room-below: parent.shown-y + parent.shown-height - self.y - self.height;
+                        name: face.name;
+                        show-box: DetailsBridge.show-boxes;
+                        show-name: DetailsBridge.show-names;
+                        flashing: i == DetailsBridge.flash-face && root.flash-step > 0;
+                        lit: i == DetailsBridge.flash-face && Math.mod(root.flash-step, 2) == 0 && root.flash-step > 0;
+                    }
+                    TouchArea {
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down) {
+                                keys.focus();
+                            }
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                DetailsBridge.context-menu();
+                            }
+                        }
+                    }
+                }
+                if !DetailsBridge.image-ready: Text {
+                    text: !DetailsBridge.has-item ? "Double-click an item in Review, People or Acquire to see it here"
+                        : DetailsBridge.loading ? "Loading…" : "No preview for this file";
+                    color: Theme.text-muted;
+                }
             }
-            Text {
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-                // The request in flight, else why the last one failed, else orient's detail.
-                text: DetailsBridge.working ? "Working…"
-                    : DetailsBridge.message != "" ? DetailsBridge.message
-                    : DetailsBridge.review-cw != 0 ? DetailsBridge.review-detail : "";
-                color: !DetailsBridge.working && DetailsBridge.message != "" ? Theme.danger : Theme.text-muted;
-                font-size: 12px;
-                overflow: elide;
-            }
-            // The orient stage wasn't sure enough to turn the file itself.
-            if DetailsBridge.review-cw != 0: HorizontalLayout {
+
+            // Hook: the "similar in your filter" strip goes here, above the bottom bar
+            // (`DetailsBridge.scope-label` / `scope-count`; the items are `details::scope()`).
+
+            HorizontalLayout {
+                height: 34px;
                 spacing: 8px;
                 Text {
                     vertical-alignment: center;
-                    text: "Rotate \{DetailsBridge.review-cw}°?";
-                    color: Theme.text;
+                    text: DetailsBridge.info;
+                    color: Theme.text-muted;
                     font-size: 12px;
                 }
-                if PipelineBridge.running: Button {
-                    text: "Accept";
-                    primary: true;
-                    enabled: !DetailsBridge.working;
-                    clicked => { DetailsBridge.accept(); }
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    // The request in flight, else why the last one failed, else orient's detail.
+                    text: DetailsBridge.working ? "Working…"
+                        : DetailsBridge.message != "" ? DetailsBridge.message
+                        : DetailsBridge.review-cw != 0 ? DetailsBridge.review-detail : "";
+                    color: !DetailsBridge.working && DetailsBridge.message != "" ? Theme.danger : Theme.text-muted;
+                    font-size: 12px;
+                    overflow: elide;
                 }
-                if PipelineBridge.running: Button {
-                    text: "Keep";
-                    enabled: !DetailsBridge.working;
-                    clicked => { DetailsBridge.keep(); }
+                // The orient stage wasn't sure enough to turn the file itself.
+                if DetailsBridge.review-cw != 0: HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        vertical-alignment: center;
+                        text: "Rotate \{DetailsBridge.review-cw}°?";
+                        color: Theme.text;
+                        font-size: 12px;
+                    }
+                    if PipelineBridge.running: Button {
+                        text: "Accept";
+                        primary: true;
+                        enabled: !DetailsBridge.working;
+                        clicked => { DetailsBridge.accept(); }
+                    }
+                    if PipelineBridge.running: Button {
+                        text: "Keep";
+                        enabled: !DetailsBridge.working;
+                        clicked => { DetailsBridge.keep(); }
+                    }
+                }
+                if DetailsBridge.faces.length > 0: Text {
+                    vertical-alignment: center;
+                    text: DetailsBridge.faces.length == 1 ? "1 face" : "\{DetailsBridge.faces.length} faces";
+                    color: Theme.text-muted;
+                    font-size: 12px;
+                }
+                if DetailsBridge.is-image: CheckBox {
+                    text: "Face boxes";
+                    enabled: DetailsBridge.faces.length > 0;
+                    checked <=> DetailsBridge.show-boxes;
+                }
+                if DetailsBridge.is-image: CheckBox {
+                    text: "Names";
+                    enabled: DetailsBridge.faces.length > 0;
+                    checked <=> DetailsBridge.show-names;
                 }
             }
         }

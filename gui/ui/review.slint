@@ -2,6 +2,7 @@ import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineStatus } from "pipeline.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
+import { ScrollRestore } from "nav.slint";
 
 export global ReviewBridge {
     // Virtual model: rows are produced on demand by Rust, only for what is on screen.
@@ -13,13 +14,30 @@ export global ReviewBridge {
     in property <[string]> available-tags;
     in-out property <length> tile-size: 160px;
 
+    // The filter controls' state, kept here so the view can be snapshotted and restored (Back).
+    in-out property <string> search-text;
+    in-out property <string> tag-text;
+    in-out property <string> selected-tag;
+    in-out property <int> kind-filter: 0;
+    in-out property <int> sort-index: 0;
+    // Scroll position, reported by the page: the first row (partly) in view and how far it
+    // is scrolled past.
+    in-out property <int> scroll-row;
+    in-out property <length> scroll-offset;
+    // Set by Rust to scroll somewhere (Back).
+    in property <ScrollRestore> restore;
+
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
     callback viewport-changed(int, int);
     // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
     callback filter-changed(string, string, int, int);
-    callback select(int);
-    callback open(int);
+    // Pointer input on the grid, by (row, column); -1 for neither when it missed every tile.
+    callback click(int, int);
+    // Double-click: opens the tile on the Details page.
+    callback open(int, int);
+    // Right-click. Hook for the item context menu (not implemented yet).
+    callback context-menu(int, int);
 }
 
 component Chip inherits Rectangle {
@@ -48,6 +66,7 @@ component Chip inherits Rectangle {
 component MediaCell inherits Rectangle {
     in property <MediaTile> tile;
     in property <length> size;
+    in property <bool> hover;
 
     width: size;
 
@@ -91,7 +110,7 @@ component MediaCell inherits Rectangle {
         width: root.size;
         height: root.size;
         border-radius: 6px;
-        border-width: root.tile.selected ? 2px : ta.has-hover ? 1px : 0px;
+        border-width: root.tile.selected ? 2px : root.hover ? 1px : 0px;
         border-color: root.tile.selected ? Theme.accent : Theme.border;
     }
 
@@ -113,19 +132,19 @@ component MediaCell inherits Rectangle {
         color: Theme.text-muted;
         overflow: elide;
     }
-
-    ta := TouchArea {
-        clicked => { ReviewBridge.select(root.tile.index); }
-        double-clicked => { ReviewBridge.open(root.tile.index); }
-    }
 }
 
 export component ReviewPage inherits Rectangle {
-    property <int> kind-filter: 0;
-    property <string> selected-tag: "";
+    property <int> kind-filter <=> ReviewBridge.kind-filter;
+    property <string> selected-tag <=> ReviewBridge.selected-tag;
     property <length> gap: 14px;
     property <length> row-height: ReviewBridge.tile-size + 44px;
-    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (ReviewBridge.tile-size + root.gap)));
+    property <length> pitch: ReviewBridge.tile-size + root.gap;
+    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / root.pitch));
+
+    // Tile under the pointer, for the hover border.
+    property <int> hover-row: -1;
+    property <int> hover-col: -1;
 
     // Tile size also picks the thumbnail resolution tier on the Rust side.
     property <length> tile-size: ReviewBridge.tile-size;
@@ -141,6 +160,39 @@ export component ReviewPage inherits Rectangle {
     property <int> last-row: Math.max(0, Math.floor((-list.content-y + list.visible-height - 1px) / root.row-height));
     changed first-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
     changed last-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
+
+    // Scroll position for snapshots, and scrolling back to one.
+    property <length> scrolled: -list.content-y;
+    changed scrolled => {
+        ReviewBridge.scroll-row = Math.floor(self.scrolled / root.row-height);
+        ReviewBridge.scroll-offset = self.scrolled - ReviewBridge.scroll-row * root.row-height;
+    }
+    property <ScrollRestore> restore: ReviewBridge.restore;
+    changed restore => {
+        list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
+            Math.min(0px, -(self.restore.row * root.row-height + self.restore.offset)));
+    }
+
+    // Grid geometry: the row / column of the tile at a point in content coordinates
+    // (-1: between tiles).
+    pure function row-at(y: length) -> int {
+        return y < 0 || Math.mod(y / 1px, root.row-height / 1px) < root.gap / 1px ? -1 : Math.floor(y / root.row-height);
+    }
+    pure function col-at(x: length) -> int {
+        return x < root.gap || Math.floor((x - root.gap) / root.pitch) >= root.columns
+            || Math.mod((x - root.gap) / 1px, root.pitch / 1px) > ReviewBridge.tile-size / 1px
+            ? -1 : Math.floor((x - root.gap) / root.pitch);
+    }
+
+    function track() {
+        if (overlay.has-hover) {
+            root.hover-row = root.row-at(overlay.mouse-y - list.content-y);
+            root.hover-col = root.col-at(overlay.mouse-x);
+        } else {
+            root.hover-row = -1;
+            root.hover-col = -1;
+        }
+    }
 
     function apply() {
         ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index);
@@ -192,6 +244,7 @@ export component ReviewPage inherits Rectangle {
                         color: Theme.text-muted;
                     }
                     search := LineEdit {
+                        text <=> ReviewBridge.search-text;
                         placeholder-text: "Search name or tags…";
                         edited => { root.apply(); }
                     }
@@ -247,6 +300,7 @@ export component ReviewPage inherits Rectangle {
                     }
 
                     tag-search := LineEdit {
+                        text <=> ReviewBridge.tag-text;
                         placeholder-text: "Filter tags (e.g. tag_a and tag_b)…";
                         edited => {
                             if (self.text != root.selected-tag) {
@@ -334,6 +388,7 @@ export component ReviewPage inherits Rectangle {
                         alignment: center;
                         Text { text: "Sort"; color: Theme.text-muted; vertical-alignment: center; }
                         sort := ComboBox {
+                            current-index <=> ReviewBridge.sort-index;
                             width: 140px;
                             model: ["Name", "Date modified", "Size", "Type"];
                             selected => { root.apply(); }
@@ -350,15 +405,51 @@ export component ReviewPage inherits Rectangle {
                     clip: true;
 
                     list := ListView {
-                        for row in ReviewBridge.rows: Rectangle {
+                        for row[r] in ReviewBridge.rows: Rectangle {
                             height: root.row-height;
                             HorizontalLayout {
                                 padding-left: root.gap;
                                 padding-top: root.gap;
                                 spacing: root.gap;
                                 alignment: start;
-                                for t in row.tiles: MediaCell { tile: t; size: ReviewBridge.tile-size; }
+                                for t[c] in row.tiles: MediaCell {
+                                    tile: t;
+                                    size: ReviewBridge.tile-size;
+                                    hover: r == root.hover-row && c == root.hover-col;
+                                }
                             }
+                        }
+                    }
+
+                    // All pointer input over the tiles (not the scroll bar). It can't live in
+                    // the tiles: a row is re-delivered (a new tiles model) whenever a thumbnail
+                    // arrives or the selection changes, which recreates its cells, and a
+                    // TouchArea recreated between two clicks never sees a double-click.
+                    overlay := TouchArea {
+                        x: list.x;
+                        y: list.y;
+                        width: list.visible-width;
+                        height: list.visible-height;
+
+                        changed mouse-x => { root.track(); }
+                        changed mouse-y => { root.track(); }
+                        changed has-hover => { root.track(); }
+
+                        clicked => {
+                            ReviewBridge.click(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
+                        }
+                        double-clicked => {
+                            ReviewBridge.open(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
+                        }
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                ReviewBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
+                            }
+                        }
+                        scroll-event(event) => {
+                            list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
+                                Math.min(0px, list.content-y + event.delta-y));
+                            accept
                         }
                     }
 

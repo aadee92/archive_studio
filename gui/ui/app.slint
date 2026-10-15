@@ -5,12 +5,14 @@ import { ReviewPage, ReviewBridge } from "review.slint";
 import { PeoplePage, PeopleBridge } from "people.slint";
 import { DetailsPage, DetailsBridge } from "details.slint";
 import { PipelineBridge } from "pipeline.slint";
+import { NavBridge } from "nav.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
-export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge }
+export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
+    // Set by Rust only (`nav.rs`), which keeps the history for Back.
     in-out property <int> page: 0;
 
     title: "Archive Studio";
@@ -25,12 +27,12 @@ export component AppWindow inherits Window {
     HorizontalLayout {
         Sidebar {
             active: root.page;
-            navigate(i) => { root.page = i; }
+            navigate(i) => { NavBridge.navigate(i); }
         }
         Rectangle { width: 1px; background: Theme.border; }
 
-        // Both pages stay alive so device previews keep running and the review
-        // scroll position survives switching tabs.
+        // Every page stays alive so device previews keep running and each grid keeps its
+        // scroll position, filters and selection while another page is shown.
         Rectangle {
             horizontal-stretch: 1;
             AcquirePage { visible: root.page == 0; }

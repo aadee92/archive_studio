@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode, VecModel};
 
 use archive_core::device::{CaptureDevice, DeviceEvent, EventSink, Frame, RECENT};
 use archive_core::devices;
@@ -23,6 +23,7 @@ use archive_core::image::DynamicImage;
 
 use crate::pipeline::Handle;
 use crate::thumbs::{self, Tier};
+use crate::nav::{self, Scope, Target};
 use crate::{AcquireBridge, AppWindow, DeviceState, DeviceTile};
 
 /// How often to look for hardware plugged in after launch (see [`Acquire::hotplug`]).
@@ -33,8 +34,8 @@ type Buffer = SharedPixelBuffer<Rgb8Pixel>;
 /// What reaches the UI thread: a [`DeviceEvent`] with its pictures already converted.
 enum Update {
     Preview(Buffer),
-    /// A thumbnail for the strip of recent captures.
-    Recent(Buffer),
+    /// A thumbnail for the strip of recent captures, and its file.
+    Recent(Buffer, PathBuf),
     Event(DeviceEvent),
 }
 
@@ -75,6 +76,18 @@ pub fn install(ui: &AppWindow, out_dir: &Path, pipeline: Handle) -> Rc<Acquire> 
     bridge.on_stop(move |row| t.stop(row as usize));
     let t = this.clone();
     bridge.on_start_all(move || (0..t.tiles.row_count()).for_each(|row| t.start(row)));
+    let t = this.clone();
+    bridge.on_open_recent(move |row, slot| {
+        if let (Some(ui), Some(target)) = (t.ui.upgrade(), t.recent_target(row as usize, slot as usize)) {
+            nav::open(&ui, target);
+        }
+    });
+    let t = this.clone();
+    bridge.on_context_menu(move |row, slot| {
+        if let (Some(ui), Some(target)) = (t.ui.upgrade(), t.recent_target(row as usize, slot as usize)) {
+            nav::context_menu(&ui, target);
+        }
+    });
 
     this.rescan();
     let weak: Weak<Acquire> = Rc::downgrade(&this);
@@ -87,6 +100,15 @@ pub fn install(ui: &AppWindow, out_dir: &Path, pipeline: Handle) -> Rc<Acquire> 
 }
 
 impl Acquire {
+    /// Recent capture `slot` of device `row`, as an item to open; its scope is the device's
+    /// recent captures, newest first.
+    fn recent_target(&self, row: usize, slot: usize) -> Option<Target> {
+        let tile = self.tiles.row_data(row)?;
+        let paths: Vec<PathBuf> = tile.recent_paths.iter().map(|p| PathBuf::from(p.as_str())).collect();
+        let path = paths.get(slot)?.clone();
+        Some(Target::new(path, Scope::of(format!("Acquire · {}", tile.name), paths, Some(slot))))
+    }
+
     fn rescan(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut devices = self.devices.borrow_mut();
@@ -190,10 +212,10 @@ impl Acquire {
                     }
                     // After seeding, so the grid finds the thumbnail when the file arrives.
                     pipeline.saved(&path);
-                    Update::Recent(buffer(&thumb))
+                    Update::Recent(buffer(&thumb), path)
                 }
                 DeviceEvent::Recent(path) => match thumbs::small_for_file(&path) {
-                    Some(thumb) => Update::Recent(buffer(&thumb)),
+                    Some(thumb) => Update::Recent(buffer(&thumb), path),
                     None => return,
                 },
                 other => Update::Event(other),
@@ -231,10 +253,13 @@ fn apply(ui: &AppWindow, row: usize, update: Update) {
             tile.preview = Image::from_rgb8(frame);
             tile.has_preview = true;
         }
-        Update::Recent(thumb) => {
+        Update::Recent(thumb, path) => {
             let mut recent: Vec<Image> = tile.recent.iter().take(RECENT - 1).collect();
             recent.insert(0, Image::from_rgb8(thumb));
             tile.recent = ModelRc::new(VecModel::from(recent));
+            let mut paths: Vec<SharedString> = tile.recent_paths.iter().take(RECENT - 1).collect();
+            paths.insert(0, path.display().to_string().into());
+            tile.recent_paths = ModelRc::new(VecModel::from(paths));
         }
         Update::Event(event) => match event {
             DeviceEvent::Status(text) => tile.detail = text.into(),

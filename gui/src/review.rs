@@ -37,7 +37,8 @@ use archive_core::catalog::query::{self, Expr};
 use archive_core::catalog::{Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
-use crate::{details, AppWindow, MediaRow, MediaTile, ReviewBridge};
+use crate::nav::{self, Scope, Target};
+use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge, ScrollRestore};
 
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Entry {
@@ -452,6 +453,9 @@ struct GridModel {
     thumbs: ThumbCache,
     ready: Arc<Mailbox<Ready>>,
     available_tags: RefCell<BTreeSet<String>>,
+    /// A scroll position to return to (Back) once the refilter in flight lands: the first
+    /// tile that was in view, and how far its row was scrolled past.
+    restore: RefCell<Option<(Option<PathBuf>, f32)>>,
     /// Tests: a drain left work for the next event-loop turn.
     #[cfg(test)]
     redrain_due: Cell<bool>,
@@ -497,8 +501,27 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     bridge.set_root_path(root.display().to_string().into());
     bridge.on_columns_changed(|n| with_grid(|g| g.set_columns(n.max(1) as usize)));
     bridge.on_viewport_changed(|first, last| with_grid(|g| g.set_viewport(first, last)));
-    bridge.on_select(|id| with_grid(|g| g.select(id as u32)));
-    bridge.on_open(|id| with_grid(|g| g.open(id as u32)));
+    bridge.on_click(|row, col| {
+        with_grid(|g| {
+            if let Some(id) = g.id_at(row, col) {
+                g.select(id)
+            }
+        })
+    });
+    bridge.on_open(|row, col| {
+        with_grid(|g| {
+            if let Some(id) = g.id_at(row, col) {
+                g.open(id)
+            }
+        })
+    });
+    bridge.on_context_menu(|row, col| {
+        with_grid(|g| {
+            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.id_at(row, col).and_then(|id| g.target(id))) {
+                nav::context_menu(&ui, target);
+            }
+        })
+    });
 
     let debounce = Timer::default();
     bridge.on_filter_changed(move |text, tag, kind, sort| {
@@ -511,6 +534,47 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     grid.publish_status();
     grid.publish_tags();
     spawn_indexer(root, ui.as_weak());
+}
+
+/// The Review view as it was left, for Back (see `nav`): the filter controls, the selection
+/// and the scroll position.
+pub(crate) struct Snapshot {
+    search: SharedString,
+    tag: SharedString,
+    selected_tag: SharedString,
+    kind: i32,
+    sort: i32,
+    /// Entries are kept by path: one replaced meanwhile (e.g. rotated) has a new id.
+    selected: Option<PathBuf>,
+    /// The first tile in view, and how far its row was scrolled past: restored by tile
+    /// rather than pixels, so it holds if the column count changed meanwhile.
+    anchor: Option<PathBuf>,
+    offset: f32,
+}
+
+pub(crate) fn snapshot() -> Option<Snapshot> {
+    GRID.with_borrow(|grid| {
+        let g = grid.as_ref()?;
+        let ui = g.ui.upgrade()?;
+        let bridge = ui.global::<ReviewBridge>();
+        let path_of = |id: u32| g.entries.borrow().get(id).map(|e| e.path.clone());
+        let first = bridge.get_scroll_row().max(0) as usize * g.columns.get();
+        let anchor = g.visible.borrow().get(first).copied().and_then(path_of);
+        Some(Snapshot {
+            search: bridge.get_search_text(),
+            tag: bridge.get_tag_text(),
+            selected_tag: bridge.get_selected_tag(),
+            kind: bridge.get_kind_filter(),
+            sort: bridge.get_sort_index(),
+            selected: g.selected.get().and_then(path_of),
+            anchor,
+            offset: bridge.get_scroll_offset(),
+        })
+    })
+}
+
+pub(crate) fn restore(snapshot: Snapshot) {
+    with_grid(|g| g.restore(snapshot));
 }
 
 /// Stops thumbnail work at app exit, letting queued cache writes finish briefly.
@@ -676,6 +740,7 @@ impl GridModel {
             thumbs,
             ready,
             available_tags: RefCell::default(),
+            restore: RefCell::default(),
             #[cfg(test)]
             redrain_due: Cell::new(false),
             notify: Notify::default(),
@@ -925,6 +990,7 @@ impl GridModel {
         self.notify.reset();
         self.reschedule();
         self.publish_status();
+        self.apply_restore();
         true
     }
 
@@ -983,22 +1049,113 @@ impl GridModel {
     }
 
     fn select(&self, id: u32) {
-        let previous = self.selected.replace(Some(id));
-        for id in previous.into_iter().chain([id]) {
-            self.refresh_entry(id);
+        self.set_selected(Some(id));
+    }
+
+    fn set_selected(&self, id: Option<u32>) {
+        let previous = self.selected.replace(id);
+        if previous != id {
+            for id in previous.into_iter().chain(id) {
+                self.refresh_entry(id);
+            }
         }
+    }
+
+    /// The entry shown at grid `row`, `column`.
+    fn id_at(&self, row: i32, column: i32) -> Option<u32> {
+        let columns = self.columns.get();
+        if row < 0 || column < 0 || column as usize >= columns {
+            return None;
+        }
+        self.visible.borrow().get(row as usize * columns + column as usize).copied()
+    }
+
+    /// The live entry of `path`.
+    fn id_of(&self, path: &Path) -> Option<u32> {
+        let id = *self.by_path.borrow().get(&path_hash(path))?;
+        let index = self.entries.borrow();
+        (!index.gone.contains(&id) && index.get(id)?.path == path).then_some(id)
     }
 
     /// Shows `id` on the Details page.
     fn open(&self, id: u32) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let Some((path, name, kind, size)) =
-            self.entries.borrow().get(id).map(|e| (e.path.clone(), e.name.clone(), e.kind, e.size))
+        let Some(target) = self.target(id) else { return };
+        self.select(id);
+        nav::open(&ui, target);
+    }
+
+    /// Entry `id` as an item opened from here.
+    fn target(&self, id: u32) -> Option<Target> {
+        let path = self.entries.borrow().get(id)?.path.clone();
+        Some(Target::new(path, self.scope(Some(id))))
+    }
+
+    /// What the grid shows now, as filtered and sorted: a snapshot of the index (shared
+    /// chunks) and of the shown order, listed only when asked.
+    fn scope(&self, current: Option<u32>) -> Scope {
+        let (index, visible) = (self.entries.borrow().clone(), self.visible.borrow().clone());
+        let current = current
+            .and_then(|id| self.slot_of.borrow().get(id as usize).copied())
+            .filter(|&slot| slot != HIDDEN)
+            .map(|slot| slot as usize);
+        let query = self.query.borrow();
+        let mut label = "Review".to_owned();
+        if !query.text.is_empty() {
+            label += &format!(" · “{}”", query.text);
+        }
+        if !query.tag.is_empty() {
+            label += &format!(" · tags {}", query.tag);
+        }
+        label += match query.kind {
+            1 => " · Images",
+            2 => " · Video",
+            3 => " · Audio",
+            _ => "",
+        };
+        Scope::new(label, visible.len(), current, move || {
+            visible.iter().filter_map(|&id| index.get(id).map(|e| e.path.clone())).collect()
+        })
+    }
+
+    /// Back to a view left earlier: its filters (re-filtering if they changed since), its
+    /// selection and, once the filter result is in, its scroll position.
+    fn restore(&self, s: Snapshot) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let bridge = ui.global::<ReviewBridge>();
+        let now = (bridge.get_search_text(), bridge.get_tag_text(), bridge.get_kind_filter(), bridge.get_sort_index());
+        let refilter = now != (s.search.clone(), s.tag.clone(), s.kind, s.sort);
+        bridge.set_search_text(s.search.clone());
+        bridge.set_tag_text(s.tag.clone());
+        bridge.set_selected_tag(s.selected_tag);
+        bridge.set_kind_filter(s.kind);
+        bridge.set_sort_index(s.sort);
+        self.set_selected(s.selected.and_then(|path| self.id_of(&path)));
+        *self.restore.borrow_mut() = Some((s.anchor, s.offset));
+        if refilter {
+            self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)));
+        }
+        self.apply_restore();
+    }
+
+    /// Scrolls to the position [`restore`](Self::restore) asked for, unless a refilter is
+    /// still to land (then it does this).
+    fn apply_restore(&self) {
+        if self.pending.get() {
+            return;
+        }
+        let Some((anchor, offset)) = self.restore.take() else { return };
+        let Some(slot) = anchor
+            .and_then(|path| self.id_of(&path))
+            .and_then(|id| self.slot_of.borrow().get(id as usize).copied())
+            .filter(|&slot| slot != HIDDEN)
         else {
             return;
         };
-        self.select(id);
-        details::show(&ui, path, name, kind, size);
+        let Some(ui) = self.ui.upgrade() else { return };
+        let bridge = ui.global::<ReviewBridge>();
+        let serial = bridge.get_restore().serial + 1;
+        bridge.set_restore(ScrollRestore { serial, row: (slot as usize / self.columns.get()) as i32, offset });
     }
 
     /// Applies the thumbnails that arrived since the last drain (in arrival order, within
