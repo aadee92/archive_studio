@@ -18,6 +18,7 @@ mod nav;
 mod people;
 mod pipeline;
 mod review;
+mod semantic;
 mod thumbs;
 
 use std::path::PathBuf;
@@ -44,9 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = pipeline::install(&ui, root.clone());
     let _acquire = acquire::install(&ui, &root, pipeline.clone());
     actions::install(&ui, root.clone(), pipeline.clone());
-    details::install(&ui, root.clone(), pipeline);
+    details::install(&ui, root.clone(), pipeline.clone());
     people::install(&ui, root.clone());
-    review::install(&ui, root);
+    review::install(&ui, root, pipeline);
     // Diagnostics: start on another page (1 Review, 2 People), as if picked in the sidebar.
     if let Some(page) = std::env::var("ARCHIVE_STUDIO_PAGE").ok().and_then(|p| p.parse().ok()) {
         log::info!("ARCHIVE_STUDIO_PAGE: starting on page {page}");

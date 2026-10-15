@@ -37,6 +37,16 @@ export global ReviewBridge {
     in-out property <int> kind-filter: 0;
     in-out property <int> sort-index: 0;
     in-out property <Attention> attention;
+    // 0: the search box matches names and tags; 1: it describes what the pictures show,
+    // ranked by the CLIP model (the "Relevance" sort, index 4, is only offered then).
+    in-out property <int> search-mode: 0;
+    // "Find similar" (description mode): the path of the picture the results look like, and
+    // its name for the chip; empty otherwise.
+    in-out property <string> similar-to;
+    in property <string> similar-name;
+    // Under the search box in description mode: "Searching…", how many images are described
+    // so far, or why it can't search.
+    in property <string> describe-note;
     // Scroll position, reported by the page: the first row (partly) in view and how far it
     // is scrolled past.
     in-out property <int> scroll-row;
@@ -52,9 +62,9 @@ export global ReviewBridge {
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
     callback viewport-changed(int, int);
-    // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type),
-    // the "Needs attention" filters
-    callback filter-changed(string, string, int, int, Attention);
+    // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type,
+    // 4 relevance), the "Needs attention" filters, search mode, the picture to look like
+    callback filter-changed(string, string, int, int, Attention, int, string);
     // Pointer input on the grid, by (row, column); -1 for neither when it missed every tile.
     // A click with Shift (range from the anchor) / Ctrl (toggle).
     callback click(int, int, /* shift */ bool, /* ctrl */ bool);
@@ -328,7 +338,23 @@ export component ReviewPage inherits Rectangle {
     }
 
     function apply() {
-        ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index, ReviewBridge.attention);
+        ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index, ReviewBridge.attention,
+            ReviewBridge.search-mode, ReviewBridge.similar-to);
+    }
+
+    // Name & tags (0) or description (1); description sorts by relevance unless told otherwise.
+    function set-search-mode(mode: int) {
+        if (ReviewBridge.search-mode == mode) {
+            return;
+        }
+        ReviewBridge.search-mode = mode;
+        ReviewBridge.similar-to = "";
+        if (mode == 1) {
+            ReviewBridge.sort-index = 4;
+        } else if (ReviewBridge.sort-index == 4) {
+            ReviewBridge.sort-index = 0;
+        }
+        root.apply();
     }
 
     function select-tag(tag: string) {
@@ -376,10 +402,63 @@ export component ReviewPage inherits Rectangle {
                         font-weight: 600;
                         color: Theme.text-muted;
                     }
+                    // What the box searches: names and tags, or a description of the picture.
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Chip { text: "Name & tags"; active: ReviewBridge.search-mode == 0; clicked => { root.set-search-mode(0); } }
+                        Chip { text: "Description"; active: ReviewBridge.search-mode == 1; clicked => { root.set-search-mode(1); } }
+                    }
+                    // "Find similar": what the results look like, with × to go back to the text.
+                    if ReviewBridge.similar-to != "": Rectangle {
+                        height: 28px;
+                        border-radius: 14px;
+                        background: Theme.accent-soft;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "Looks like \{ReviewBridge.similar-name}";
+                                color: Theme.accent;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Rectangle {
+                                width: 20px;
+                                Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: similar-ta.has-hover ? Theme.hover : transparent;
+                                    Text { text: "×"; color: Theme.accent; font-size: 14px; }
+                                }
+                                similar-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        ReviewBridge.similar-to = "";
+                                        root.apply();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     search := LineEdit {
                         text <=> ReviewBridge.search-text;
-                        placeholder-text: "Search name or tags…";
-                        edited => { root.apply(); }
+                        placeholder-text: ReviewBridge.search-mode == 1 ? "Describe it: dog on a beach…" : "Search name or tags…";
+                        edited => {
+                            // Typing a description replaces "Find similar".
+                            ReviewBridge.similar-to = "";
+                            root.apply();
+                        }
+                    }
+                    if ReviewBridge.search-mode == 1 && ReviewBridge.describe-note != "": Text {
+                        text: ReviewBridge.describe-note;
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                 }
 
@@ -588,7 +667,8 @@ export component ReviewPage inherits Rectangle {
                         sort := ComboBox {
                             current-index <=> ReviewBridge.sort-index;
                             width: 140px;
-                            model: ["Name", "Date modified", "Size", "Type"];
+                            model: ReviewBridge.search-mode == 1 ? ["Name", "Date modified", "Size", "Type", "Relevance"]
+                                : ["Name", "Date modified", "Size", "Type"];
                             selected => { root.apply(); }
                         }
                     }

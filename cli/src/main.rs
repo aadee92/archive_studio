@@ -13,7 +13,7 @@ use archive_core::catalog::faces::FaceId;
 use archive_core::catalog::flags::AssetFlags;
 use archive_core::catalog::{AssetId, Catalog, Region, TagKind};
 use archive_core::ops;
-use archive_core::pipeline::describe::TextSearch;
+use archive_core::pipeline::describe;
 use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, DESCRIBE, FACES, ORIENT, SIGNATURE};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
@@ -55,7 +55,8 @@ pair FRONT BACK            pair a back with its front by hand (replaces their ol
 unpair PATH                take the file out of its front/back pair
 swap-sides PATH            the file's pair the other way round (front <-> back)
 similar PATH [N]           files from the same scene or event
-find WORDS...              files that fit a description (\"dog on a beach\")
+find WORDS...              files that fit a description (\"dog on a beach\"), best first
+like PATH [N]              files that look like this one (by their descriptions), best first
 delete PATH...             move the files (and their backs) to the library's trash
 trash                      what is in the trash
 restore PATH...            put trashed files back (their original paths)
@@ -179,7 +180,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     };
 
-    let mut shell = Shell { root: root.clone(), catalog, engine, search: None, faces: None };
+    let mut shell = Shell { root: root.clone(), catalog, engine, faces: None };
     for command in &args.commands {
         if !shell.execute(command) {
             return Ok(());
@@ -265,8 +266,6 @@ struct Shell {
     root: PathBuf,
     catalog: Catalog,
     engine: Option<Engine>,
-    /// Loaded on the first `find`.
-    search: Option<TextSearch>,
     /// Loaded on the first `add-face` without an engine here.
     faces: Option<Arc<archive_core::faces::Faces>>,
 }
@@ -316,6 +315,7 @@ impl Shell {
             "swap-sides" => self.swap_sides(rest),
             "similar" => self.similar(rest),
             "find" => self.find(rest),
+            "like" => self.like(rest),
             "delete" => self.delete(rest),
             "trash" => self.trash(),
             "restore" => self.restore(rest),
@@ -773,17 +773,42 @@ impl Shell {
         if args.is_empty() {
             return Err("find WORDS...".into());
         }
-        if self.search.is_none() {
-            let dir = Models::locate().describe.ok_or("no CLIP model (tinyclip-8m in the models directory)")?;
-            self.search = Some(TextSearch::from_dir(&dir).map_err(|e| format!("CLIP model: {e}"))?);
-        }
-        let search = self.search.as_ref().expect("loaded");
+        let search = ops::text_search(self.engine.as_ref())?;
         let found = search.search(&self.catalog, &args.join(" "), 20)?;
         if found.is_empty() {
-            println!("nothing fits (only files the describe stage has done are searched)");
+            println!("nothing fits");
         }
         for (path, similarity) in found {
             println!("{similarity:.3}  {}", show(&self.root, &path));
+        }
+        self.print_coverage()
+    }
+
+    /// `like PATH [N]`: the files whose CLIP embedding is most like the file's.
+    fn like(&self, args: &[&str]) -> Result<(), String> {
+        let (path, limit) = match args {
+            [path] => (path, 20),
+            [path, n] => (path, n.parse().map_err(|_| "like PATH [N]".to_owned())?),
+            _ => return Err("like PATH [N]".into()),
+        };
+        let asset = self.asset(path)?;
+        let found = describe::similar_images(&self.catalog, asset, limit)
+            .map_err(err)?
+            .ok_or("not described yet (the pipeline's describe stage hasn't run on it)")?;
+        if found.is_empty() {
+            println!("nothing looks like it");
+        }
+        for (path, similarity) in found {
+            println!("{similarity:.3}  {}", show(&self.root, &path));
+        }
+        self.print_coverage()
+    }
+
+    /// How many images a search by description can find, when that isn't all of them.
+    fn print_coverage(&self) -> Result<(), String> {
+        let coverage = describe::coverage(&self.catalog).map_err(err)?;
+        if coverage.described < coverage.images {
+            println!("({} of {} images described so far; only those are searched)", coverage.described, coverage.images);
         }
         Ok(())
     }

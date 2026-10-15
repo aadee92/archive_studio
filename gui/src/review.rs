@@ -32,6 +32,15 @@
 //! a changed file); items that leave the grid, whether deleted or filtered out, drop out of
 //! it, so an action on the selection only ever touches what is shown. Back snapshots keep
 //! it by path. Right-clicking an item of a multi-selection gives the menu for all of them.
+//!
+//! Search by description: in "Description" mode the search text is ranked against the
+//! images' CLIP embeddings on a worker ([`semantic`]), as is "Find similar" from the item
+//! menu ([`find_similar`]). The ranking (path hash -> rank) becomes part of the [`Query`]:
+//! only ranked entries pass, and the "Relevance" sort orders by rank, so the kind, tag and
+//! attention filters combine with it and merges and refilters work as for any query. A
+//! ranking is kept for the description it was made for: changing the other filters (or
+//! coming Back) doesn't search again. Each search has a generation; a result for an older
+//! one is dropped, as are refilter results.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -53,6 +62,8 @@ use archive_core::media::{classify, MediaKind};
 
 use crate::actions;
 use crate::nav::{self, Scope, Target};
+use crate::pipeline::Handle;
+use crate::semantic::{self, Found, Searcher, Want};
 use crate::{AppWindow, Attention, MediaRow, MediaTile, ReviewBridge, ScrollRestore, TagItem};
 
 #[cfg_attr(test, derive(Clone))]
@@ -181,29 +192,34 @@ enum Sort {
     Size,
     /// Kind, then name.
     Type,
+    /// Best match first, for a search by description ([`Query::ranking`]); name otherwise.
+    Relevance,
 }
 
 /// An entry with its sort key: `(Sort::key, id, entry)`.
 type Keyed<'a> = (u128, u32, &'a Entry);
 
 impl Sort {
-    /// From the UI's sort combo index (0 name, 1 date modified, 2 size, 3 type).
+    /// From the UI's sort combo index (0 name, 1 date modified, 2 size, 3 type, 4 relevance).
     fn from_index(index: i32) -> Self {
         match index {
             1 => Self::Date,
             2 => Self::Size,
             3 => Self::Type,
+            4 => Self::Relevance,
             _ => Self::Name,
         }
     }
 
     /// Primary key, consistent with [`cmp`](Self::cmp): a smaller key always sorts first.
-    fn key(self, e: &Entry) -> u128 {
+    /// `rank`: the entry's place in a search by description (`u32::MAX` if none).
+    fn key(self, e: &Entry, rank: u32) -> u128 {
         match self {
             Self::Name => e.name_prefix,
             Self::Date => (!e.mtime).into(),
             Self::Size => (!e.size).into(),
             Self::Type => ((e.kind as u128) << 126) | (e.name_prefix >> 2),
+            Self::Relevance => ((rank as u128) << 96) | (e.name_prefix >> 32),
         }
     }
 
@@ -211,7 +227,7 @@ impl Sort {
     fn cmp(self, a: &Keyed, b: &Keyed) -> Ordering {
         a.0.cmp(&b.0)
             .then_with(|| match self {
-                Self::Name | Self::Type => a.2.name_lc.cmp(&b.2.name_lc),
+                Self::Name | Self::Type | Self::Relevance => a.2.name_lc.cmp(&b.2.name_lc),
                 Self::Date | Self::Size => Ordering::Equal,
             })
             .then(a.1.cmp(&b.1))
@@ -235,6 +251,10 @@ struct Query {
     need: AssetFlags,
     without: AssetFlags,
     sort: Sort,
+    /// A search by description: [`path_hash`] -> rank (0 best). Only these entries pass.
+    ranking: Option<Arc<HashMap<u64, u32>>>,
+    /// What it looked for, for the Details scope ("“dog on a beach”", "like IMG_1.jpg").
+    described: String,
 }
 
 impl Query {
@@ -260,7 +280,22 @@ impl Query {
             need: AssetFlags::NONE,
             without: AssetFlags::NONE,
             sort,
+            ranking: None,
+            described: String::new(),
         }
+    }
+
+    /// Narrowed to (and ranked by) a search by description.
+    fn ranked(mut self, ranking: Option<Arc<HashMap<u64, u32>>>, described: String) -> Self {
+        self.ranking = ranking;
+        self.described = described;
+        self
+    }
+
+    /// [`Sort::key`] of `e`.
+    fn key(&self, e: &Entry) -> u128 {
+        let rank = self.ranking.as_ref().and_then(|r| r.get(&e.path_hash).copied()).unwrap_or(u32::MAX);
+        self.sort.key(e, rank)
     }
 
     /// Narrowed to what the "Needs attention" chips ask for.
@@ -277,6 +312,9 @@ impl Query {
             _ => true,
         };
         if !kind_ok || !e.flags.matches(self.need, self.without) {
+            return false;
+        }
+        if self.ranking.as_ref().is_some_and(|r| !r.contains_key(&e.path_hash)) {
             return false;
         }
 
@@ -308,10 +346,55 @@ impl Query {
     /// The entries it accepts, in display order.
     fn filter_sort<'a>(&self, entries: impl Iterator<Item = (u32, &'a Entry)>) -> Vec<Keyed<'a>> {
         let sort = self.sort;
-        let mut keyed: Vec<Keyed> = entries.filter(|(_, e)| self.accepts(e)).map(|(id, e)| (sort.key(e), id, e)).collect();
+        let mut keyed: Vec<Keyed> = entries.filter(|(_, e)| self.accepts(e)).map(|(id, e)| (self.key(e), id, e)).collect();
         keyed.sort_unstable_by(|a, b| sort.cmp(a, b));
         keyed
     }
+}
+
+/// The filter controls as the page set them: what [`GridModel::set_filters`] turns into a
+/// [`Query`], after a search by description when one is asked for.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Filters {
+    text: String,
+    tag: String,
+    kind: i32,
+    sort: i32,
+    attention: Attention,
+    /// 0 name & tags, 1 description.
+    mode: i32,
+    /// "Find similar": the picture to look like, in description mode; else empty.
+    similar: String,
+}
+
+impl Filters {
+    /// The search by description this asks for, if any.
+    fn want(&self) -> Option<Want> {
+        if self.mode != 1 {
+            return None;
+        }
+        if !self.similar.is_empty() {
+            return Some(Want::Like(self.similar.clone().into()));
+        }
+        let text = self.text.trim();
+        (!text.is_empty()).then(|| Want::Text(text.to_owned()))
+    }
+
+    /// The query, with the ranking of [`want`](Self::want) if there is one.
+    fn query(&self, ranking: Option<Arc<HashMap<u64, u32>>>) -> Query {
+        // In description mode the text describes; it isn't matched against names.
+        let text = if self.mode == 1 { String::new() } else { self.text.clone() };
+        let described = match self.want() {
+            Some(Want::Text(text)) => format!("“{text}”"),
+            Some(Want::Like(path)) => format!("like {}", file_name(&path)),
+            None => String::new(),
+        };
+        Query::new(text, self.tag.clone(), self.kind, Sort::from_index(self.sort)).needing(&self.attention).ranked(ranking, described)
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 const HIDDEN: u32 = u32::MAX;
@@ -475,6 +558,16 @@ struct GridModel {
     scrolling_down: Cell<bool>,
     settle: Timer,
     query: RefCell<Query>,
+    /// The filter controls the query was (or is being) made from.
+    filters: RefCell<Filters>,
+    /// Searches by description, if this grid has a worker for them (not in tests).
+    searcher: RefCell<Option<Searcher>>,
+    /// Of the latest search by description; older results are stale.
+    search_generation: Cell<u64>,
+    /// A search by description is in flight: the grid still shows the previous result.
+    searching: Cell<bool>,
+    /// The last search by description's result, kept while that is what is asked for.
+    ranking: RefCell<Option<(Want, Arc<HashMap<u64, u32>>)>>,
     /// Of the latest refilter; older results are stale.
     generation: Cell<u64>,
     /// A refilter is running on the filter thread; `visible` still shows the old query.
@@ -521,7 +614,7 @@ fn with_grid(f: impl FnOnce(&GridModel)) {
     });
 }
 
-pub fn install(ui: &AppWindow, root: PathBuf) {
+pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     let db = thumbs::cache::default_db_path();
     let ready = Arc::new(Mailbox::new());
     let (mailbox, weak) = (ready.clone(), ui.as_weak());
@@ -540,6 +633,14 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     });
 
     let grid = Rc::new(GridModel::new(ui.as_weak(), thumbs, ready, filter, SYNC_FILTER_LIMIT));
+    let weak = ui.as_weak();
+    *grid.searcher.borrow_mut() = Some(Searcher::spawn(root.clone(), pipeline, move |found| {
+        let _ = weak.upgrade_in_event_loop(move |_| {
+            with_grid(|g| {
+                g.searched(found);
+            })
+        });
+    }));
     GRID.set(Some(grid.clone()));
 
     let bridge = ui.global::<ReviewBridge>();
@@ -597,14 +698,18 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     });
 
     let debounce = Timer::default();
-    bridge.on_filter_changed(move |text, tag, kind, sort, attention| {
+    bridge.on_filter_changed(move |text, tag, kind, sort, attention, mode, similar| {
         log::debug!(
-            "review filter changed: search {text:?}, tags {tag:?}, kind {kind}, sort {sort}, needs attention [{}]",
-            attention_label(&attention)
+            "review filter changed: search {text:?} ({}), tags {tag:?}, kind {kind}, sort {sort}, needs attention [{}]{}",
+            if mode == 1 { "description" } else { "name & tags" },
+            attention_label(&attention),
+            if similar.is_empty() { String::new() } else { format!(", like {similar:?}") }
         );
-        let query = Query::new(text.to_string(), tag.to_string(), kind, Sort::from_index(sort)).needing(&attention);
-        debounce.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
-            with_grid(|g| g.set_query(query.clone()))
+        let filters = Filters { text: text.into(), tag: tag.into(), kind, sort, attention, mode, similar: similar.into() };
+        // A description is searched with a model: wait a little longer for the typing to stop.
+        let wait = if mode == 1 { 350 } else { 120 };
+        debounce.start(TimerMode::SingleShot, Duration::from_millis(wait), move || {
+            with_grid(|g| g.set_filters(filters.clone()))
         });
     });
 
@@ -625,8 +730,37 @@ pub fn show_attention(ui: &AppWindow, attention: Attention) {
     bridge.set_selected_tag(SharedString::default());
     bridge.set_kind_filter(0);
     bridge.set_attention(attention.clone());
-    let query = Query::new(String::new(), String::new(), 0, Sort::from_index(bridge.get_sort_index())).needing(&attention);
-    with_grid(|g| g.set_query(query));
+    bridge.set_search_mode(0);
+    bridge.set_similar_to(SharedString::default());
+    if Sort::from_index(bridge.get_sort_index()) == Sort::Relevance {
+        bridge.set_sort_index(0);
+    }
+    let filters = Filters { sort: bridge.get_sort_index(), attention, ..Default::default() };
+    with_grid(|g| g.set_filters(filters));
+}
+
+/// "Find similar" from the item menu: shows Review with the pictures that look like the one
+/// at `path` (by their CLIP embeddings), best first and it first, in description mode; the
+/// other filters are cleared. Back returns to the view it was asked from, Review included.
+pub fn find_similar(ui: &AppWindow, path: &Path) {
+    log::debug!("review: find pictures like {}", path.display());
+    if ui.get_page() == nav::REVIEW {
+        nav::remember(ui);
+    } else {
+        nav::go(ui, nav::REVIEW);
+    }
+    let bridge = ui.global::<ReviewBridge>();
+    bridge.set_search_text(SharedString::default());
+    bridge.set_tag_text(SharedString::default());
+    bridge.set_selected_tag(SharedString::default());
+    bridge.set_kind_filter(0);
+    bridge.set_attention(Attention::default());
+    bridge.set_search_mode(1);
+    bridge.set_similar_to(path.display().to_string().into());
+    bridge.set_similar_name(file_name(path).into());
+    bridge.set_sort_index(4);
+    let filters = Filters { sort: 4, mode: 1, similar: path.display().to_string(), ..Default::default() };
+    with_grid(|g| g.set_filters(filters));
 }
 
 /// Where [`GridModel::apply_restore`] scrolls: the first tile that was in view, how far its
@@ -642,6 +776,9 @@ pub(crate) struct Snapshot {
     kind: i32,
     sort: i32,
     attention: Attention,
+    /// Search mode (0 name & tags, 1 description) and "Find similar"'s picture.
+    mode: i32,
+    similar: SharedString,
     /// Entries are kept by path ([`path_hash`]): one replaced meanwhile (e.g. rotated) has
     /// a new id.
     selected: Vec<u64>,
@@ -673,8 +810,10 @@ impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, needs attention [{}], {} selected, focus {:?}{}, scroll anchor {:?} +{:.0}px }}",
+            "Review {{ search {:?}{}{}, tags {:?} (picked {:?}), kind {}, sort {}, needs attention [{}], {} selected, focus {:?}{}, scroll anchor {:?} +{:.0}px }}",
             self.search.as_str(),
+            if self.mode == 1 { " (description)" } else { "" },
+            if self.similar.is_empty() { String::new() } else { format!(" like {:?}", self.similar.as_str()) },
             self.tag.as_str(),
             self.selected_tag.as_str(),
             self.kind,
@@ -704,6 +843,8 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
             kind: bridge.get_kind_filter(),
             sort: bridge.get_sort_index(),
             attention: bridge.get_attention(),
+            mode: bridge.get_search_mode(),
+            similar: bridge.get_similar_to(),
             selected: g.selection.borrow().iter().filter_map(|&id| g.entries.borrow().get(id).map(|e| e.path_hash)).collect(),
             focus: g.focus.get().and_then(path_of),
             anchor,
@@ -917,6 +1058,11 @@ impl GridModel {
             scrolling_down: Cell::new(true),
             settle: Timer::default(),
             query: RefCell::default(),
+            filters: RefCell::default(),
+            searcher: RefCell::default(),
+            search_generation: Cell::new(0),
+            searching: Cell::new(false),
+            ranking: RefCell::default(),
             generation: Cell::new(0),
             pending: Cell::new(false),
             filter,
@@ -1187,6 +1333,65 @@ impl GridModel {
     fn set_query(&self, query: Query) {
         *self.query.borrow_mut() = query;
         self.refilter();
+    }
+
+    /// The filter controls changed (or were restored): re-filters, after searching by
+    /// description if that asks for a search other than the last one (the grid shows what it
+    /// showed until the result is in).
+    fn set_filters(&self, filters: Filters) {
+        *self.filters.borrow_mut() = filters.clone();
+        let Some(want) = filters.want() else {
+            // A search in flight is no longer wanted.
+            self.search_generation.set(self.search_generation.get() + 1);
+            self.searching.set(false);
+            self.publish_note(String::new());
+            self.set_query(filters.query(None));
+            return;
+        };
+        let cached = self.ranking.borrow().as_ref().filter(|(had, _)| *had == want).map(|(_, ranking)| ranking.clone());
+        if let Some(ranking) = cached {
+            log::debug!("review: {want:?} ranked already ({} items)", ranking.len());
+            self.search_generation.set(self.search_generation.get() + 1);
+            self.searching.set(false);
+            self.set_query(filters.query(Some(ranking)));
+            return;
+        }
+        let generation = self.search_generation.get() + 1;
+        self.search_generation.set(generation);
+        log::debug!("review: description search #{generation} for {want:?}");
+        self.searching.set(true);
+        self.publish_note("Searching…".into());
+        if let Some(searcher) = self.searcher.borrow().as_ref() {
+            searcher.ask(generation, want);
+        }
+    }
+
+    /// A search by description is done: shown (with the other filters) if it is still the
+    /// latest one asked for; returns whether it was.
+    fn searched(&self, found: Found) -> bool {
+        if found.generation != self.search_generation.get() {
+            log::debug!("description search #{} result dropped: #{} is newer", found.generation, self.search_generation.get());
+            return false;
+        }
+        self.searching.set(false);
+        self.publish_note(semantic::note(&found.result));
+        let paths = found.result.map(|ranked| ranked.paths).unwrap_or_default();
+        let mut ranking = HashMap::with_capacity(paths.len());
+        for (rank, path) in paths.iter().enumerate() {
+            ranking.entry(path_hash(path)).or_insert(rank as u32);
+        }
+        let ranking = Arc::new(ranking);
+        *self.ranking.borrow_mut() = Some((found.want, ranking.clone()));
+        let query = self.filters.borrow().query(Some(ranking));
+        self.set_query(query);
+        true
+    }
+
+    /// The line under the search box (searching, how much is described, why it can't).
+    fn publish_note(&self, note: String) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.global::<ReviewBridge>().set_describe_note(note.into());
+        }
     }
 
     /// Re-filters everything: synchronously for small libraries, else on the filter thread
@@ -1547,6 +1752,9 @@ impl GridModel {
         if !query.text.is_empty() {
             label += &format!(" · “{}”", query.text);
         }
+        if !query.described.is_empty() {
+            label += &format!(" · {}", query.described);
+        }
         if !query.tag.is_empty() {
             label += &format!(" · tags {}", query.tag);
         }
@@ -1570,8 +1778,16 @@ impl GridModel {
     fn restore(&self, s: Snapshot) {
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<ReviewBridge>();
-        let now = (bridge.get_search_text(), bridge.get_tag_text(), bridge.get_kind_filter(), bridge.get_sort_index(), bridge.get_attention());
-        let refilter = now != (s.search.clone(), s.tag.clone(), s.kind, s.sort, s.attention.clone());
+        let filters = Filters {
+            text: s.search.to_string(),
+            tag: s.tag.to_string(),
+            kind: s.kind,
+            sort: s.sort,
+            attention: s.attention.clone(),
+            mode: s.mode,
+            similar: s.similar.to_string(),
+        };
+        let refilter = *self.filters.borrow() != filters;
         log::debug!("review restore {s:?} (refilter {refilter})");
         bridge.set_search_text(s.search.clone());
         bridge.set_tag_text(s.tag.clone());
@@ -1579,6 +1795,9 @@ impl GridModel {
         bridge.set_kind_filter(s.kind);
         bridge.set_sort_index(s.sort);
         bridge.set_attention(s.attention.clone());
+        bridge.set_search_mode(s.mode);
+        bridge.set_similar_to(s.similar.clone());
+        bridge.set_similar_name(file_name(Path::new(s.similar.as_str())).into());
         let reveal = s.focus.clone().filter(|_| s.followed);
         let focus = s.focus.and_then(|path| self.id_of(&path));
         if let Some(old) = self.focus.replace(focus) {
@@ -1589,15 +1808,15 @@ impl GridModel {
         self.set_selection(ids);
         *self.restore.borrow_mut() = Some((s.anchor, s.offset, reveal));
         if refilter {
-            self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)).needing(&s.attention));
+            self.set_filters(filters);
         }
         self.apply_restore();
     }
 
-    /// Scrolls to the position [`restore`](Self::restore) asked for, unless a refilter is
-    /// still to land (then it does this).
+    /// Scrolls to the position [`restore`](Self::restore) asked for, unless a search or a
+    /// refilter is still to land (then it does this).
     fn apply_restore(&self) {
-        if self.pending.get() {
+        if self.pending.get() || self.searching.get() {
             return;
         }
         let Some((anchor, offset, reveal)) = self.restore.take() else { return };
@@ -1937,6 +2156,10 @@ mod tests {
             Sort::Date => ids.sort_by(|a, b| e(b).mtime.cmp(&e(a).mtime)),
             Sort::Size => ids.sort_by(|a, b| e(b).size.cmp(&e(a).size)),
             Sort::Type => ids.sort_by(|a, b| (e(a).kind as i32, &e(a).name_lc).cmp(&(e(b).kind as i32, &e(b).name_lc))),
+            Sort::Relevance => {
+                let rank = |id: &u32| query.ranking.as_ref().and_then(|r| r.get(&e(id).path_hash).copied()).unwrap_or(u32::MAX);
+                ids.sort_by(|a, b| (rank(a), &e(a).name_lc).cmp(&(rank(b), &e(b).name_lc)))
+            }
         }
         ids
     }
@@ -2308,6 +2531,63 @@ mod tests {
         assert!(!g.notify.log.borrow().contains(&Change::Reset), "updates never reset the view");
         let label = g.scope(None).label;
         assert_eq!(label, "Review · Failed");
+    }
+
+    /// A search by description ranks the view and combines with the other filters; changing
+    /// those doesn't search again, a stale result is dropped, and files indexed later merge
+    /// in at their rank.
+    #[test]
+    fn description_search_ranks_and_combines_with_filters() {
+        use archive_core::catalog::semantic::Coverage;
+        use semantic::Ranked;
+        let g = grid(usize::MAX, 4, |_| {});
+        let file = |name: &str, kind| Entry::new(PathBuf::from(format!("/x/{name}")), name.into(), kind, 10, SystemTime::UNIX_EPOCH);
+        let entries = vec![file("a.jpg", MediaKind::Image), file("b.jpg", MediaKind::Image), file("c.mp4", MediaKind::Video), file("d.jpg", MediaKind::Image)];
+        g.append(entries.into(), true);
+        let shown = |g: &GridModel| -> Vec<String> {
+            let index = g.entries.borrow();
+            g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.to_string()).collect()
+        };
+        let dog = Filters { text: " dog ".into(), sort: 4, mode: 1, ..Default::default() };
+        let found = |generation, paths: &[&str]| Found {
+            generation,
+            want: Want::Text("dog".into()),
+            result: Ok(Ranked { paths: paths.iter().map(|p| PathBuf::from(format!("/x/{p}"))).collect(), coverage: Coverage { described: 4, images: 4 } }),
+        };
+
+        g.set_filters(dog.clone());
+        assert!(g.searching.get());
+        assert_eq!(shown(&g).len(), 4, "the view stays until the result is in");
+        let asked = g.search_generation.get();
+        g.set_filters(Filters { text: "cat".into(), ..dog.clone() });
+        assert!(!g.searched(found(asked, &["a.jpg"])), "superseded");
+        g.set_filters(dog.clone());
+        assert!(g.searched(found(g.search_generation.get(), &["d.jpg", "c.mp4", "a.jpg", "e.jpg"])));
+        assert_eq!(shown(&g), ["d.jpg", "c.mp4", "a.jpg"]);
+        assert_eq!(g.scope(None).label, "Review · “dog”");
+
+        // Other filters: no new search.
+        let asked = g.search_generation.get();
+        g.set_filters(Filters { kind: 1, ..dog.clone() });
+        assert!(!g.searching.get());
+        assert_eq!(shown(&g), ["d.jpg", "a.jpg"]);
+        g.set_filters(Filters { sort: 0, ..dog.clone() });
+        assert_eq!(shown(&g), ["a.jpg", "c.mp4", "d.jpg"]);
+        g.set_filters(dog.clone());
+        assert!(g.search_generation.get() > asked && !g.searching.get());
+
+        // Indexed later: in at its rank.
+        g.append(vec![file("e.jpg", MediaKind::Image), file("f.jpg", MediaKind::Image)].into(), true);
+        assert_eq!(shown(&g), ["d.jpg", "c.mp4", "a.jpg", "e.jpg"]);
+
+        // Back to names: everything, and a search still in flight is dropped.
+        g.set_filters(Filters { text: "cat".into(), ..dog.clone() });
+        let asked = g.search_generation.get();
+        g.set_filters(Filters { text: "dog".into(), ..Default::default() });
+        assert!(!g.searched(found(asked, &["a.jpg"])));
+        assert!(shown(&g).is_empty(), "names with “dog”: none");
+        g.set_filters(Filters::default());
+        assert_eq!(shown(&g).len(), 6);
     }
 
     /// Files read for the grid carry the catalog's flags, from a walk and from the relay.

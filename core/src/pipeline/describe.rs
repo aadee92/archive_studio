@@ -9,12 +9,16 @@
 //! the user can reject any of them.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clip::zero_shot::{self, ZeroShot};
-use clip::{Clip, Embedding, TextEncoder};
+use clip::{Clip, Embedding, ImageEncoder, TextEncoder};
 
-use crate::catalog::{Catalog, TagKind};
+use crate::catalog::semantic::{self, Coverage, Cutoff};
+use crate::catalog::{AssetId, Catalog, TagKind};
 
+/// The model whose embeddings the stage stores and searches compare against.
+pub const MODEL: &str = clip::MODEL;
 /// The source name of the tags this stage proposes.
 pub const DETECTOR: &str = "clip/tinyclip-8m";
 /// The model and the vocabulary: changing either makes every describe run due again.
@@ -27,6 +31,14 @@ pub const MIN_SEARCH_SIMILARITY: f32 = 0.2;
 /// …or than the best match's similarity less this: fitting images stand out by a few
 /// hundredths over the rest, whose similarities are all alike.
 pub const SEARCH_WINDOW: f32 = 0.08;
+/// What a text search keeps.
+pub const TEXT_CUTOFF: Cutoff = Cutoff { min: MIN_SEARCH_SIMILARITY, window: SEARCH_WINDOW };
+/// What [`similar_images`] keeps. Measured on family photos: pictures of one event are
+/// mostly 0.8 up to each other, bursts and near-duplicates 0.95 up, unrelated ones around
+/// 0.55; the window keeps a burst's look-alikes from drowning in the rest of the event.
+pub const IMAGE_CUTOFF: Cutoff = Cutoff { min: MIN_SIMILAR_IMAGE, window: 0.2 };
+/// See [`IMAGE_CUTOFF`].
+pub const MIN_SIMILAR_IMAGE: f32 = 0.75;
 
 /// Labels that compete, under the tag `branch`.
 struct Group {
@@ -176,19 +188,26 @@ pub struct Description {
 
 /// The model and the vocabulary's prompts, embedded once.
 pub struct Describer {
-    clip: Clip,
+    image: ImageEncoder,
+    /// The text half, shared with hosts ([`text_search`](Self::text_search)).
+    search: Arc<TextSearch>,
     zero_shot: ZeroShot,
 }
 
 impl Describer {
     /// Loads the model from `dir` (`visual.onnx`, `textual.onnx`) and embeds the vocabulary.
     pub fn from_dir(dir: &Path) -> Result<Self, clip::Error> {
-        let clip = Clip::from_dir(dir)?;
+        let Clip { image, text } = Clip::from_dir(dir)?;
         let groups: Vec<(Vec<&str>, &[&str])> =
             VOCABULARY.iter().map(|g| (g.labels.iter().map(|(_, phrase)| *phrase).collect(), g.nulls)).collect();
         let groups: Vec<zero_shot::Group> = groups.iter().map(|(labels, nulls)| zero_shot::Group { labels, nulls }).collect();
-        let zero_shot = ZeroShot::new(&clip.text, &groups)?;
-        Ok(Self { clip, zero_shot })
+        let zero_shot = ZeroShot::new(&text, &groups)?;
+        Ok(Self { image, search: Arc::new(TextSearch { text }), zero_shot })
+    }
+
+    /// Search by description with the text model loaded here, rather than a second copy.
+    pub fn text_search(&self) -> Arc<TextSearch> {
+        self.search.clone()
     }
 
     /// Describes the image file at `path`, upright (EXIF orientation applied).
@@ -198,7 +217,7 @@ impl Describer {
     }
 
     pub fn describe(&self, image: &image::DynamicImage) -> Result<Description, String> {
-        let embedding = self.clip.image.embed(image).map_err(|e| format!("clip model: {e}"))?;
+        let embedding = self.image.embed(image).map_err(|e| format!("clip model: {e}"))?;
         let mut tags = Vec::new();
         for (group, scores) in VOCABULARY.iter().zip(self.zero_shot.scores(&embedding)) {
             for ((name, _), confidence) in group.labels.iter().zip(scores) {
@@ -225,20 +244,56 @@ impl TextSearch {
     }
 
     /// The images that fit `text` best, best first, with their similarity, at most `limit`
-    /// (see [`MIN_SEARCH_SIMILARITY`], [`SEARCH_WINDOW`]). Only images the describe stage
-    /// has done are found.
+    /// (cut off by [`TEXT_CUTOFF`]). Only images the describe stage has done are found
+    /// ([`Catalog::embedding_coverage`] says how many).
     pub fn search(&self, catalog: &Catalog, text: &str, limit: usize) -> Result<Vec<(PathBuf, f32)>, String> {
         let query = self.text.embed(text).map_err(|e| format!("clip model: {e}"))?;
-        let mut found = catalog.search_embedding(&query, clip::MODEL, limit).map_err(|e| e.to_string())?;
-        let best = found.first().map_or(0.0, |(_, similarity)| *similarity);
-        found.retain(|(_, similarity)| *similarity >= MIN_SEARCH_SIMILARITY.max(best - SEARCH_WINDOW));
+        let found = catalog.search_embedding(&query, clip::MODEL, usize::MAX).map_err(|e| e.to_string())?;
+        let found = semantic::rank(found, TEXT_CUTOFF, limit);
+        log::debug!("text search {text:?}: {} found (best {:?})", found.len(), found.first().map(|(_, s)| *s));
         Ok(found)
     }
+}
+
+/// How much of the library searches by description can find: images with an embedding of
+/// the current model ([`Catalog::embedding_coverage`]).
+pub fn coverage(catalog: &Catalog) -> crate::catalog::Result<Coverage> {
+    catalog.embedding_coverage(MODEL)
+}
+
+/// The images that look most like `asset`'s by their CLIP embeddings (made by the describe
+/// stage), best first, with their similarity, at most `limit`, cut off by [`IMAGE_CUTOFF`];
+/// not `asset` itself. `None` while the describe stage hasn't done `asset`.
+pub fn similar_images(catalog: &Catalog, asset: AssetId, limit: usize) -> crate::catalog::Result<Option<Vec<(PathBuf, f32)>>> {
+    let Some((model, embedding)) = catalog.image_embedding(asset)? else { return Ok(None) };
+    let own = catalog.asset_path(asset)?;
+    let mut found = catalog.search_embedding(&embedding, &model, usize::MAX)?;
+    found.retain(|(path, _)| *path != own);
+    let found = semantic::rank(found, IMAGE_CUTOFF, limit);
+    log::debug!("images like asset {} ({}): {} found", asset.0, own.display(), found.len());
+    Ok(Some(found))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similar_images_leave_out_the_image_and_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&dir.path().join("catalog.sqlite"), dir.path()).unwrap();
+        let asset = |name: &str| cat.asset(&dir.path().join(name)).unwrap();
+        let (beach, dunes, dog, plain) = (asset("beach.jpg"), asset("dunes.jpg"), asset("dog.jpg"), asset("plain.jpg"));
+        let unit = |v: &[f32]| Embedding::new(v.to_vec());
+        cat.set_image_embedding(beach, clip::MODEL, &unit(&[1.0, 0.0])).unwrap();
+        cat.set_image_embedding(dunes, clip::MODEL, &unit(&[1.0, 0.3])).unwrap();
+        cat.set_image_embedding(dog, clip::MODEL, &unit(&[0.0, 1.0])).unwrap();
+
+        let found = similar_images(&cat, beach, 10).unwrap().unwrap();
+        assert_eq!(found.iter().map(|(p, _)| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["dunes.jpg"]);
+        assert!(found[0].1 > MIN_SIMILAR_IMAGE);
+        assert_eq!(similar_images(&cat, plain, 10).unwrap(), None, "not described");
+    }
 
     #[test]
     fn version_names_the_model() {

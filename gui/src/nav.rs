@@ -201,6 +201,12 @@ pub fn context_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
     actions::show_menu_for(ui, target, items);
 }
 
+/// Pushes the view on screen onto the history without leaving its page, for a change to it
+/// that Back should undo (Review's "Find similar" from Review).
+pub fn remember(ui: &AppWindow) {
+    leave(ui);
+}
+
 /// Whether there is a view to go back to.
 pub fn can_go_back(_ui: &AppWindow) -> bool {
     HISTORY_STACK.with_borrow(|history| !history.is_empty())

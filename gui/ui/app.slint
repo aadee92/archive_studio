@@ -77,6 +77,11 @@ export component AppWindow inherits Window {
                 }
             }
             MenuItem {
+                title: "Find similar";
+                enabled: ItemMenu.count <= 1;
+                activated => { ItemMenu.action("find-similar"); }
+            }
+            MenuItem {
                 title: "Show in folder";
                 enabled: ItemMenu.count <= 1;
                 activated => { ItemMenu.action("show-in-folder"); }

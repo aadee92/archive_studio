@@ -1,5 +1,7 @@
 //! The item context menu: Rotate left / right, Add tag…, front and back (pair as the back of
-//! the previous / next item of the view, swap, unpair), Show in folder, Properties, Delete,
+//! the previous / next item of the view, swap, unpair), Find similar (Review ranked by how
+//! much pictures look like it: [`review::find_similar`](crate::review::find_similar)), Show
+//! in folder, Properties, Delete,
 //! for any item a page shows (a Review tile, a face in People, a recent capture in Acquire,
 //! the Details picture and its similar strip). Pages resolve the item under the pointer and
 //! call [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the
@@ -215,6 +217,7 @@ pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<Pa
         "tag" => open_tag_dialog(ui, vec![target.path]),
         "properties" => properties(ui, target.path),
         "show-in-folder" => show_in_folder(ui, target.path),
+        "find-similar" => crate::review::find_similar(ui, &target.path),
         "open-external" => open_externally(ui, target.path),
         "pair-prev" => pair_with_neighbour(ui, target, -1),
         "pair-next" => pair_with_neighbour(ui, target, 1),

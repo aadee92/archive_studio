@@ -19,11 +19,16 @@
 //!   [`Catalog::not_person`], [`Catalog::ignore_faces`] and [`Catalog::delete_faces`] for the
 //!   ones there.
 //! - [`properties`]: everything known about the asset, for a properties dialog.
+//! - Search by description: [`text_search`] gives the text model (the engine's, else one
+//!   loaded once per process) for [`TextSearch::search`]; [`similar_images`](pipeline::describe::similar_images) finds
+//!   pictures that look like one; [`Catalog::embedding_coverage`] says how much of the
+//!   library either can find.
 //! - Many at once (a multi-selection): [`delete_all`] / [`restore_all`] (one Undo for all
 //!   of them), [`add_tag_all`]. Each returns what happened to every asset, or is all or
 //!   nothing, as documented.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use image::{ImageDecoder, ImageReader};
@@ -36,7 +41,8 @@ use crate::catalog::people::{display_name, PEOPLE};
 use crate::catalog::{AppliedTag, AssetId, Catalog, Region, TagId, TagKind};
 use crate::exif::{self, Exif};
 use crate::media::{classify, MediaKind};
-use crate::pipeline::{self, Models, ORIENT};
+use crate::pipeline::describe::TextSearch;
+use crate::pipeline::{self, Engine, Models, ORIENT};
 
 /// Turns the asset's image `cw` degrees clockwise (90, 180 or 270), rewriting the file
 /// losslessly; see [`pipeline::rotate_file`].
@@ -262,6 +268,30 @@ pub fn face_models() -> Result<faces::Faces, String> {
     let models = faces::Faces::from_dir(&dir).map_err(|e| format!("face model: {e}"))?;
     log::debug!("face models loaded from {} in {:?}", dir.display(), started.elapsed());
     Ok(models)
+}
+
+/// The text model [`text_search`] loaded, kept for the life of the process.
+static OWN_TEXT_SEARCH: Mutex<Option<Arc<TextSearch>>> = Mutex::new(None);
+
+/// The CLIP text model for searching by description ([`TextSearch::search`]): `engine`'s if
+/// it has loaded one, else one loaded from the models directory ([`Models::locate`]) on the
+/// first call and kept. Loading takes a moment: call it on a worker. Fails without the model
+/// (tried again on the next call, in case it was installed meanwhile).
+pub fn text_search(engine: Option<&Engine>) -> Result<Arc<TextSearch>, String> {
+    if let Some(search) = engine.and_then(Engine::text_search) {
+        return Ok(search);
+    }
+    // Held while loading, so concurrent callers wait for one load.
+    let mut own = OWN_TEXT_SEARCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(search) = own.as_ref() {
+        return Ok(search.clone());
+    }
+    let dir = Models::locate().describe.ok_or("description search needs the tinyclip-8m model (in the models directory)")?;
+    let started = std::time::Instant::now();
+    let search = Arc::new(TextSearch::from_dir(&dir).map_err(|e| format!("CLIP model: {e}"))?);
+    log::debug!("CLIP text model loaded from {} in {:?}", dir.display(), started.elapsed());
+    *own = Some(search.clone());
+    Ok(search)
 }
 
 /// How the asset's rotation stands, from the orient stage.

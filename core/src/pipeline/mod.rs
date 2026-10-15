@@ -268,6 +268,8 @@ pub struct Engine {
     availability: Arc<Mutex<Option<Availability>>>,
     /// The face models the workers loaded, shared with hosts ([`Engine::face_models`]).
     face_models: Arc<Mutex<Option<Arc<faces::Faces>>>>,
+    /// The describe stage's text model, likewise ([`Engine::text_search`]).
+    text_search: Arc<Mutex<Option<Arc<describe::TextSearch>>>>,
 }
 
 type Reply = mpsc::Sender<Result<(), String>>;
@@ -311,6 +313,8 @@ impl Engine {
         let shared = availability.clone();
         let face_models = Arc::new(Mutex::new(None));
         let shared_faces = face_models.clone();
+        let text_search = Arc::new(Mutex::new(None));
+        let shared_text = text_search.clone();
         let done = send.clone();
         let thread = thread::Builder::new()
             .name("pipeline".into())
@@ -319,12 +323,13 @@ impl Engine {
                 let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(sink);
                 let workers = Workers::start(&config, done, &sink);
                 *shared_faces.lock().unwrap() = workers.faces.clone();
+                *shared_text.lock().unwrap() = workers.text_search.clone();
                 *shared.lock().unwrap() = Some(workers.availability);
                 sink(Event::Ready(workers.availability));
                 Pipeline::new(catalog, workers, sink).run(receive);
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { send, thread: Some(thread), availability, face_models })
+        Ok(Self { send, thread: Some(thread), availability, face_models, text_search })
     }
 
     /// Which stages can run; `None` while the models are loading.
@@ -337,6 +342,13 @@ impl Engine {
     /// them a second time.
     pub fn face_models(&self) -> Option<Arc<faces::Faces>> {
         self.face_models.lock().unwrap().clone()
+    }
+
+    /// The describe stage's text model (`None` while loading, or without it), for a host to
+    /// search by description ([`ops::text_search`](crate::ops::text_search)) without loading
+    /// it a second time.
+    pub fn text_search(&self) -> Option<Arc<describe::TextSearch>> {
+        self.text_search.lock().unwrap().clone()
     }
 
     /// Takes in a file known to be complete (e.g. a capture just saved) without waiting
@@ -460,6 +472,7 @@ struct Workers {
     /// The describe stage's model loaded.
     describe: bool,
     faces: Option<Arc<faces::Faces>>,
+    text_search: Option<Arc<describe::TextSearch>>,
 }
 
 impl Workers {
@@ -477,6 +490,7 @@ impl Workers {
         });
         let availability = Availability { orient: orientation.is_some(), faces: faces.is_some() };
         let describe = describer.is_some();
+        let text_search = describer.as_ref().map(describe::Describer::text_search);
         let models = Arc::new(Loaded { orientation, faces: faces.clone(), describer });
 
         let (jobs, receive) = mpsc::channel::<Job>();
@@ -496,7 +510,7 @@ impl Workers {
                 }
             });
         }
-        Self { jobs, active, threads, availability, describe, faces }
+        Self { jobs, active, threads, availability, describe, faces, text_search }
     }
 }
 
