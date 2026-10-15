@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 
-use crate::{details, people, review, AppWindow, NavBridge};
+use crate::{actions, details, people, review, AppWindow, NavBridge};
 use archive_core::catalog::faces::FaceId;
 
 /// Sidebar indices of the pages (`AppWindow.page`); 0 is Acquire.
@@ -27,7 +27,7 @@ pub const DETAILS: i32 = 3;
 /// Views kept for Back.
 const HISTORY: usize = 64;
 
-/// An item to show on the Details page (or, later, to act on from a context menu).
+/// An item to show on the Details page, or to act on from the context menu.
 #[derive(Clone)]
 pub struct Target {
     pub path: PathBuf,
@@ -44,7 +44,7 @@ impl Target {
 }
 
 /// The items a view showed when something was opened from it, as filtered and ordered there:
-/// what a "similar in your filter" strip on the Details page draws from. Listing them is
+/// what the "similar in your filter" strip on the Details page draws from. Listing them is
 /// deferred ([`paths`](Self::paths)) since a Review filter can match hundreds of thousands
 /// of files; the view's state is captured when the scope is made, so it doesn't change
 /// with the view afterwards. Catalog asset ids are `Catalog::find_asset` of the paths.
@@ -54,7 +54,7 @@ pub struct Scope {
     pub label: String,
     pub len: usize,
     /// The opened item's position among them, if it is one of them.
-    #[allow(dead_code)] // For the "similar in your filter" strip (not built yet).
+    #[allow(dead_code)] // Not needed by the similar strip (which goes by similarity).
     pub current: Option<usize>,
     items: Rc<dyn Fn() -> Vec<PathBuf>>,
 }
@@ -71,7 +71,6 @@ impl Scope {
     }
 
     /// The items, in the view's order.
-    #[allow(dead_code)] // For the "similar in your filter" strip (not built yet).
     pub fn paths(&self) -> Vec<PathBuf> {
         (self.items)()
     }
@@ -146,11 +145,17 @@ pub fn back(ui: &AppWindow) {
     }
 }
 
-/// Hook for the item context menu (rotate, delete, add tag, properties), which every page
-/// forwards right-clicks on items to with the item resolved. Not implemented yet: a
-/// `PopupWindow` in `app.slint` driven from here, its actions going to the pipeline engine
-/// like the Details page's rotate buttons.
-pub fn context_menu(_ui: &AppWindow, _target: Target) {}
+/// The item context menu (rotate, delete, add tag, properties) for `target`, at the
+/// pointer: every page forwards right-clicks on items here with the item resolved (see
+/// `actions`).
+pub fn context_menu(ui: &AppWindow, target: Target) {
+    actions::show_menu(ui, target);
+}
+
+/// Whether there is a view to go back to.
+pub fn can_go_back(_ui: &AppWindow) -> bool {
+    HISTORY_STACK.with_borrow(|history| !history.is_empty())
+}
 
 /// Pushes the view on screen onto the history.
 fn leave(ui: &AppWindow) {

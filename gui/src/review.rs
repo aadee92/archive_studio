@@ -38,7 +38,7 @@ use archive_core::catalog::{Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
 use crate::nav::{self, Scope, Target};
-use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge, ScrollRestore};
+use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge, ScrollRestore, TagItem};
 
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Entry {
@@ -815,6 +815,8 @@ impl GridModel {
             return;
         }
         let (mut retired, mut fresh, mut replaced) = (Vec::new(), Vec::new(), Vec::new());
+        // A file's tags changed or a tagged file left: the tag list may have lost some.
+        let mut tags_changed = false;
         {
             let (index, by_path) = (self.entries.borrow(), self.by_path.borrow());
             let mut seen = HashSet::new();
@@ -835,25 +837,31 @@ impl GridModel {
                             if !changed && (old.size, old.mtime, &old.tags) == (entry.size, entry.mtime, &entry.tags) {
                                 continue;
                             }
+                            tags_changed |= old.tags != entry.tags;
                             retired.push(id);
                             replaced.push((id, fresh.len()));
                         }
                         fresh.push(entry);
                     }
-                    FileUpdate::Gone(_) => retired.extend(current),
+                    FileUpdate::Gone(_) => {
+                        tags_changed |= current.and_then(|id| index.get(id)).is_some_and(|e| !e.tags.is_empty());
+                        retired.extend(current)
+                    }
                 }
             }
         }
         self.retire(&retired);
-        if fresh.is_empty() {
-            self.publish_status();
-            return;
+        if !fresh.is_empty() {
+            let from = self.entries.borrow().len() as u32;
+            if let Some(&(_, i)) = replaced.iter().find(|(old, _)| self.selected.get() == Some(*old)) {
+                self.selected.set(Some(from + i as u32));
+            }
+            self.append(fresh.into(), true);
         }
-        let from = self.entries.borrow().len() as u32;
-        if let Some(&(_, i)) = replaced.iter().find(|(old, _)| self.selected.get() == Some(*old)) {
-            self.selected.set(Some(from + i as u32));
+        if tags_changed {
+            self.recompute_tags();
         }
-        self.append(fresh.into(), true);
+        self.publish_status();
     }
 
     /// Retires entries: they leave the grid (the rows from the first one on are re-read) and
@@ -1239,8 +1247,18 @@ impl GridModel {
 
     fn publish_tags(&self) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let tags: Vec<SharedString> = self.available_tags.borrow().iter().map(|s| s.as_str().into()).collect();
+        let tags: Vec<TagItem> = self.available_tags.borrow().iter().map(|path| tag_item(path)).collect();
         ui.global::<ReviewBridge>().set_available_tags(ModelRc::new(VecModel::from(tags)));
+    }
+
+    /// Lists the tags of the entries still in the library afresh (tags were taken off,
+    /// renamed, or their files left), republishing them if that changed anything.
+    fn recompute_tags(&self) {
+        let tags: BTreeSet<String> = self.entries.borrow().live_from(0).flat_map(|(_, e)| e.tags.iter().map(|(t, _)| t.clone())).collect();
+        if *self.available_tags.borrow() != tags {
+            *self.available_tags.borrow_mut() = tags;
+            self.publish_tags();
+        }
     }
 }
 
@@ -1292,6 +1310,18 @@ fn ui_kind(kind: MediaKind) -> crate::MediaKind {
         MediaKind::Video => crate::MediaKind::Video,
         MediaKind::Audio => crate::MediaKind::Audio,
     }
+}
+
+/// A tag for the filter list: `People|Alice` is shown as "People / Alice" and filtered by
+/// its path, quoted if it has spaces (so `People|Ann Lee` isn't two terms).
+fn tag_item(path: &str) -> TagItem {
+    let label = path.split('|').map(str::trim).collect::<Vec<_>>().join(" / ");
+    let query = if path.chars().any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '&' | '!')) && !path.contains('"') {
+        format!("\"{path}\"")
+    } else {
+        path.to_owned()
+    };
+    TagItem { label: label.into(), query: query.into() }
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -1615,6 +1645,37 @@ mod tests {
         g.update_files(vec![FileUpdate::Gone("/x/b.png".into()), FileUpdate::Gone("/x/unknown.png".into())]);
         assert_eq!(g.visible.borrow().len(), 1);
         assert_eq!(g.entries.borrow().live(), 1);
+    }
+
+    /// Naming someone in People (or adding a tag) reaches the grid as a file update: the
+    /// tag list follows, shown nicely, and filtering by it finds the file.
+    #[test]
+    fn tag_updates_refresh_the_tag_list_and_filter() {
+        let g = grid(usize::MAX, 4, |_| {});
+        let at = SystemTime::UNIX_EPOCH;
+        let a = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at);
+        let b = Entry::new("/x/b.png".into(), "b.png".into(), MediaKind::Image, 20, at);
+        g.append(vec![a, b].into(), true);
+        assert!(g.available_tags.borrow().is_empty());
+
+        let named = Entry::with_tags("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at, vec![
+            ("People|Ann Lee".to_owned(), Some(TagKind::Person)),
+        ]);
+        g.update_files(vec![present(&named, false)]);
+        assert_eq!(g.available_tags.borrow().iter().collect::<Vec<_>>(), ["People|Ann Lee"]);
+        let item = tag_item("People|Ann Lee");
+        assert_eq!((item.label.as_str(), item.query.as_str()), ("People / Ann Lee", "\"People|Ann Lee\""));
+
+        g.set_query(Query::new(String::new(), item.query.to_string(), 0, Sort::Name));
+        let index = g.entries.borrow();
+        let shown: Vec<&str> = g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.as_str()).collect();
+        assert_eq!(shown, ["a.png"]);
+        drop(index);
+
+        // Un-named again: the tag leaves the list.
+        let unnamed = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at);
+        g.update_files(vec![present(&unnamed, false)]);
+        assert!(g.available_tags.borrow().is_empty());
     }
 
     #[test]

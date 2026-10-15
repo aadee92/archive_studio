@@ -1,0 +1,240 @@
+// The item context menu (Rotate, Delete, Add tag…, Properties) shared by every page, and
+// the dialogs it opens. All of it is driven from Rust (`src/actions.rs`): a page reports a
+// right-click (after storing where the pointer was in `ItemMenu.x` / `y`), Rust resolves
+// the item and bumps `serial`, and the window shows the menu there.
+
+import { Button, LineEdit, ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// One line of the Properties dialog; a heading starts a section.
+export struct PropRow {
+    label: string,
+    value: string,
+    heading: bool,
+}
+
+export global ItemMenu {
+    // Where the pointer was, in window coordinates; set by the page before it reports.
+    in-out property <length> x;
+    in-out property <length> y;
+    // Bumped by Rust to show the menu at (x, y) for the item it resolved.
+    in property <int> serial;
+    in property <bool> can-rotate;
+    // "rotate-left", "rotate-right", "delete", "tag", "properties".
+    callback action(string);
+
+    // Add tag dialog.
+    in property <bool> tag-open;
+    in property <string> tag-for;
+    in property <[string]> tag-matches;
+    in property <string> tag-error;
+    in property <bool> tag-working;
+    callback tag-edited(string);
+    callback tag-submit(string);
+    callback tag-cancel();
+
+    // Properties dialog.
+    in property <bool> props-open;
+    in property <string> props-title;
+    in property <[PropRow]> props;
+    in property <bool> props-loading;
+    callback props-close();
+
+    // A short note at the bottom of the window (what was done, or why not), with an
+    // optional action (e.g. Undo).
+    in property <string> notice;
+    in property <bool> notice-error;
+    in property <string> notice-action;
+    callback notice-clicked();
+}
+
+component Card inherits Rectangle {
+    background: Theme.surface;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #00000030;
+    drop-shadow-offset-y: 6px;
+}
+
+// Add a tag to the item: a name box with matching tags from the catalog under it.
+export component TagDialog inherits Rectangle {
+    background: #0000002a;
+    // The backdrop: clicking it cancels; it keeps clicks off the page below.
+    TouchArea {
+        clicked => { ItemMenu.tag-cancel(); }
+    }
+    init => { edit.focus(); }
+
+    card := Card {
+        width: Math.min(420px, root.width - 40px);
+        height: col.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: Math.max(20px, (root.height - self.height) / 3);
+        TouchArea { }
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    ItemMenu.tag-cancel();
+                    return accept;
+                }
+                reject
+            }
+            col := VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                Text { text: "Add tag"; font-size: 16px; font-weight: 600; color: Theme.text; }
+                Text { text: ItemMenu.tag-for; color: Theme.text-muted; overflow: elide; font-size: 12px; }
+                edit := LineEdit {
+                    placeholder-text: "e.g. Holidays|1998 or People|Alice";
+                    enabled: !ItemMenu.tag-working;
+                    edited(text) => { ItemMenu.tag-edited(text); }
+                    accepted(text) => { ItemMenu.tag-submit(text); }
+                }
+                for tag in ItemMenu.tag-matches: Rectangle {
+                    height: 26px;
+                    border-radius: 4px;
+                    background: match-ta.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        Text { text: tag; vertical-alignment: center; color: Theme.text; font-size: 12px; overflow: elide; }
+                    }
+                    match-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            edit.text = tag;
+                            ItemMenu.tag-edited(tag);
+                            edit.focus();
+                        }
+                    }
+                }
+                if ItemMenu.tag-error != "": Text {
+                    text: ItemMenu.tag-error;
+                    color: Theme.danger;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Cancel";
+                        clicked => { ItemMenu.tag-cancel(); }
+                    }
+                    Button {
+                        text: "Add";
+                        primary: true;
+                        enabled: edit.text != "" && !ItemMenu.tag-working;
+                        clicked => { ItemMenu.tag-submit(edit.text); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Everything known about the item (`archive_core::ops::properties`).
+export component PropertiesDialog inherits Rectangle {
+    background: #0000002a;
+    TouchArea {
+        clicked => { ItemMenu.props-close(); }
+    }
+    init => { keys.focus(); }
+
+    Card {
+        width: Math.min(640px, root.width - 40px);
+        height: Math.min(root.height - 60px, 640px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        TouchArea { }
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    ItemMenu.props-close();
+                    return accept;
+                }
+                reject
+            }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: ItemMenu.props-title;
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+                if ItemMenu.props-loading: Text { text: "Reading…"; color: Theme.text-muted; vertical-stretch: 1; }
+                if !ItemMenu.props-loading: ListView {
+                    vertical-stretch: 1;
+                    for row in ItemMenu.props: HorizontalLayout {
+                        padding-top: row.heading ? 12px : 2px;
+                        padding-bottom: 2px;
+                        padding-right: 12px;
+                        spacing: 12px;
+                        Text {
+                            width: row.heading ? 0px : 130px;
+                            visible: !row.heading;
+                            text: row.label;
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: row.heading ? row.label : row.value;
+                            color: Theme.text;
+                            font-size: row.heading ? 13px : 12px;
+                            font-weight: row.heading ? 600 : 400;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: "Close";
+                        clicked => { ItemMenu.props-close(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The note at the bottom of the window.
+export component Notice inherits Rectangle {
+    height: 36px;
+    width: row.preferred-width;
+    border-radius: 18px;
+    background: ItemMenu.notice-error ? Theme.danger : #1f2328e8;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000030;
+    row := HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 14px;
+        Text {
+            text: ItemMenu.notice;
+            color: white;
+            vertical-alignment: center;
+            font-size: 12px;
+        }
+        if ItemMenu.notice-action != "": Text {
+            text: ItemMenu.notice-action;
+            color: #93c5fd;
+            font-weight: 600;
+            vertical-alignment: center;
+            font-size: 12px;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { ItemMenu.notice-clicked(); }
+            }
+        }
+    }
+}

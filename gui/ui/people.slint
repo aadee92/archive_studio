@@ -1,6 +1,7 @@
 import { ListView, LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { ScrollRestore } from "nav.slint";
+import { ItemMenu } from "menu.slint";
 
 // A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
 export struct PersonItem {
@@ -52,7 +53,7 @@ export global PeopleBridge {
     callback select(int);
     // (row, column); -1 for neither when the click missed every face.
     callback open(int, int);
-    // Right-click on a face. Hook for the item context menu (not implemented yet).
+    // Right-click on a face. Shows the item context menu (`ItemMenu`).
     callback context-menu(int, int);
     callback click(int, int, /* extend */ bool, /* toggle */ bool);
     // A drag starts: `keep` adds to the current selection instead of replacing it.
@@ -383,6 +384,8 @@ export component PeoplePage inherits Rectangle {
 
                         pointer-event(event) => {
                             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                                ItemMenu.y = self.absolute-position.y + self.mouse-y;
                                 PeopleBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                             }
                             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {

@@ -6,9 +6,10 @@ import { PeoplePage, PeopleBridge } from "people.slint";
 import { DetailsPage, DetailsBridge } from "details.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge } from "nav.slint";
+import { ItemMenu, PropRow, TagDialog, PropertiesDialog, Notice } from "menu.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
-export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge }
+export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, ItemMenu, PropRow }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
@@ -23,6 +24,45 @@ export component AppWindow inherits Window {
     min-height: 540px;
     background: Theme.bg;
     default-font-size: Theme.font-size;
+
+    // The item context menu, shown by Rust (`ItemMenu.serial`) where the page was
+    // right-clicked. Never opened by its own right-clicks (`enabled: false`): pages decide
+    // which item, if any, was hit. Behind everything, so it never takes their input.
+    menu-area := ContextMenuArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        enabled: false;
+        Menu {
+            MenuItem {
+                title: "Rotate left";
+                enabled: ItemMenu.can-rotate;
+                activated => { ItemMenu.action("rotate-left"); }
+            }
+            MenuItem {
+                title: "Rotate right";
+                enabled: ItemMenu.can-rotate;
+                activated => { ItemMenu.action("rotate-right"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Add tag…";
+                activated => { ItemMenu.action("tag"); }
+            }
+            MenuItem {
+                title: "Properties";
+                activated => { ItemMenu.action("properties"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Delete";
+                activated => { ItemMenu.action("delete"); }
+            }
+        }
+    }
+    property <int> menu-serial: ItemMenu.serial;
+    changed menu-serial => { menu-area.show({ x: ItemMenu.x, y: ItemMenu.y }); }
 
     HorizontalLayout {
         Sidebar {
@@ -40,5 +80,18 @@ export component AppWindow inherits Window {
             PeoplePage { visible: root.page == 2; }
             DetailsPage { visible: root.page == 3; }
         }
+    }
+
+    if ItemMenu.notice != "": Notice {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - 52px;
+    }
+    if ItemMenu.tag-open: TagDialog {
+        width: root.width;
+        height: root.height;
+    }
+    if ItemMenu.props-open: PropertiesDialog {
+        width: root.width;
+        height: root.height;
     }
 }

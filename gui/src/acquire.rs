@@ -286,3 +286,45 @@ fn apply(ui: &AppWindow, row: usize, update: Update) {
         report_capturing(&tiles);
     }
 }
+
+/// Files changed elsewhere (see `pipeline::changed`): a recent capture that was rotated gets
+/// its thumbnail made again (on a worker), one that left (e.g. to the trash) leaves its strip.
+pub fn files_changed(ui: &AppWindow, rotated: &[PathBuf], gone: &[PathBuf]) {
+    if rotated.is_empty() && gone.is_empty() {
+        return;
+    }
+    let tiles = ui.global::<AcquireBridge>().get_devices();
+    for row in 0..tiles.row_count() {
+        let Some(mut tile) = tiles.row_data(row) else { continue };
+        let paths: Vec<SharedString> = tile.recent_paths.iter().collect();
+        let is = |list: &[PathBuf], p: &SharedString| list.iter().any(|g| g == Path::new(p.as_str()));
+        if paths.iter().any(|p| is(gone, p)) {
+            let images: Vec<Image> = tile.recent.iter().collect();
+            let (images, paths): (Vec<Image>, Vec<SharedString>) =
+                images.into_iter().zip(paths.iter().cloned()).filter(|(_, p)| !is(gone, p)).unzip();
+            tile.recent = ModelRc::new(VecModel::from(images));
+            tile.recent_paths = ModelRc::new(VecModel::from(paths));
+            tiles.set_row_data(row, tile);
+        }
+    }
+    for path in rotated {
+        let (path, weak) = (path.clone(), ui.as_weak());
+        std::thread::spawn(move || {
+            let Some(thumb) = thumbs::small_for_file(&path) else { return };
+            let thumb = Buffer::clone_from_slice(thumb.as_raw(), thumb.width(), thumb.height());
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                let tiles = ui.global::<AcquireBridge>().get_devices();
+                for row in 0..tiles.row_count() {
+                    let Some(mut tile) = tiles.row_data(row) else { continue };
+                    let Some(slot) = tile.recent_paths.iter().position(|p| Path::new(p.as_str()) == path) else { continue };
+                    let mut images: Vec<Image> = tile.recent.iter().collect();
+                    if let Some(image) = images.get_mut(slot) {
+                        *image = Image::from_rgb8(thumb.clone());
+                    }
+                    tile.recent = ModelRc::new(VecModel::from(images));
+                    tiles.set_row_data(row, tile);
+                }
+            });
+        });
+    }
+}

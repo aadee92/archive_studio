@@ -31,7 +31,8 @@ person merge NAME INTO     NAME's faces and tags become INTO's
 person delete NAME         un-name their faces and drop their tag
 sync-people                put missing People| tags on files with named faces
 tags PATH                  the file's tags
-tag PATH [KIND:]TAG        add a tag (KIND: keyword, scene, object, person, place, event)
+tag PATH [KIND:]TAG        add a tag (KIND: keyword, scene, object, person, place, event;
+                           People|NAME is a person)
 untag PATH TAG             remove a tag (a person tag also un-names their faces there)
 props PATH                 everything known about a file
 pair PATH                  the file's front or back
@@ -490,12 +491,7 @@ impl Shell {
         let Some((path, words)) = args.split_first().filter(|(_, w)| !w.is_empty()) else {
             return Err("tag PATH [KIND:]TAG".into());
         };
-        let text = words.join(" ");
-        let (kind, tag) = match text.split_once(':').and_then(|(k, rest)| TagKind::from_name(k).map(|k| (k, rest.trim()))) {
-            Some((kind, tag)) => (kind, tag.to_owned()),
-            None => (TagKind::Keyword, text.clone()),
-        };
-        self.catalog.add_tag_path(self.asset(path)?, &tag, kind).map_err(err)?;
+        ops::add_tag(&self.catalog, self.asset(path)?, &words.join(" ")).map_err(err)?;
         Ok(())
     }
 

@@ -3,6 +3,14 @@ import { Theme } from "theme.slint";
 import { PipelineStatus } from "pipeline.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
 import { ScrollRestore } from "nav.slint";
+import { ItemMenu } from "menu.slint";
+
+// A tag in the filter list: shown as `label` ("People / Alice"), filtered by `query` (the
+// tag path, quoted if it has spaces).
+export struct TagItem {
+    label: string,
+    query: string,
+}
 
 export global ReviewBridge {
     // Virtual model: rows are produced on demand by Rust, only for what is on screen.
@@ -11,7 +19,7 @@ export global ReviewBridge {
     in property <string> status-text;
     in property <bool> indexing;
     in property <bool> empty;
-    in property <[string]> available-tags;
+    in property <[TagItem]> available-tags;
     in-out property <length> tile-size: 160px;
 
     // The filter controls' state, kept here so the view can be snapshotted and restored (Back).
@@ -36,7 +44,7 @@ export global ReviewBridge {
     callback click(int, int);
     // Double-click: opens the tile on the Details page.
     callback open(int, int);
-    // Right-click. Hook for the item context menu (not implemented yet).
+    // Right-click. Shows the item context menu (`ItemMenu`).
     callback context-menu(int, int);
 }
 
@@ -330,7 +338,7 @@ export component ReviewPage inherits Rectangle {
                         ListView {
                             for tag in ReviewBridge.available-tags: Rectangle {
                                 height: 28px;
-                                background: (root.selected-tag == tag || tag-search.text == tag)
+                                background: (root.selected-tag == tag.query || tag-search.text == tag.query)
                                     ? Theme.accent-soft
                                     : tag-ta.has-hover ? Theme.hover : transparent;
 
@@ -339,9 +347,9 @@ export component ReviewPage inherits Rectangle {
                                     padding-right: 10px;
                                     alignment: start;
                                     Text {
-                                        text: tag;
+                                        text: tag.label;
                                         font-size: 12px;
-                                        color: (root.selected-tag == tag || tag-search.text == tag)
+                                        color: (root.selected-tag == tag.query || tag-search.text == tag.query)
                                             ? Theme.accent
                                             : Theme.text;
                                         overflow: elide;
@@ -351,7 +359,7 @@ export component ReviewPage inherits Rectangle {
 
                                 tag-ta := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => { root.select-tag(tag); }
+                                    clicked => { root.select-tag(tag.query); }
                                 }
                             }
                         }
@@ -443,6 +451,8 @@ export component ReviewPage inherits Rectangle {
                         }
                         pointer-event(event) => {
                             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                                ItemMenu.y = self.absolute-position.y + self.mouse-y;
                                 ReviewBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                             }
                         }

@@ -1,6 +1,7 @@
 import { Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { DeviceTile, DeviceState } from "types.slint";
+import { ItemMenu } from "menu.slint";
 
 export global AcquireBridge {
     in property <[DeviceTile]> devices;
@@ -12,7 +13,7 @@ export global AcquireBridge {
     callback start-all();
     // Double-click on a recent capture: (device row, slot in `recent`). Opens Details.
     callback open-recent(int, int);
-    // Right-click on one. Hook for the item context menu (not implemented yet).
+    // Right-click on one. Shows the item context menu (`ItemMenu`).
     callback context-menu(int, int);
 }
 
@@ -104,6 +105,8 @@ component RecentStrip inherits Rectangle {
         pointer-event(event) => {
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down
                 && root.slot-at(self.mouse-x) >= 0) {
+                ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                ItemMenu.y = self.absolute-position.y + self.mouse-y;
                 root.context-menu(root.slot-at(self.mouse-x));
             }
         }

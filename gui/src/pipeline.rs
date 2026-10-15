@@ -9,6 +9,10 @@
 //! what is left ([`pipeline::status`], at most twice a second while busy and once on idle)
 //! and posts the lot to the UI thread as one event-loop callback.
 //!
+//! Changes made in this window (a context-menu rotate, delete or tag, naming faces) are
+//! reported with [`changed`] and go the same way as the engine's reports, so every view
+//! refreshes from one place: the review grid, the Acquire strips and the Details page.
+//!
 //! Captures: the acquire sink calls [`Handle::saved`] for each saved file, so the engine
 //! takes it in at once (no settle delay) and the grid shows it even with no engine here.
 //! While any device is capturing the engine runs in [`Mode::Background`] (one worker), so a
@@ -18,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +32,7 @@ use archive_core::catalog::Catalog;
 use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, Status, FACES, ORIENT};
 
 use crate::review::{self, FileUpdate};
-use crate::{details, people, AppWindow, PipelineBridge};
+use crate::{acquire, details, people, AppWindow, PipelineBridge};
 
 /// A burst of engine events is gathered this long before it is passed on.
 const GATHER: Duration = Duration::from_millis(100);
@@ -46,6 +50,20 @@ enum Note {
     Started(Result<(), String>),
     /// Something changed the counts without an engine event (see [`Handle::recount`]).
     Recount,
+    /// This window changed a file or its catalog data (see [`changed`]).
+    Changed { path: PathBuf, pixels: bool },
+}
+
+/// The window's handle, for [`changed`].
+static HANDLE: OnceLock<Handle> = OnceLock::new();
+
+/// This window changed the file at `path` (`pixels`: rewrote it, e.g. rotated without an
+/// engine) or its catalog data (tags, faces), or moved it away (trash): every view showing
+/// it refreshes, as for the engine's own reports. Any thread.
+pub fn changed(path: &Path, pixels: bool) {
+    if let Some(handle) = HANDLE.get() {
+        let _ = handle.notes.send(Note::Changed { path: path.to_owned(), pixels });
+    }
 }
 
 /// The engine, shareable with device threads and workers. Cheap to clone.
@@ -134,6 +152,7 @@ fn with_host(f: impl FnOnce(&Host)) {
 pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
     let (notes, receive) = mpsc::channel();
     let handle = Handle { engine: Arc::default(), notes };
+    let _ = HANDLE.set(handle.clone());
 
     let (relay_root, weak) = (root.clone(), ui.as_weak());
     let _ = thread::Builder::new().name("pipeline-relay".into()).spawn(move || relay(&relay_root, receive, weak));
@@ -230,9 +249,13 @@ impl Host {
         if let Some(availability) = batch.ready {
             self.availability.set(availability);
         }
+        let gone: Vec<PathBuf> =
+            batch.files.iter().filter_map(|f| if let FileUpdate::Gone(path) = f { Some(path.clone()) } else { None }).collect();
         if !batch.files.is_empty() {
             review::update_files(batch.files);
         }
+        acquire::files_changed(&ui, &batch.rotated, &gone);
+        details::files_gone(&ui, &gone);
         for path in batch.rotated {
             details::file_changed(&ui, &path);
         }
@@ -338,6 +361,15 @@ impl Digest {
             }
             Note::Recount => {
                 self.engine = true;
+                return;
+            }
+            Note::Changed { path, pixels } => {
+                // The counts may move too (a rotation settles orient; trash leaves them).
+                self.engine = true;
+                if pixels && !self.rotated.contains(&path) {
+                    self.rotated.push(path.clone());
+                }
+                *self.files.entry(path).or_insert(false) |= pixels;
                 return;
             }
             Note::Event(event) => event,
@@ -490,12 +522,15 @@ mod tests {
         digest.add(root, Note::Event(Event::Rotated { path: root.join("3.png"), cw: 90, by_user: false }));
         digest.add(root, Note::Event(Event::Updated(root.join("3.png"))));
         digest.add(root, Note::Saved(root.join("scan.png")));
+        digest.add(root, Note::Changed { path: root.join("5.png"), pixels: true });
+        digest.add(root, Note::Changed { path: root.join("6.png"), pixels: false });
         digest.add(root, Note::Event(Event::Busy));
         digest.add(root, Note::Event(Event::Idle));
         assert_eq!(digest.files.len(), 11, "one update per file");
+        assert_eq!((digest.files[&root.join("5.png")], digest.files[&root.join("6.png")]), (true, false));
         assert_eq!(digest.files[&root.join("3.png")], true, "a rotation sticks through later updates");
         assert_eq!(digest.files[&root.join("4.png")], false);
-        assert_eq!(digest.rotated, vec![root.join("3.png")]);
+        assert_eq!(digest.rotated, vec![root.join("3.png"), root.join("5.png")]);
         assert_eq!(digest.busy, Some(false), "the last word counts");
         assert!(digest.engine);
     }

@@ -2,6 +2,7 @@ import { Button, CheckBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge } from "nav.slint";
+import { ItemMenu } from "menu.slint";
 
 // A face found in the shown image: its box as fractions of the (orientation-corrected)
 // image, and who it is, if someone said so.
@@ -11,6 +12,14 @@ export struct DetailFace {
     w: float,
     h: float,
     name: string,
+}
+
+// A highly similar item in the strip under the picture.
+export struct SimilarItem {
+    thumb: image,
+    name: string,
+    // How similar, in percent.
+    score: int,
 }
 
 export global DetailsBridge {
@@ -39,21 +48,32 @@ export global DetailsBridge {
     in property <int> flash-face: -1;
     in property <int> flash-serial;
 
-    // Hooks for later features, filled by Rust but not shown yet:
-    // the view the item was opened from ("similar in your filter" strip; the items
-    // themselves are `details::scope()` on the Rust side) ...
+    // The view the item was opened from, and the items in it most like this one.
     in property <string> scope-label;
     in property <int> scope-count;
-    // ... and the other side of a two-sided photo (`photo-NNNN-front` / `-back`), "" if none,
-    // for a flip button and a side-by-side view.
+    in property <[SimilarItem]> similar;
+
+    // The other side of a two-sided photo (its back, or its front if this is the back),
+    // "" if none; shown next to this one when `side-by-side` is on (kept across items).
     in property <string> other-side;
+    in property <bool> is-back;
+    in-out property <bool> side-by-side;
+    in property <image> other-image;
+    in property <bool> other-ready;
+    in property <[DetailFace]> other-faces;
 
     callback open-external();
     callback accept();
     callback keep();
     callback rotate(int);   // degrees clockwise
-    // Right-click on the picture. Hook for the item context menu (not implemented yet).
-    callback context-menu();
+    // Right-click on the picture (0) or on the other side next to it (1): the item menu.
+    callback context-menu(int);
+    // Show the other side instead.
+    callback flip();
+    callback side-by-side-changed();
+    // The similar item at an index: double-click opens it, right-click its menu.
+    callback open-similar(int);
+    callback similar-menu(int);
 }
 
 // A face's box over the picture, with the person's name under it.
@@ -126,6 +146,146 @@ component IconButton inherits Rectangle {
     }
 }
 
+// A picture fitted in its box, with its faces drawn over it, and (`dog-ear`) a turned-down
+// corner that flips to the other side of the photo.
+component Picture inherits Rectangle {
+    in property <image> source;
+    in property <[DetailFace]> faces;
+    in property <int> flash-face: -1;
+    in property <int> flash-step;
+    in property <bool> dog-ear;
+    callback pressed();
+    // Right-click; the pointer's window position is in `ItemMenu`.
+    callback menu();
+    callback flip();
+    // Double-click.
+    callback open();
+
+    // Where `image-fit: contain` puts the picture: scaled to fit, centered.
+    // Face boxes are placed in these coordinates, so they follow resizes.
+    property <float> aspect: root.source.width / Math.max(1, root.source.height);
+    property <length> shown-width: Math.min(self.width, self.height * self.aspect);
+    property <length> shown-height: self.shown-width / self.aspect;
+    property <length> shown-x: (self.width - self.shown-width) / 2;
+    property <length> shown-y: (self.height - self.shown-height) / 2;
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.source;
+        image-fit: contain;
+    }
+    for face[i] in root.faces: FaceBox {
+        x: root.shown-x + face.x * root.shown-width;
+        y: root.shown-y + face.y * root.shown-height;
+        width: face.w * root.shown-width;
+        height: face.h * root.shown-height;
+        room-below: root.shown-y + root.shown-height - self.y - self.height;
+        name: face.name;
+        show-box: DetailsBridge.show-boxes;
+        show-name: DetailsBridge.show-names;
+        flashing: i == root.flash-face && root.flash-step > 0;
+        lit: i == root.flash-face && Math.mod(root.flash-step, 2) == 0 && root.flash-step > 0;
+    }
+    TouchArea {
+        double-clicked => { root.open(); }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.pressed();
+            }
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                ItemMenu.y = self.absolute-position.y + self.mouse-y;
+                root.menu();
+            }
+        }
+    }
+    // The photo's corner, turned down: there is a back to see.
+    if root.dog-ear: Rectangle {
+        property <length> size: Math.min(44px, Math.min(root.shown-width, root.shown-height) / 4);
+        x: root.shown-x + root.shown-width - self.size;
+        y: root.shown-y + root.shown-height - self.size;
+        width: self.size;
+        height: self.size;
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: @image-url("icons/flip.svg");
+            opacity: ear.has-hover ? 1.0 : 0.85;
+        }
+        ear := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.flip(); }
+        }
+    }
+}
+
+// The items most like this one in the view it was opened from, best first.
+component SimilarStrip inherits VerticalLayout {
+    property <length> tile: 76px;
+    property <length> gap: 8px;
+    property <int> hover: ta.has-hover ? root.index-at(ta.mouse-x) : -1;
+    pure function index-at(x: length) -> int {
+        return x < 0 || Math.mod(x / 1px, (root.tile + root.gap) / 1px) > root.tile / 1px
+            || Math.floor(x / (root.tile + root.gap)) >= DetailsBridge.similar.length
+            ? -1 : Math.floor(x / (root.tile + root.gap));
+    }
+
+    spacing: 6px;
+    Text {
+        text: root.hover >= 0
+            ? "\{DetailsBridge.similar[root.hover].name} · \{DetailsBridge.similar[root.hover].score}% similar"
+            : "Similar in \{DetailsBridge.scope-label}";
+        color: Theme.text-muted;
+        font-size: 12px;
+        overflow: elide;
+    }
+    Rectangle {
+        height: root.tile;
+        clip: true;
+        HorizontalLayout {
+            spacing: root.gap;
+            alignment: start;
+            for item[i] in DetailsBridge.similar: Rectangle {
+                width: root.tile;
+                height: root.tile;
+                border-radius: 6px;
+                background: Theme.well;
+                clip: true;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: item.thumb;
+                    image-fit: cover;
+                }
+                Rectangle {
+                    border-radius: 6px;
+                    border-width: i == root.hover ? 2px : 1px;
+                    border-color: i == root.hover ? Theme.accent : Theme.border;
+                }
+            }
+        }
+        // One TouchArea over the strip: its model is replaced per item shown, which would
+        // recreate per-tile TouchAreas between the clicks of a double-click.
+        ta := TouchArea {
+            mouse-cursor: root.hover >= 0 ? pointer : default;
+            double-clicked => {
+                if (root.index-at(self.mouse-x) >= 0) {
+                    DetailsBridge.open-similar(root.index-at(self.mouse-x));
+                }
+            }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down
+                    && root.index-at(self.mouse-x) >= 0) {
+                    ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                    ItemMenu.y = self.absolute-position.y + self.mouse-y;
+                    DetailsBridge.similar-menu(root.index-at(self.mouse-x));
+                }
+            }
+        }
+    }
+}
+
 // One item, enlarged. Opened by double-clicking an item in Review, a face in People or a
 // recent capture in Acquire; the back arrow (or Esc) returns to that view as it was.
 export component DetailsPage inherits Rectangle {
@@ -182,18 +342,16 @@ export component DetailsPage inherits Rectangle {
                     }
                     Text { text: DetailsBridge.path; color: Theme.text-muted; overflow: elide; }
                 }
-                // Hook: a front / back flip button goes here when `DetailsBridge.other-side`
-                // is set, and a side-by-side toggle next to it.
                 if DetailsBridge.has-item: HorizontalLayout {
                     alignment: center;
                     spacing: 8px;
-                    // Rotating rewrites the file, which the pipeline in this window does.
-                    if DetailsBridge.is-image && PipelineBridge.running: Button {
+                    // Rotating rewrites the file (the pipeline's engine does it if it runs here).
+                    if DetailsBridge.is-image: Button {
                         text: "Rotate left";
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.rotate(270); }
                     }
-                    if DetailsBridge.is-image && PipelineBridge.running: Button {
+                    if DetailsBridge.is-image: Button {
                         text: "Rotate right";
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.rotate(90); }
@@ -205,7 +363,7 @@ export component DetailsPage inherits Rectangle {
                 }
             }
 
-            Rectangle {
+            stage := Rectangle {
                 vertical-stretch: 1;
                 background: Theme.surface;
                 border-radius: Theme.radius;
@@ -213,48 +371,33 @@ export component DetailsPage inherits Rectangle {
                 border-color: Theme.border;
                 clip: true;
 
-                if DetailsBridge.image-ready: Rectangle {
-                    x: 12px;
+                property <bool> pair: DetailsBridge.side-by-side && DetailsBridge.other-ready;
+                // The front goes on the left: this item, unless it is the back.
+                property <bool> this-left: !self.pair || !DetailsBridge.is-back;
+                if DetailsBridge.image-ready: Picture {
+                    x: stage.this-left ? 12px : stage.width / 2 + 6px;
                     y: 12px;
-                    width: parent.width - 24px;
-                    height: parent.height - 24px;
-
-                    // Where `image-fit: contain` puts the picture: scaled to fit, centered.
-                    // Face boxes are placed in these coordinates, so they follow resizes.
-                    property <float> aspect: DetailsBridge.image.width / Math.max(1, DetailsBridge.image.height);
-                    property <length> shown-width: Math.min(self.width, self.height * self.aspect);
-                    property <length> shown-height: self.shown-width / self.aspect;
-                    property <length> shown-x: (self.width - self.shown-width) / 2;
-                    property <length> shown-y: (self.height - self.shown-height) / 2;
-
-                    Image {
-                        width: parent.width;
-                        height: parent.height;
-                        source: DetailsBridge.image;
-                        image-fit: contain;
-                    }
-                    for face[i] in DetailsBridge.faces: FaceBox {
-                        x: parent.shown-x + face.x * parent.shown-width;
-                        y: parent.shown-y + face.y * parent.shown-height;
-                        width: face.w * parent.shown-width;
-                        height: face.h * parent.shown-height;
-                        room-below: parent.shown-y + parent.shown-height - self.y - self.height;
-                        name: face.name;
-                        show-box: DetailsBridge.show-boxes;
-                        show-name: DetailsBridge.show-names;
-                        flashing: i == DetailsBridge.flash-face && root.flash-step > 0;
-                        lit: i == DetailsBridge.flash-face && Math.mod(root.flash-step, 2) == 0 && root.flash-step > 0;
-                    }
-                    TouchArea {
-                        pointer-event(event) => {
-                            if (event.kind == PointerEventKind.down) {
-                                keys.focus();
-                            }
-                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
-                                DetailsBridge.context-menu();
-                            }
-                        }
-                    }
+                    width: stage.pair ? stage.width / 2 - 18px : stage.width - 24px;
+                    height: stage.height - 24px;
+                    source: DetailsBridge.image;
+                    faces: DetailsBridge.faces;
+                    flash-face: DetailsBridge.flash-face;
+                    flash-step: root.flash-step;
+                    dog-ear: DetailsBridge.other-side != "" && !stage.pair;
+                    pressed => { keys.focus(); }
+                    menu => { DetailsBridge.context-menu(0); }
+                    flip => { DetailsBridge.flip(); }
+                }
+                if DetailsBridge.image-ready && stage.pair: Picture {
+                    x: stage.this-left ? stage.width / 2 + 6px : 12px;
+                    y: 12px;
+                    width: stage.width / 2 - 18px;
+                    height: stage.height - 24px;
+                    source: DetailsBridge.other-image;
+                    faces: DetailsBridge.other-faces;
+                    pressed => { keys.focus(); }
+                    menu => { DetailsBridge.context-menu(1); }
+                    open => { DetailsBridge.flip(); }
                 }
                 if !DetailsBridge.image-ready: Text {
                     text: !DetailsBridge.has-item ? "Double-click an item in Review, People or Acquire to see it here"
@@ -263,8 +406,8 @@ export component DetailsPage inherits Rectangle {
                 }
             }
 
-            // Hook: the "similar in your filter" strip goes here, above the bottom bar
-            // (`DetailsBridge.scope-label` / `scope-count`; the items are `details::scope()`).
+            // Highly similar items among those of the view this one was opened from.
+            if DetailsBridge.similar.length > 0: SimilarStrip { }
 
             HorizontalLayout {
                 height: 34px;
@@ -312,6 +455,11 @@ export component DetailsPage inherits Rectangle {
                     text: DetailsBridge.faces.length == 1 ? "1 face" : "\{DetailsBridge.faces.length} faces";
                     color: Theme.text-muted;
                     font-size: 12px;
+                }
+                if DetailsBridge.other-side != "": CheckBox {
+                    text: "Front & back";
+                    checked <=> DetailsBridge.side-by-side;
+                    toggled => { DetailsBridge.side-by-side-changed(); }
                 }
                 if DetailsBridge.is-image: CheckBox {
                     text: "Face boxes";

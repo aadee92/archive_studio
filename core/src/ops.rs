@@ -7,7 +7,8 @@
 //!   does the same on the engine thread.
 //! - [`delete`]: to the library's trash, reversible with [`Catalog::restore`] (see
 //!   [`catalog::trash`](crate::catalog::trash)); a front takes its back with it.
-//! - Tags: [`Catalog::add_tag_path`], [`Catalog::remove_tag_path`]; people:
+//! - Tags: [`add_tag`] for what a user typed (see [`parse_tag`]), [`Catalog::add_tag_path`],
+//!   [`Catalog::remove_tag_path`]; people:
 //!   [`Catalog::name_faces`] and the rest of [`catalog::people`](crate::catalog::people).
 //! - [`properties`]: everything known about the asset, for a properties dialog.
 
@@ -19,7 +20,8 @@ use image::{ImageDecoder, ImageReader};
 use crate::catalog::people::FaceBox;
 use crate::catalog::runs::{RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
-use crate::catalog::{AppliedTag, AssetId, Catalog};
+use crate::catalog::people::PEOPLE;
+use crate::catalog::{AppliedTag, AssetId, Catalog, TagId, TagKind};
 use crate::exif::{self, Exif};
 use crate::media::{classify, MediaKind};
 use crate::pipeline::{self, ORIENT};
@@ -35,6 +37,31 @@ pub fn rotate(catalog: &Catalog, asset: AssetId, cw: u16) -> Result<(), String> 
 /// [`Catalog::trash`]. Undo with [`Catalog::restore`].
 pub fn delete(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<Vec<Trashed>> {
     catalog.trash(asset)
+}
+
+/// What a typed tag means: `kind:path` picks the kind (`place:Home|Kitchen`); a path under
+/// `People|` is a person; anything else is a keyword. The path is returned trimmed.
+pub fn parse_tag(text: &str) -> (TagKind, String) {
+    let text = text.trim();
+    if let Some((kind, rest)) = text.split_once(':').and_then(|(k, rest)| TagKind::from_name(k.trim()).map(|k| (k, rest.trim()))) {
+        return (kind, rest.to_owned());
+    }
+    let first = text.split('|').next().unwrap_or_default().trim();
+    let kind = if first.eq_ignore_ascii_case(PEOPLE) && text.contains('|') { TagKind::Person } else { TagKind::Keyword };
+    (kind, text.to_owned())
+}
+
+/// The user puts the tag they typed on the asset (see [`parse_tag`]); a person is found as
+/// [`Catalog::person`] finds one. Returns the tag.
+pub fn add_tag(catalog: &Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<TagId> {
+    match parse_tag(text) {
+        (TagKind::Person, path) => {
+            let person = catalog.person(&path)?;
+            catalog.add_tag(asset, person, None)?;
+            Ok(person)
+        }
+        (kind, path) => catalog.add_tag_path(asset, &path, kind),
+    }
 }
 
 /// How the asset's rotation stands, from the orient stage.
@@ -134,6 +161,25 @@ fn rotation(stages: &[StageRun]) -> Rotation {
 mod tests {
     use super::*;
     use crate::catalog::{Region, TagKind};
+
+    #[test]
+    fn typed_tags() {
+        assert_eq!(parse_tag(" beach "), (TagKind::Keyword, "beach".to_owned()));
+        assert_eq!(parse_tag("place: Home|Kitchen"), (TagKind::Place, "Home|Kitchen".to_owned()));
+        assert_eq!(parse_tag("people|Alice"), (TagKind::Person, "people|Alice".to_owned()));
+        assert_eq!(parse_tag("People"), (TagKind::Keyword, "People".to_owned()));
+        assert_eq!(parse_tag("12:30"), (TagKind::Keyword, "12:30".to_owned()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let a = cat.asset(&root.join("a.png")).unwrap();
+        let alice = cat.person("Alice").unwrap();
+        assert_eq!(add_tag(&cat, a, "People|Alice").unwrap(), alice);
+        add_tag(&cat, a, "event:Wedding").unwrap();
+        let tags: Vec<_> = cat.tags_of(a).unwrap().into_iter().map(|t| (t.path, t.kind)).collect();
+        assert_eq!(tags, [("People|Alice".to_owned(), TagKind::Person), ("Wedding".to_owned(), TagKind::Event)]);
+    }
 
     #[test]
     fn rotate_tag_inspect_and_delete() {

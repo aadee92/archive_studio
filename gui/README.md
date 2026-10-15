@@ -24,14 +24,15 @@ install -Dm644 ui/icons/app.svg ~/.local/share/icons/hicolor/scalable/apps/archi
 |---|---|
 | `ui/app.slint` | Window: sidebar + page host (pages stay alive when hidden) |
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
-| `ui/review.slint` | Search, kind chips, sort, virtualized thumbnail grid, size slider in the bottom bar |
+| `ui/review.slint` | Search, kind chips, sort, tag list (`People|Ann` shown as "People / Ann"; picking one filters by it), virtualized thumbnail grid, size slider in the bottom bar |
 | `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops: click / Shift / Ctrl / drag to select, name box (with matching names) and Ignore above the list. A person's suggested faces come first, highlighted |
-| `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review, a face in People or a recent capture in Acquire. Back arrow / Esc returns to that view as it was. Face boxes over the picture (placed in displayed-image coordinates) with names under confirmed ones, toggled independently in the bottom bar; a face opened from People pulses 3× over 1.5 s. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes |
-| `ui/nav.slint`, `src/nav.rs` | Navigation: `nav::open(Target)` for every double-click, `nav::go` for the sidebar; both push a snapshot of the view left (Review: filters, selection, scroll anchor; People: person, selected faces, scroll anchor; Details: its item) that `nav::back` restores. A `Target` carries the origin view's `Scope` (its filtered items) for a future "similar" strip; `nav::context_menu` is the (empty) hook every page's right-click reaches |
+| `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review, a face in People or a recent capture in Acquire. Back arrow / Esc returns to that view as it was. Face boxes over the picture (placed in displayed-image coordinates) with names under confirmed ones, toggled independently in the bottom bar; a face opened from People pulses 3× over 1.5 s. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes. A two-sided photo (catalog pair, else `-front` / `-back` names) has a turned-down corner that flips to the other side, and a "Front & back" toggle that shows both, front on the left, each with its faces. Under the picture, "Similar in …": up to 12 highly similar items among those of the view it was opened from (`Catalog::similar` on a worker; hidden if none); double-click opens one (Back returns), right-click gives its menu |
+| `ui/menu.slint`, `src/actions.rs` | The item context menu on every picture (Review tiles, People faces, Acquire's recent strip, Details and its similar strip): Rotate left / right, Add tag… (dialog with matching tags from the catalog; `kind:` prefix or `People|…` pick the kind, `ops::add_tag`), Properties (dialog of `ops::properties`), Delete (to the library trash, with Undo in the notice at the bottom). A window-level `ContextMenuArea` that pages show at the pointer through `nav::context_menu`. Each action runs on a worker and reports what it changed with `pipeline::changed`, which refreshes every view |
+| `ui/nav.slint`, `src/nav.rs` | Navigation: `nav::open(Target)` for every double-click, `nav::go` for the sidebar; both push a snapshot of the view left (Review: filters, selection, scroll anchor; People: person, selected faces, scroll anchor; Details: its item) that `nav::back` restores. A `Target` carries the origin view's `Scope` (its filtered items), which the similar strip draws from; `nav::context_menu` is where every page's right-click goes |
 | `ui/pipeline.slint` | `PipelineStatus`: the pipeline's status line with Pause / Resume (in Review's bottom bar) |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
 | `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
-| `src/people.rs` | Reads people and faces from the catalog on a worker; decodes crops for the rows on screen. Named / ignored faces are masked in place (no reflow until the grid is reloaded) while a writer thread saves them and refreshes the suggestions |
+| `src/people.rs` | Reads people and faces from the catalog on a worker; decodes crops for the rows on screen. Named / ignored faces are masked in place (no reflow until the grid is reloaded) while a writer thread saves them (`Catalog::name_faces`, which tags the pictures `People|<Name>`), reports the pictures changed (so Review shows the tag) and refreshes the suggestions |
 | `src/details.rs` | Decodes the opened item off the UI thread (up to 4096 px), "Open externally"; asks the engine to rotate / accept / keep on a worker, reloads when the file is rotated |
 | `src/pipeline.rs` | Hosts the pipeline `Engine` while the window is open: relay thread (coalesced reports → review-grid updates, status counts), capture priority, status line |
 | `src/review.rs` | Background indexer, `GridModel` (rows sliced on demand, incremental merges while indexing and of pipeline updates), filter thread, batched thumbnail delivery |
@@ -43,7 +44,7 @@ While the window is open it hosts the library's processing pipeline (`archive_co
 see `../ARCHITECTURE.md`): the `Engine` is started for the root on launch (on a thread, with
 `Config::default()`) and dropped after the window closes. One engine per library: if another
 window or the `archive` shell already runs it, this one runs without and its status line says
-"Pipeline running in another window"; rotating is then unavailable here.
+"Pipeline running in another window"; rotating then goes to the core directly.
 
 - **Reports**: the engine's sink only forwards events to a relay thread, which takes each burst
   in one go (~100 ms; thousands of `Updated` during a catch-up become one batch, one entry per
@@ -63,10 +64,16 @@ window or the `archive` shell already runs it, this one runs without and its sta
   selection follows a replaced file. Reports that come in while the indexer is still walking
   are applied when it finishes. The Details page reloads a file that was rotated; People
   re-reads the catalog after the pipeline groups faces, if it is on screen.
+- **Changes made here**: the context menu's rotate / delete / tag and naming faces in People
+  report the files they touched with `pipeline::changed(path, pixels)`, which goes through the
+  same relay: the grid re-reads their tags (the tag list is recomputed when a tag disappears),
+  a trashed file leaves the grid and Acquire's strip (and Details goes back if it showed it),
+  a file rotated without an engine gets fresh thumbnails and is reloaded on Details.
 - **Rotations**: Details shows "Rotate 90°?" with Accept / Keep when orient left one for
   review, and Rotate left / right for any image. The engine rewrites the file on its own
   thread (about a second for a large scan), so these are asked from a worker; an error (e.g.
-  a format that can't be rotated losslessly yet) is shown under the picture.
+  a format that can't be rotated losslessly yet) is shown under the picture. Without an engine
+  here, rotating goes straight to the core (`ops::rotate`); Accept / Keep need the engine.
 
 ## Acquire
 

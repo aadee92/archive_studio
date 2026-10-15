@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <!-- A photo's bottom-right corner turned down: the corner itself is gone (surface colour
+       shows), and the flap shows the back of the photo, with a soft shadow on the picture. -->
+  <defs>
+    <linearGradient id="flap" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3f1ea"/>
+      <stop offset="1" stop-color="#d9d5ca"/>
+    </linearGradient>
+  </defs>
+  <path d="M48 0 L48 48 L0 48 Z" fill="#ffffff"/>
+  <path d="M48 2 L2 48 L-2 48 L48 -2 Z" fill="#00000026"/>
+  <path d="M48 0 L0 48 L4 4 Z" fill="url(#flap)" stroke="#a8a294" stroke-width="1" stroke-linejoin="round"/>
+</svg>

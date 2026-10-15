@@ -475,31 +475,39 @@ fn trim_back(text: &str, pos: usize) -> usize {
     text[..pos].trim_end().len()
 }
 
-/// Extracts all tag paths and kinds from an XMP sidecar document.
+/// Extracts all tag paths and kinds from an XMP sidecar document. A flat keyword or name
+/// (`dc:subject`, `PersonInImage`, a region's name) that is the last level of a
+/// hierarchical one (`Alice` beside `People|Alice`, as these sidecars are written) is the
+/// same tag and isn't listed again; `People|…` paths are people.
 pub fn extract_tags(text: &str) -> Result<Vec<(String, TagKind)>, String> {
     let parsed = parse(text)?;
-    let mut tags = Vec::new();
+    let mut tags: Vec<(String, TagKind)> = Vec::new();
+    let known = |tags: &[(String, TagKind)], name: &str| {
+        tags.iter().any(|(path, _)| path.eq_ignore_ascii_case(name) || path.rsplit('|').next().is_some_and(|leaf| leaf.trim().eq_ignore_ascii_case(name.trim())))
+    };
     if let Some(hierarchical) = parsed.values.get(&(LR, "hierarchicalSubject")) {
         for path in hierarchical {
-            tags.push((path.clone(), TagKind::Keyword));
+            let first = path.split('|').next().unwrap_or_default().trim();
+            let kind = if first.eq_ignore_ascii_case(super::people::PEOPLE) && path.contains('|') { TagKind::Person } else { TagKind::Keyword };
+            tags.push((path.clone(), kind));
         }
     }
     if let Some(subjects) = parsed.values.get(&(DC, "subject")) {
         for s in subjects {
-            if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(s)) {
+            if !known(&tags, s) {
                 tags.push((s.clone(), TagKind::Keyword));
             }
         }
     }
     if let Some(people) = parsed.values.get(&(IPTC_EXT, "PersonInImage")) {
         for p in people {
-            if !tags.iter().any(|(path, _)| path.eq_ignore_ascii_case(p)) {
+            if !known(&tags, p) {
                 tags.push((p.clone(), TagKind::Person));
             }
         }
     }
     for r in &parsed.regions {
-        if !r.name.is_empty() && !tags.iter().any(|(path, _)| path.eq_ignore_ascii_case(&r.name)) {
+        if !r.name.is_empty() && !known(&tags, &r.name) {
             tags.push((r.name.clone(), TagKind::Person));
         }
     }
@@ -698,5 +706,14 @@ mod tests {
         assert!(paths.contains(&"format"));
         assert!(paths.contains(&"Tom & Jerry"));
         assert!(paths.contains(&"Carol"));
+    }
+
+    #[test]
+    fn person_tags_are_not_listed_twice() {
+        let ann = tag("People|Ann Lee", TagKind::Person);
+        let Ok(Outcome::Write(text)) = merge(Some(DARKTABLE), &[ann], None, &[]) else { panic!("written") };
+        assert!(text.contains("<rdf:li>Ann Lee</rdf:li>"), "the name is written flat too");
+        let tags: Vec<_> = extract_tags(&text).unwrap().into_iter().filter(|(p, _)| p.contains("Ann")).collect();
+        assert_eq!(tags, [("People|Ann Lee".to_owned(), TagKind::Person)]);
     }
 }

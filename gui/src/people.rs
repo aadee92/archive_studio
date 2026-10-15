@@ -7,8 +7,10 @@
 //!
 //! Naming or ignoring faces doesn't reorder the grid: the faces stay where they are, masked
 //! with the name, until the grid is reloaded (another person picked, the page shown again).
-//! The catalog is written by a writer thread, which then refreshes the suggestions, so
-//! faces like the ones just named are listed under that person on the next load.
+//! The catalog is written by a writer thread (`Catalog::name_faces`, which also tags the
+//! pictures `People|<Name>`), which then reports the pictures to `pipeline::changed` so
+//! Review shows their new tags, and refreshes the suggestions, so faces like the ones just
+//! named are listed under that person on the next load.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -24,14 +26,13 @@ use crate::nav::{self, Scope, Target};
 use crate::thumbs::Pixels;
 use crate::{AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
 use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, DEFAULT_MIN_SIMILARITY};
+use archive_core::catalog::people::{display_name, person_path};
 use archive_core::catalog::{Catalog, TagId, TagKind};
 
 /// `PersonItem.key` of the faces nobody has named.
 const UNKNOWN: i32 = -1;
 /// Decoded crops kept; ~75 KB each at the stored 160 px.
 const CROP_CACHE: usize = 3000;
-/// Where a typed name without a `|` goes.
-const PEOPLE: &str = "People";
 /// Names offered under the name box.
 const MATCHES: usize = 6;
 /// The writer waits this long for more changes before refreshing the suggestions.
@@ -75,9 +76,10 @@ struct People {
 }
 
 /// A change for the writer thread.
+/// `paths`: the pictures of `faces`, whose tags change with them.
 enum Change {
-    Name { change: u64, faces: Vec<FaceId>, path: String },
-    Ignore { change: u64, faces: Vec<FaceId> },
+    Name { change: u64, faces: Vec<FaceId>, paths: Vec<PathBuf>, path: String },
+    Ignore { change: u64, faces: Vec<FaceId>, paths: Vec<PathBuf> },
 }
 
 /// The face grid: `faces` cut into rows of `columns`.
@@ -458,22 +460,20 @@ impl FaceGrid {
         ui.global::<PeopleBridge>().set_name_matches(ModelRc::new(VecModel::from(offered)));
     }
 
-    /// The person tag `name` means, and its label: an existing person by name or path, or
-    /// a new one under `People|`.
+    /// The person tag `name` means, and its label: an existing person by path or name (the
+    /// one picked from the matches), or a new one (`Catalog::person` decides for good when
+    /// the writer names the faces).
     fn resolve(&self, name: &str) -> Option<(String, String)> {
         let name = name.trim();
-        if name.is_empty() || name.split('|').any(|s| s.trim().is_empty()) {
-            return None;
-        }
+        let path = person_path(name).ok()?;
         let names = self.names.borrow();
         let known = names
             .iter()
-            .find(|n| n.path.eq_ignore_ascii_case(name))
+            .find(|n| n.path.eq_ignore_ascii_case(name) || n.path.eq_ignore_ascii_case(&path))
             .or_else(|| names.iter().find(|n| n.display.to_lowercase() == name.to_lowercase()));
         Some(match known {
             Some(n) => (n.path.clone(), n.display.clone()),
-            None if name.contains('|') => (name.to_owned(), display_name(name).to_owned()),
-            None => (format!("{PEOPLE}|{name}"), name.to_owned()),
+            None => (path.clone(), display_name(&path).to_owned()),
         })
     }
 
@@ -483,42 +483,44 @@ impl FaceGrid {
             // So the next selection is offered this name before the writer reports back.
             self.names.borrow_mut().push(Name { display: label.clone(), path: path.clone() });
         }
-        if let Some((change, faces)) = self.mask_selection(label.into(), false) {
-            let _ = self.writer.send(Change::Name { change, faces, path });
+        if let Some((change, faces, paths)) = self.mask_selection(label.into(), false) {
+            let _ = self.writer.send(Change::Name { change, faces, paths, path });
         }
     }
 
     fn ignore(&self) {
-        if let Some((change, faces)) = self.mask_selection("Ignored".into(), true) {
-            let _ = self.writer.send(Change::Ignore { change, faces });
+        if let Some((change, faces, paths)) = self.mask_selection("Ignored".into(), true) {
+            let _ = self.writer.send(Change::Ignore { change, faces, paths });
         }
     }
 
-    /// Masks the selected faces with `label` and deselects them; returns the change number
-    /// and the faces.
-    fn mask_selection(&self, label: SharedString, ignored: bool) -> Option<(u64, Vec<FaceId>)> {
+    /// Masks the selected faces with `label` and deselects them; returns the change number,
+    /// the faces and their pictures.
+    fn mask_selection(&self, label: SharedString, ignored: bool) -> Option<(u64, Vec<FaceId>, Vec<PathBuf>)> {
         let selection = std::mem::take(&mut *self.selection.borrow_mut());
         if selection.is_empty() {
             return None;
         }
         let change = self.changes.get() + 1;
         self.changes.set(change);
-        let ids = {
+        let (ids, mut paths): (Vec<FaceId>, Vec<PathBuf>) = {
             let mut faces = self.faces.borrow_mut();
             selection
                 .iter()
                 .map(|&i| {
                     faces[i].mask = Some(Mask { label: label.clone(), ignored, change });
-                    faces[i].id
+                    (faces[i].id, faces[i].path.clone())
                 })
-                .collect()
+                .unzip()
         };
+        paths.sort();
+        paths.dedup();
         let columns = self.columns.get();
         for row in selection.iter().map(|i| i / columns).collect::<BTreeSet<_>>() {
             self.notify.row_changed(row);
         }
         self.publish_status();
-        Some((change, ids))
+        Some((change, ids, paths))
     }
 
     /// The writer applied `change`, or failed to: then its masks come off.
@@ -643,14 +645,18 @@ fn change_id(change: &Change) -> u64 {
     }
 }
 
+/// Applies `change`; once saved, its pictures are reported changed (their person tags).
 fn apply(catalog: &mut Catalog, change: Change) -> (u64, Result<People, String>) {
     let id = change_id(&change);
-    let result = match change {
-        Change::Name { faces, path, .. } => {
-            catalog.tag(&path, TagKind::Person).and_then(|tag| catalog.confirm_faces(&faces, tag))
-        }
-        Change::Ignore { faces, .. } => catalog.ignore_faces(&faces),
+    let (result, paths) = match change {
+        Change::Name { faces, path, paths, .. } => (catalog.name_faces(&faces, &path).map(|_| ()), paths),
+        Change::Ignore { faces, paths, .. } => (catalog.ignore_faces(&faces), paths),
     };
+    if result.is_ok() {
+        for path in &paths {
+            crate::pipeline::changed(path, false);
+        }
+    }
     (id, result.map_err(|e| e.to_string()).and_then(|()| read_people(catalog)))
 }
 
@@ -663,11 +669,6 @@ fn refresh(catalog: &mut Catalog, ui: &slint::Weak<AppWindow>) {
     if let Ok(people) = read_people(catalog) {
         let _ = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.show_people(people)));
     }
-}
-
-/// The last level of a tag path: "People|Alice" -> "Alice".
-fn display_name(path: &str) -> &str {
-    path.rsplit('|').next().unwrap_or(path).trim()
 }
 
 fn file_name(path: &Path) -> SharedString {

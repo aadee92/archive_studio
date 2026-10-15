@@ -6,8 +6,11 @@
 //!   file under the working directory.
 //!
 //! While the window is open it hosts the library's processing pipeline (`pipeline.rs`).
+//! Every item can be opened on the Details page (`details.rs`, via `nav.rs`) and has a
+//! context menu (`actions.rs`).
 
 mod acquire;
+mod actions;
 mod details;
 mod nav;
 mod people;
@@ -36,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nav::install(&ui);
     let pipeline = pipeline::install(&ui, root.clone());
     let _acquire = acquire::install(&ui, &root, pipeline.clone());
+    actions::install(&ui, root.clone(), pipeline.clone());
     details::install(&ui, root.clone(), pipeline);
     people::install(&ui, root.clone());
     review::install(&ui, root);
