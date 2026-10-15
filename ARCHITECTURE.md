@@ -16,8 +16,8 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag, properties). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), find by description |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties). `exif`: basic EXIF fields |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag), front/back (pair, unpair, swap-sides), find by description |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -104,7 +104,13 @@ XMP sidecar sync.
 - **Front/back pairs** (`pairs`): `asset_pairs(front, back)`. Filled by naming when an asset
   is first seen (`X-back.*` / `X_back` / `X back` with `X-front.*` or `X.*` in the same
   directory, as the V850 / photo-duplex writes `photo-NNNN-front.png` / `-back.png`), or by
-  hand (`set_pair`). `back_of` / `front_of`.
+  hand (`set_pair`, `unpair`). `back_of` / `front_of`. Front ends go through `ops::pair`
+  (both images, not trashed, not the same; old pairs of either are replaced; returns every
+  asset whose other side changed, to refresh), `ops::unpair` and `ops::swap_sides`.
+- **Untagging** (`ops::remove_tag`): what the user typed, matched against the asset's own
+  tags (ignoring case; `kind:path` restricts the kind; a bare name can be a person). A
+  person tag taken off un-names that person's faces on the asset rather than being refused:
+  the tag is what says they are in the picture (`Catalog::remove_tag`).
 - **Trash** (`trash`): deleting moves the file and sidecar to
   `.archive-studio/trash/<when>-<id>/<path>` and the asset row with it (kept, marked
   trashed and missing, out of searches). `restore` undoes it; `empty_trash` deletes for good.

@@ -7,7 +7,10 @@
 //! stem ending in `-back` / `_back` / ` back` (in any case) goes with the file whose stem is
 //! the same base ending in `-front` / `_front` / ` front`, or the bare base, whatever the
 //! extensions. The user can pair or unpair by hand ([`Catalog::set_pair`],
-//! [`Catalog::unpair`]). Each front has at most one back and the other way round.
+//! [`Catalog::unpair`]; front ends go through [`ops::pair`](crate::ops::pair),
+//! [`ops::unpair`](crate::ops::unpair) and [`ops::swap_sides`](crate::ops::swap_sides), which
+//! check what is paired and say what changed). Each front has at most one back and the
+//! other way round.
 
 use rusqlite::{params, Connection, OptionalExtension};
 

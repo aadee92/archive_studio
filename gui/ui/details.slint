@@ -1,8 +1,8 @@
-import { Button, CheckBox, LineEdit } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
-import { ItemMenu } from "menu.slint";
+import { ItemMenu, PropRow } from "menu.slint";
 
 // A face found in the shown image: its box as fractions of the (orientation-corrected)
 // image, and who it is, if someone said so.
@@ -22,6 +22,15 @@ export struct SimilarItem {
     name: string,
     // How similar, in percent.
     score: int,
+}
+
+// A line of the info panel's tags: a kind's heading, or a tag on the item, with how to
+// take it off (`key`: `kind:path`) and who proposed it ("clip 62%"; "" for the user).
+export struct InfoTag {
+    heading: bool,
+    label: string,
+    key: string,
+    note: string,
 }
 
 // An item of the view the shown one was opened from, in the filmstrip above the picture.
@@ -104,6 +113,25 @@ export global DetailsBridge {
     in property <image> other-image;
     in property <bool> other-ready;
     in property <[DetailFace]> other-faces;
+
+    // The info panel beside the picture (kept open across items): facts about the file and
+    // its tags by kind; `info-toggled` after `info-open` changed.
+    in-out property <bool> info-open;
+    in property <bool> info-loading;
+    in property <[PropRow]> info-rows;
+    in property <[InfoTag]> info-tags;
+    // Its tag box: the catalog's tags matching what is typed (`info-tag-edited`), why the
+    // last one couldn't be added or removed, a change in flight, and `info-tag-serial`
+    // bumped once a tag was added (the box empties).
+    in property <[string]> info-tag-matches;
+    in property <string> info-tag-error;
+    in property <bool> info-tag-working;
+    in property <int> info-tag-serial;
+    callback info-toggled();
+    // Take the tag `kind:path` off the item (a person: their faces on it become unknown).
+    callback remove-tag(string);
+    callback info-tag-edited(string);
+    callback info-tag-submit(string);
 
     callback open-external();
     callback accept();
@@ -517,6 +545,143 @@ component LinkButton inherits Rectangle {
     }
 }
 
+// Beside the picture: the file (name, path with Copy, dates, its own dimensions, size, kind)
+// and its tags by kind, each with an × to take it off, and a box to add one.
+component InfoPanel inherits Rectangle {
+    // Esc in the tag box: the keys go back to the page.
+    callback done();
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    property <int> serial: DetailsBridge.info-tag-serial;
+    changed serial => { tag-edit.text = ""; }
+
+    ScrollView {
+        VerticalLayout {
+            padding: 14px;
+            spacing: 6px;
+            Text {
+                text: DetailsBridge.name;
+                font-size: 14px;
+                font-weight: 600;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            // Selectable, so it can be copied (Copy, or select and Ctrl+C).
+            path-text := TextInput {
+                text: DetailsBridge.path;
+                read-only: true;
+                wrap: word-wrap;
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+            HorizontalLayout {
+                alignment: start;
+                LinkButton {
+                    text: "Copy path";
+                    clicked => {
+                        path-text.select-all();
+                        path-text.copy();
+                        path-text.clear-selection();
+                        UiLog.debug("details.info", "path copied");
+                    }
+                }
+            }
+            for row in DetailsBridge.info-rows: HorizontalLayout {
+                spacing: 8px;
+                Text { width: 76px; text: row.label; color: Theme.text-muted; font-size: 12px; }
+                Text { horizontal-stretch: 1; text: row.value; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+            }
+            Rectangle { height: 6px; }
+            Text { text: "Tags"; font-size: 13px; font-weight: 600; color: Theme.text; }
+            if DetailsBridge.info-tags.length == 0 && !DetailsBridge.info-loading: Text {
+                text: "No tags";
+                color: Theme.text-muted;
+                font-size: 12px;
+            }
+            for tag in DetailsBridge.info-tags: HorizontalLayout {
+                padding-top: tag.heading ? 6px : 0px;
+                spacing: 6px;
+                height: tag.heading ? 22px : 24px;
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    text: tag.label;
+                    color: tag.heading ? Theme.text-muted : Theme.text;
+                    font-size: tag.heading ? 11px : 12px;
+                    font-weight: tag.heading ? 600 : 400;
+                    overflow: elide;
+                }
+                if !tag.heading && tag.note != "": Text {
+                    vertical-alignment: center;
+                    text: tag.note;
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                }
+                if !tag.heading: Rectangle {
+                    width: 22px;
+                    border-radius: 4px;
+                    background: x-ta.has-hover ? Theme.hover : transparent;
+                    Text {
+                        text: "×";
+                        font-size: 14px;
+                        color: x-ta.has-hover ? Theme.danger : Theme.text-muted;
+                    }
+                    x-ta := TouchArea {
+                        enabled: !DetailsBridge.info-tag-working;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            UiLog.debug("details.info", "remove tag \{tag.key}");
+                            DetailsBridge.remove-tag(tag.key);
+                        }
+                    }
+                }
+            }
+            FocusScope {
+                height: tag-edit.preferred-height;
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        tag-edit.text = "";
+                        DetailsBridge.info-tag-edited("");
+                        root.done();
+                        return accept;
+                    }
+                    reject
+                }
+                tag-edit := LineEdit {
+                    placeholder-text: "Add tag…";
+                    enabled: !DetailsBridge.info-tag-working;
+                    edited(text) => { DetailsBridge.info-tag-edited(text); }
+                    accepted(text) => { DetailsBridge.info-tag-submit(text); }
+                }
+            }
+            for tag in DetailsBridge.info-tag-matches: Rectangle {
+                height: 24px;
+                border-radius: 4px;
+                background: match-ta.has-hover ? Theme.hover : transparent;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    Text { text: tag; vertical-alignment: center; color: Theme.text; font-size: 12px; overflow: elide; }
+                }
+                match-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { DetailsBridge.info-tag-submit(tag); }
+                }
+            }
+            if DetailsBridge.info-tag-error != "": Text {
+                text: DetailsBridge.info-tag-error;
+                color: Theme.danger;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
 // Naming the face `DetailsBridge.editing`, next to its box: a name box with the people whose
 // names match under it (Enter or a click assigns, Esc closes), and the other things to say
 // about the face.
@@ -882,6 +1047,12 @@ export component DetailsPage inherits Rectangle {
                 NavBridge.back();
                 return accept;
             }
+            // I shows or hides the info panel.
+            if (DetailsBridge.has-item && (event.text == "i" || event.text == "I") && !event.modifiers.alt && !event.modifiers.control) {
+                DetailsBridge.info-open = !DetailsBridge.info-open;
+                DetailsBridge.info-toggled();
+                return accept;
+            }
             // Zoom: + / - around the center, 0 fits, 1 shows the file's pixels 1:1.
             if (DetailsBridge.image-ready && !event.modifiers.alt) {
                 if (event.text == "+" || event.text == "=") {
@@ -978,8 +1149,11 @@ export component DetailsPage inherits Rectangle {
             // The items of the view this one was opened from, around it.
             if DetailsBridge.has-item && DetailsBridge.scope-count > 1: FilmStrip { }
 
+            HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 12px;
             stage := Rectangle {
-                vertical-stretch: 1;
+                horizontal-stretch: 1;
                 background: Theme.surface;
                 border-radius: Theme.radius;
                 border-width: 1px;
@@ -1046,6 +1220,11 @@ export component DetailsPage inherits Rectangle {
                         : DetailsBridge.loading ? "Loading…" : "No preview for this file";
                     color: Theme.text-muted;
                 }
+            }
+            if DetailsBridge.has-item && DetailsBridge.info-open: InfoPanel {
+                width: 280px;
+                done => { keys.focus(); }
+            }
             }
 
             // Highly similar items among those of the view this one was opened from.
@@ -1133,6 +1312,11 @@ export component DetailsPage inherits Rectangle {
                     text: "Names";
                     enabled: DetailsBridge.faces.length > 0;
                     checked <=> DetailsBridge.show-names;
+                }
+                if DetailsBridge.has-item: CheckBox {
+                    text: "Info";
+                    checked <=> DetailsBridge.info-open;
+                    toggled => { DetailsBridge.info-toggled(); }
                 }
             }
         }

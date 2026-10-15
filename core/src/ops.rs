@@ -7,9 +7,14 @@
 //!   does the same on the engine thread.
 //! - [`delete`]: to the library's trash, reversible with [`Catalog::restore`] (see
 //!   [`catalog::trash`](crate::catalog::trash)); a front takes its back with it.
-//! - Tags: [`add_tag`] for what a user typed (see [`parse_tag`]), [`Catalog::add_tag_path`],
-//!   [`Catalog::remove_tag_path`]; people:
+//! - Tags: [`add_tag`] and [`remove_tag`] for what a user typed (see [`parse_tag`]),
+//!   [`Catalog::add_tag_path`], [`Catalog::remove_tag_path`]; people:
 //!   [`Catalog::name_faces`] and the rest of [`catalog::people`](crate::catalog::people).
+//!   Taking a person tag off a picture un-names that person's faces on it (they go back to
+//!   the unknown faces), rather than being refused: the tag is what says they are there.
+//! - Front and back: [`pair`] a back scan with its front by hand, [`unpair`],
+//!   [`swap_sides`] when they were paired the wrong way round (see
+//!   [`catalog::pairs`](crate::catalog::pairs)).
 //! - Faces on one picture: [`add_face`] for one the detector missed (boxed by the user);
 //!   [`Catalog::not_person`], [`Catalog::ignore_faces`] and [`Catalog::delete_faces`] for the
 //!   ones there.
@@ -24,7 +29,7 @@ use crate::catalog::faces::{self as catalog_faces, FaceId};
 use crate::catalog::people::FaceBox;
 use crate::catalog::runs::{RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
-use crate::catalog::people::PEOPLE;
+use crate::catalog::people::{display_name, PEOPLE};
 use crate::catalog::{AppliedTag, AssetId, Catalog, Region, TagId, TagKind};
 use crate::exif::{self, Exif};
 use crate::media::{classify, MediaKind};
@@ -81,6 +86,112 @@ fn add_parsed_tag(catalog: &Catalog, asset: AssetId, parsed: (TagKind, String)) 
         }
         (kind, path) => catalog.add_tag_path(asset, &path, kind),
     }
+}
+
+/// The user takes the tag they typed off the asset: matched against the asset's own tags
+/// ignoring case and spaces around `|`, of the kind given if typed as `kind:path` (see
+/// [`parse_tag`]); a bare name with no tag of that path is a person by that name
+/// (`Alice` → `People|Alice`). See [`Catalog::remove_tag`]: a tag a detector proposed is
+/// remembered as rejected, and taking a person tag off un-names that person's faces on the
+/// asset. Returns false (changing nothing) if no such tag is on it.
+pub fn remove_tag(catalog: &mut Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<bool> {
+    let result = remove_typed_tag(catalog, asset, text);
+    match &result {
+        Ok(removed) => log::debug!("remove_tag {text:?} from asset {}: removed {removed}", asset.0),
+        Err(e) => log::warn!("remove_tag {text:?} from asset {}: {e}", asset.0),
+    }
+    result
+}
+
+fn remove_typed_tag(catalog: &mut Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<bool> {
+    let explicit = text.split_once(':').is_some_and(|(k, _)| TagKind::from_name(k.trim()).is_some());
+    let (kind, path) = parse_tag(text);
+    let same = |a: &str, b: &str| {
+        let (mut a, mut b) = (a.split('|').map(str::trim), b.split('|').map(str::trim));
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return true,
+                (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => {}
+                _ => return false,
+            }
+        }
+    };
+    let tags = catalog.tags_of(asset)?;
+    let found = tags.iter().find(|t| same(&t.path, &path) && (!explicit || t.kind == kind)).or_else(|| {
+        let bare = !explicit && !path.contains('|');
+        tags.iter().find(|t| bare && t.kind == TagKind::Person && display_name(&t.path).eq_ignore_ascii_case(&path))
+    });
+    let Some(tag) = found.map(|t| t.tag) else { return Ok(false) };
+    catalog.remove_tag(asset, tag)?;
+    Ok(true)
+}
+
+/// The user pairs `back` (a scan of a photo's back) with `front`: both images in the
+/// library, not in the trash, and not the same. A pairing either had is replaced (see
+/// [`Catalog::set_pair`]). Returns the assets whose other side changed: the two, and
+/// whatever they were paired with before.
+pub fn pair(catalog: &mut Catalog, front: AssetId, back: AssetId) -> crate::catalog::Result<Vec<AssetId>> {
+    let result = pair_checked(catalog, front, back);
+    match &result {
+        Ok(changed) => log::debug!("pair front {} back {}: changed {changed:?}", front.0, back.0),
+        Err(e) => log::warn!("pair front {} back {}: {e}", front.0, back.0),
+    }
+    result
+}
+
+fn pair_checked(catalog: &mut Catalog, front: AssetId, back: AssetId) -> crate::catalog::Result<Vec<AssetId>> {
+    use crate::catalog::Error;
+    if front == back {
+        return Err(Error::Invalid("a photo can't be its own back".into()));
+    }
+    for asset in [front, back] {
+        let path = catalog.asset_path(asset)?;
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        if classify(&path) != Some(MediaKind::Image) {
+            return Err(Error::Invalid(format!("{name} isn't an image")));
+        }
+        if catalog.is_trashed(asset)? {
+            return Err(Error::Invalid(format!("{name} is in the trash")));
+        }
+    }
+    let mut changed = vec![front, back];
+    for asset in [front, back] {
+        for other in [catalog.back_of(asset)?, catalog.front_of(asset)?].into_iter().flatten() {
+            if !changed.contains(&other) {
+                changed.push(other);
+            }
+        }
+    }
+    catalog.set_pair(front, back)?;
+    Ok(changed)
+}
+
+/// Takes the asset (a front or a back) out of its pair. Returns the other side it had,
+/// `None` if it had none.
+pub fn unpair(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<Option<AssetId>> {
+    let result = (|| {
+        let other = catalog.back_of(asset)?.or(catalog.front_of(asset)?);
+        if other.is_some() {
+            catalog.unpair(asset)?;
+        }
+        Ok(other)
+    })();
+    crate::catalog::logged(format_args!("unpair asset {}", asset.0), result)
+}
+
+/// The asset's pair was the wrong way round: its front becomes the back and the other way
+/// round. Returns the new `(front, back)`; an error if the asset isn't paired.
+pub fn swap_sides(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<(AssetId, AssetId)> {
+    let result = (|| {
+        let (front, back) = match (catalog.back_of(asset)?, catalog.front_of(asset)?) {
+            (Some(back), _) => (asset, back),
+            (_, Some(front)) => (front, asset),
+            _ => return Err(crate::catalog::Error::Invalid("it has no other side to swap with".into())),
+        };
+        catalog.set_pair(back, front)?;
+        Ok((back, front))
+    })();
+    crate::catalog::logged(format_args!("swap_sides asset {}", asset.0), result)
 }
 
 /// The user boxed a face the detector missed at `region` of the asset's image (fractions of
@@ -223,6 +334,65 @@ mod tests {
         add_tag(&cat, a, "event:Wedding").unwrap();
         let tags: Vec<_> = cat.tags_of(a).unwrap().into_iter().map(|t| (t.path, t.kind)).collect();
         assert_eq!(tags, [("People|Alice".to_owned(), TagKind::Person), ("Wedding".to_owned(), TagKind::Event)]);
+    }
+
+    #[test]
+    fn removing_a_typed_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        image::RgbImage::from_pixel(40, 20, image::Rgb([200, 150, 120])).save(root.join("a.png")).unwrap();
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let a = cat.asset(&root.join("a.png")).unwrap();
+        add_tag(&cat, a, "Holidays|1998").unwrap();
+        add_tag(&cat, a, "place:Home").unwrap();
+        let face = add_face(&mut cat, a, Region { x: 0.5, y: 0.0, w: 0.25, h: 0.5 }, None).unwrap();
+        cat.name_faces(&[face], "Alice").unwrap();
+        let paths = |cat: &Catalog| cat.tags_of(a).unwrap().into_iter().map(|t| t.path).collect::<Vec<_>>();
+        assert_eq!(paths(&cat), ["Holidays|1998", "Home", "People|Alice"]);
+
+        assert!(!remove_tag(&mut cat, a, "Holidays").unwrap(), "only the tag itself");
+        assert!(!remove_tag(&mut cat, a, "event:Home").unwrap(), "of the kind typed");
+        assert!(remove_tag(&mut cat, a, " holidays | 1998 ").unwrap());
+        assert!(remove_tag(&mut cat, a, "place:home").unwrap());
+        assert!(!remove_tag(&mut cat, a, "home").unwrap(), "already off");
+        // A person by name: their face on it goes back to unknown.
+        assert!(remove_tag(&mut cat, a, "alice").unwrap());
+        assert!(paths(&cat).is_empty());
+        let boxes = cat.face_boxes(a).unwrap();
+        assert_eq!((boxes.len(), boxes[0].person.is_none()), (1, true));
+    }
+
+    #[test]
+    fn pairing_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["photo-0001-front.png", "photo-0001-back.png", "x.png", "y.png"] {
+            image::RgbImage::new(4, 4).save(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("clip.mp4"), b"").unwrap();
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let [f1, b1, x, y, clip] =
+            ["photo-0001-front.png", "photo-0001-back.png", "x.png", "y.png", "clip.mp4"].map(|n| cat.asset(&root.join(n)).unwrap());
+        assert_eq!(cat.back_of(f1).unwrap(), Some(b1), "paired by name");
+
+        assert!(pair(&mut cat, x, x).is_err());
+        assert!(pair(&mut cat, x, clip).is_err(), "not an image");
+        assert_eq!(pair(&mut cat, x, y).unwrap(), [x, y]);
+        assert_eq!((cat.back_of(x).unwrap(), cat.front_of(y).unwrap()), (Some(y), Some(x)));
+        // Re-pairing replaces both old pairs, and says who lost their other side.
+        assert_eq!(pair(&mut cat, f1, y).unwrap(), [f1, y, b1, x]);
+        assert_eq!((cat.back_of(f1).unwrap(), cat.front_of(b1).unwrap(), cat.back_of(x).unwrap()), (Some(y), None, None));
+
+        assert_eq!(swap_sides(&mut cat, y).unwrap(), (y, f1));
+        assert_eq!((cat.back_of(y).unwrap(), cat.front_of(f1).unwrap()), (Some(f1), Some(y)));
+        assert!(swap_sides(&mut cat, x).is_err(), "not paired");
+
+        assert_eq!(unpair(&mut cat, f1).unwrap(), Some(y));
+        assert_eq!(unpair(&mut cat, f1).unwrap(), None);
+        assert_eq!(cat.back_of(y).unwrap(), None);
+
+        delete(&mut cat, x).unwrap();
+        assert!(pair(&mut cat, x, b1).is_err(), "in the trash");
     }
 
     #[test]

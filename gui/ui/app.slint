@@ -51,6 +51,28 @@ export component AppWindow inherits Window {
                 title: "Add tag…";
                 activated => { ItemMenu.action("tag"); }
             }
+            Menu {
+                title: "Front & back";
+                MenuItem {
+                    title: "Pair as back of previous item";
+                    enabled: ItemMenu.can-pair-prev;
+                    activated => { ItemMenu.action("pair-prev"); }
+                }
+                MenuItem {
+                    title: "Pair as back of next item";
+                    enabled: ItemMenu.can-pair-next;
+                    activated => { ItemMenu.action("pair-next"); }
+                }
+                MenuSeparator { }
+                MenuItem {
+                    title: "Swap front & back";
+                    activated => { ItemMenu.action("swap-sides"); }
+                }
+                MenuItem {
+                    title: "Unpair";
+                    activated => { ItemMenu.action("unpair"); }
+                }
+            }
             MenuItem {
                 title: "Properties";
                 activated => { ItemMenu.action("properties"); }

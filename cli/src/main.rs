@@ -40,10 +40,13 @@ sync-people                put missing People| tags on files with named faces
 tags PATH                  the file's tags
 tag PATH [KIND:]TAG        add a tag (KIND: keyword, scene, object, person, place, event;
                            People|NAME is a person)
-untag PATH TAG             remove a tag (a person tag also un-names their faces there)
+untag PATH [KIND:]TAG      remove a tag (a bare NAME can be a person; a person tag also
+                           un-names their faces there)
 props PATH                 everything known about a file
 pair PATH                  the file's front or back
-pair PATH BACK             pair a back with its front by hand
+pair FRONT BACK            pair a back with its front by hand (replaces their old pairs)
+unpair PATH                take the file out of its front/back pair
+swap-sides PATH            the file's pair the other way round (front <-> back)
 similar PATH [N]           files from the same scene or event
 find WORDS...              files that fit a description (\"dog on a beach\")
 delete PATH                move the file (and its back) to the library's trash
@@ -299,6 +302,8 @@ impl Shell {
             "untag" => self.untag(rest),
             "props" => self.props(rest),
             "pair" => self.pair(rest),
+            "unpair" => self.unpair(rest),
+            "swap-sides" => self.swap_sides(rest),
             "similar" => self.similar(rest),
             "find" => self.find(rest),
             "delete" => self.delete(rest),
@@ -587,8 +592,8 @@ impl Shell {
     fn untag(&mut self, args: &[&str]) -> Result<(), String> {
         let Some((path, words)) = args.split_first().filter(|(_, w)| !w.is_empty()) else { return Err("untag PATH TAG".into()) };
         let asset = self.asset(path)?;
-        if !self.catalog.remove_tag_path(asset, &words.join(" ")).map_err(err)? {
-            return Err("no such tag".into());
+        if !ops::remove_tag(&mut self.catalog, asset, &words.join(" ")).map_err(err)? {
+            return Err("the file has no such tag".into());
         }
         Ok(())
     }
@@ -656,10 +661,28 @@ impl Shell {
             }
             [front, back] => {
                 let (front, back) = (self.asset(front)?, self.asset(back)?);
-                self.catalog.set_pair(front, back).map_err(err)
+                ops::pair(&mut self.catalog, front, back).map(|_| ()).map_err(err)
             }
             _ => Err("pair PATH [BACK]".into()),
         }
+    }
+
+    fn unpair(&mut self, args: &[&str]) -> Result<(), String> {
+        let [path] = args else { return Err("unpair PATH".into()) };
+        let asset = self.asset(path)?;
+        match ops::unpair(&mut self.catalog, asset).map_err(err)? {
+            Some(other) => println!("unpaired from {}", self.shown(other)),
+            None => println!("not paired"),
+        }
+        Ok(())
+    }
+
+    fn swap_sides(&mut self, args: &[&str]) -> Result<(), String> {
+        let [path] = args else { return Err("swap-sides PATH".into()) };
+        let asset = self.asset(path)?;
+        let (front, back) = ops::swap_sides(&mut self.catalog, asset).map_err(err)?;
+        println!("front: {}\nback:  {}", self.shown(front), self.shown(back));
+        Ok(())
     }
 
     fn similar(&self, args: &[&str]) -> Result<(), String> {

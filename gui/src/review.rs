@@ -730,7 +730,7 @@ impl FileUpdate {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         match self {
             Self::Present(entry, _) => &entry.path,
             Self::Gone(path) => path,

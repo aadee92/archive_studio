@@ -266,11 +266,14 @@ impl Host {
         }
         let gone: Vec<PathBuf> =
             batch.files.iter().filter_map(|f| if let FileUpdate::Gone(path) = f { Some(path.clone()) } else { None }).collect();
+        let present: Vec<PathBuf> =
+            batch.files.iter().filter(|f| matches!(f, FileUpdate::Present(..))).map(|f| f.path().to_path_buf()).collect();
         if !batch.files.is_empty() {
             review::update_files(batch.files);
         }
         acquire::files_changed(&ui, &batch.rotated, &gone);
         details::files_gone(&ui, &gone);
+        details::data_changed(&ui, &present);
         for path in batch.rotated {
             details::file_changed(&ui, &path);
         }

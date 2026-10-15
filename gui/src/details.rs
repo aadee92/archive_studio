@@ -36,6 +36,15 @@
 //! an embedding (with the engine's face models, else ones loaded here once), and its popup
 //! opens. Each change is reported with `pipeline::changed` (Review's tags) and to People.
 //!
+//! The info panel beside the picture (toggled from the bottom bar, kept open across items)
+//! shows the file (name, path to copy, date taken and modified, its own dimensions, size,
+//! kind: `ops::properties`) and its tags by kind, People first, each with an × that takes
+//! it off (`ops::remove_tag`; a person's faces on the picture go back to unknown), and a box
+//! to add one with the catalog's matching tags under it (as the Add tag dialog,
+//! `ops::add_tag`). It is read again whenever the item's catalog data changes
+//! ([`data_changed`], from the pipeline relay), as is the other side of the photo, so a
+//! pairing made from the item menu shows at once.
+//!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
 //! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
 //! engine if it runs here, else the core directly). That can take a second (the file is
@@ -58,11 +67,11 @@ use crate::actions;
 use crate::nav::{self, Scope, Target};
 use crate::pipeline::{self, Handle};
 use crate::thumbs::{self, Pixels};
-use crate::{AppWindow, DetailFace, DetailsBridge, FilmItem, SimilarItem};
+use crate::{AppWindow, DetailFace, DetailsBridge, FilmItem, InfoTag, PropRow, SimilarItem};
 use archive_core::catalog::faces::{FaceId, FaceStatus, DEFAULT_MIN_SIMILARITY};
 use archive_core::catalog::people::matching_people;
 use archive_core::catalog::runs::RunStatus;
-use archive_core::catalog::{Catalog, Region, TagId, TagKind};
+use archive_core::catalog::{AppliedTag, Catalog, Region, Source, TagId, TagKind, DEFAULT_MIN_CONFIDENCE};
 use archive_core::faces::Faces;
 use archive_core::ops;
 use archive_core::media::{classify, MediaKind};
@@ -107,6 +116,9 @@ struct Shown {
     film: Rc<VecModel<FilmItem>>,
     film_paths: Vec<PathBuf>,
     film_thumbs: HashMap<PathBuf, slint::Image>,
+    /// Retires info panel reads of earlier items (or before a change).
+    info_generation: u64,
+    other_side_generation: u64,
 }
 
 impl Shown {
@@ -191,6 +203,8 @@ thread_local! {
     static FACES: RefCell<Vec<FaceInfo>> = const { RefCell::new(Vec::new()) };
     /// Every person (tag path), for the face popup's matches; read when it opens.
     static NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Every tag in the catalog, for the info panel's tag box; read with the panel.
+    static TAGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One face change at a time, in the order asked.
@@ -340,6 +354,37 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         }
     });
     let weak = ui.as_weak();
+    details.on_info_toggled(move || {
+        if let Some(ui) = weak.upgrade() {
+            let open = ui.global::<DetailsBridge>().get_info_open();
+            log::debug!("details: info panel {}", if open { "opened" } else { "closed" });
+            load_info(&ui);
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_remove_tag(move |key| {
+        if let Some(ui) = weak.upgrade() {
+            change_tag(&ui, TagChange::Remove(key.into()));
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_info_tag_edited(move |text| {
+        if let Some(ui) = weak.upgrade() {
+            let offered: Vec<SharedString> =
+                TAGS.with_borrow(|tags| actions::matching_tags(tags, &text).into_iter().map(SharedString::from).collect());
+            let details = ui.global::<DetailsBridge>();
+            details.set_info_tag_matches(ModelRc::new(VecModel::from(offered)));
+            details.set_info_tag_error(SharedString::default());
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_info_tag_submit(move |text| {
+        let text = text.trim();
+        if let (Some(ui), false) = (weak.upgrade(), text.is_empty()) {
+            change_tag(&ui, TagChange::Add(text.to_owned()));
+        }
+    });
+    let weak = ui.as_weak();
     details.on_film_menu(move |i| {
         let target = SHOWN.with_borrow(|shown| {
             let (path, scope) = shown.target.as_ref()?.scope.at(usize::try_from(i).ok()?)?;
@@ -352,7 +397,6 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 }
 
 /// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
-/// TODO: metadata editing.
 pub fn show(ui: &AppWindow, mut target: Target) {
     locate(&mut target);
     log::debug!("details: show {target:?}");
@@ -404,6 +448,8 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_other_ready(false);
     details.set_other_faces(ModelRc::default());
     details.set_similar(ModelRc::default());
+    details.set_info_tag_error(SharedString::default());
+    details.set_info_tag_matches(ModelRc::default());
     // Up at once if prefetched, else its thumbnail until decoded.
     if kind.is_some() {
         if let Some(pixels) = prefetched(&path) {
@@ -420,6 +466,7 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     load(ui);
     load_similar(ui);
     load_film(ui);
+    load_info(ui);
 }
 
 /// Points the scope at `target` if it is one of its items but not the one it says (opened
@@ -602,15 +649,13 @@ fn other_side(path: &Path) -> Option<(PathBuf, bool)> {
 /// The other side of the photo at `path` and whether `path` is the back: the catalog's
 /// pairing, else the file names.
 fn read_other_side(catalog: Option<&Catalog>, path: &Path) -> Option<(PathBuf, bool)> {
-    let paired = catalog.and_then(|c| {
-        let asset = c.find_asset(path).ok()??;
-        if let Some(back) = c.back_of(asset).ok()? {
-            return Some((c.asset_path(back).ok()?, false));
-        }
-        let front = c.front_of(asset).ok()??;
-        Some((c.asset_path(front).ok()?, true))
-    });
-    paired.filter(|(p, _)| p.exists()).or_else(|| other_side(path))
+    // A file the catalog has goes by its pairing (which the user may have undone or changed).
+    let Some((catalog, asset)) = catalog.and_then(|c| Some((c, c.find_asset(path).ok()??))) else { return other_side(path) };
+    let paired = match catalog.back_of(asset).ok()? {
+        Some(back) => (catalog.asset_path(back).ok()?, false),
+        None => (catalog.asset_path(catalog.front_of(asset).ok()??).ok()?, true),
+    };
+    Some(paired).filter(|(p, _)| p.exists())
 }
 
 /// Shows the other side of the photo in place of this one (no history: Back still returns
@@ -780,14 +825,244 @@ fn load(ui: &AppWindow) {
                 details.set_flash_serial(details.get_flash_serial() + 1);
             }
 
-            SHOWN.with_borrow_mut(|shown| shown.other = other.as_ref().map(|(p, _)| p.clone()));
-            details.set_other_side(other.as_ref().map_or_else(SharedString::default, |(p, _)| p.display().to_string().into()));
-            details.set_is_back(other.as_ref().is_some_and(|(_, is_back)| *is_back));
-            if other.is_none() {
-                details.set_other_ready(false);
-            } else if details.get_side_by_side() {
-                // Reloaded with this one too (after a rotation, say).
-                load_other(&ui);
+            // Reloaded with this one too (after a rotation, say).
+            set_other(&ui, other, true);
+        });
+    });
+}
+
+/// Shows `other` as the other side of the shown photo (and whether the shown one is the
+/// back); decodes it again for "Front & back" if it is another file, or if `reload`.
+fn set_other(ui: &AppWindow, other: Option<(PathBuf, bool)>, reload: bool) {
+    let details = ui.global::<DetailsBridge>();
+    let before = SHOWN.with_borrow_mut(|shown| std::mem::replace(&mut shown.other, other.as_ref().map(|(p, _)| p.clone())));
+    details.set_other_side(other.as_ref().map_or_else(SharedString::default, |(p, _)| p.display().to_string().into()));
+    details.set_is_back(other.as_ref().is_some_and(|(_, is_back)| *is_back));
+    if other.is_none() {
+        details.set_other_ready(false);
+    } else if details.get_side_by_side() && (reload || before.as_ref() != other.as_ref().map(|(p, _)| p)) {
+        details.set_other_ready(false);
+        load_other(ui);
+    }
+}
+
+/// The catalog data of these files changed (tags, faces, pairing; reported through the
+/// pipeline relay): the info panel and the other side are read again if they concern the
+/// item shown.
+pub fn data_changed(ui: &AppWindow, paths: &[PathBuf]) {
+    let concerns = SHOWN.with_borrow(|shown| {
+        let shown_path = shown.path()?;
+        paths.iter().any(|p| p == shown_path || shown.other.as_deref() == Some(p.as_path())).then(|| shown_path.to_path_buf())
+    });
+    let Some(path) = concerns else { return };
+    log::debug!("details: catalog data of {} changed: reading its info and other side again", path.display());
+    load_info(ui);
+    reload_side(ui);
+}
+
+/// Reads the shown photo's other side again (its pairing changed), on a worker.
+fn reload_side(ui: &AppWindow) {
+    let Some((path, generation)) = SHOWN.with_borrow_mut(|shown| {
+        shown.other_side_generation += 1;
+        Some((shown.path()?.to_path_buf(), shown.other_side_generation)).filter(|_| shown.kind == Some(MediaKind::Image))
+    }) else {
+        return;
+    };
+    let (root, weak) = (root(), ui.as_weak());
+    thread::spawn(move || {
+        let catalog = root.and_then(|root| open_catalog(&root));
+        let other = read_other_side(catalog.as_ref(), &path);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if SHOWN.with_borrow(|shown| shown.other_side_generation != generation || shown.path() != Some(path.as_path())) {
+                return;
+            }
+            log::debug!("details: other side of {} is now {other:?}", path.display());
+            set_other(&ui, other, false);
+        });
+    });
+}
+
+/// Reads the info panel's data for the shown item on a worker (if the panel is open), with
+/// every tag in the catalog for its tag box.
+fn load_info(ui: &AppWindow) {
+    let details = ui.global::<DetailsBridge>();
+    let Some((path, generation)) = SHOWN.with_borrow_mut(|shown| {
+        shown.info_generation += 1;
+        Some((shown.path()?.to_path_buf(), shown.info_generation))
+    }) else {
+        return;
+    };
+    if !details.get_info_open() {
+        return;
+    }
+    let Some(root) = root() else { return };
+    details.set_info_loading(true);
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let read = open_catalog(&root).ok_or_else(|| "can't open the catalog".to_owned()).and_then(|catalog| {
+            let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
+            let p = ops::properties(&catalog, asset).map_err(|e| e.to_string())?;
+            let tags = catalog.all_tags().unwrap_or_default();
+            Ok((info_rows(&p), info_tags(&p.tags), tags))
+        });
+        if let Err(e) = &read {
+            log::warn!("details: info for {}: {e}", path.display());
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if SHOWN.with_borrow(|shown| shown.info_generation != generation) {
+                return;
+            }
+            let details = ui.global::<DetailsBridge>();
+            details.set_info_loading(false);
+            let (rows, tags) = match read {
+                Ok((rows, tags, all)) => {
+                    TAGS.set(all);
+                    (rows, tags)
+                }
+                Err(e) => (vec![("Error".to_owned(), e)], Vec::new()),
+            };
+            let rows: Vec<PropRow> = rows.into_iter().map(|(label, value)| PropRow { label: label.into(), value: value.into(), heading: false }).collect();
+            details.set_info_rows(ModelRc::new(VecModel::from(rows)));
+            details.set_info_tags(ModelRc::new(VecModel::from(tags)));
+        });
+    });
+}
+
+/// The info panel's facts about the file: taken, modified, dimensions (the file's own),
+/// size, kind; empty ones left out.
+fn info_rows(p: &ops::Properties) -> Vec<(String, String)> {
+    let kind = match p.kind {
+        Some(MediaKind::Image) => "Image",
+        Some(MediaKind::Video) => "Video",
+        Some(MediaKind::Audio) => "Audio",
+        None => "File",
+    };
+    let kind = match &p.format {
+        Some(format) => format!("{kind} · {}", format.to_uppercase()),
+        None => kind.to_owned(),
+    };
+    let status = if p.trashed { "In the trash" } else if p.missing { "Missing" } else { "" };
+    [
+        ("Status", status.to_owned()),
+        ("Taken", p.exif.taken.clone().unwrap_or_default()),
+        ("Modified", p.modified.map(actions::local_time).unwrap_or_default()),
+        ("Dimensions", p.dimensions.map_or_else(String::new, |(w, h)| format!("{w} × {h}"))),
+        ("Size", p.size.map(crate::review::human_size).unwrap_or_default()),
+        ("Kind", kind),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(label, value)| (label.to_owned(), value))
+    .collect()
+}
+
+/// The info panel's tags: grouped by kind, People first, each once (the user's, else the
+/// most confident detector's, from the confidence searches use), under a heading per kind.
+fn info_tags(tags: &[AppliedTag]) -> Vec<InfoTag> {
+    const KINDS: [(TagKind, &str); 6] = [
+        (TagKind::Person, "People"),
+        (TagKind::Keyword, "Keywords"),
+        (TagKind::Event, "Events"),
+        (TagKind::Place, "Places"),
+        (TagKind::Scene, "Scenes"),
+        (TagKind::Object, "Objects"),
+    ];
+    let mut rows = Vec::new();
+    for (kind, heading) in KINDS {
+        let mut seen: Vec<(TagId, &AppliedTag)> = Vec::new();
+        for tag in tags.iter().filter(|t| t.kind == kind && t.confidence.is_none_or(|c| c >= DEFAULT_MIN_CONFIDENCE)) {
+            match seen.iter_mut().find(|(id, _)| *id == tag.tag) {
+                Some((_, kept)) if kept.source == Source::User => {}
+                Some((_, kept)) if tag.source == Source::User || tag.confidence > kept.confidence => *kept = tag,
+                Some(_) => {}
+                None => seen.push((tag.tag, tag)),
+            }
+        }
+        if seen.is_empty() {
+            continue;
+        }
+        rows.push(InfoTag { heading: true, label: heading.into(), key: SharedString::default(), note: SharedString::default() });
+        for (_, tag) in seen {
+            let shown = match kind {
+                TagKind::Person => archive_core::catalog::people::display_name(&tag.path).to_owned(),
+                _ => tag.path.replace('|', " / "),
+            };
+            let note = match (&tag.source, tag.confidence) {
+                (Source::Detector(name), Some(c)) => format!("{} {:.0}%", name.split('/').next().unwrap_or(name), c * 100.0),
+                _ => String::new(),
+            };
+            rows.push(InfoTag {
+                heading: false,
+                label: shown.into(),
+                key: format!("{}:{}", kind.name(), tag.path).into(),
+                note: note.into(),
+            });
+        }
+    }
+    rows
+}
+
+/// A change to the shown item's tags from the info panel.
+#[derive(Debug)]
+enum TagChange {
+    /// What was typed in the tag box (`ops::add_tag`).
+    Add(String),
+    /// The tag `kind:path` (`ops::remove_tag`).
+    Remove(String),
+}
+
+/// Makes `change` on a worker, then reads the panel again and reports the item changed; a
+/// person taken off also redraws its faces (theirs are unknown now) and tells People.
+fn change_tag(ui: &AppWindow, change: TagChange) {
+    let Some(path) = SHOWN.with_borrow(|shown| shown.path().map(Path::to_path_buf)) else { return };
+    let Some(root) = root() else { return };
+    let details = ui.global::<DetailsBridge>();
+    details.set_info_tag_working(true);
+    details.set_info_tag_error(SharedString::default());
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let mut catalog = open_catalog(&root);
+        let result = match catalog.as_mut() {
+            None => Err("can't open the catalog".to_owned()),
+            Some(catalog) => catalog.asset(&path).map_err(|e| e.to_string()).and_then(|asset| match &change {
+                TagChange::Add(text) => ops::add_tag(catalog, asset, text).map(|_| ()).map_err(|e| e.to_string()),
+                TagChange::Remove(key) => match ops::remove_tag(catalog, asset, key) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err("it isn't on this item any more".to_owned()),
+                    Err(e) => Err(e.to_string()),
+                },
+            }),
+        };
+        let person = matches!(&change, TagChange::Remove(key) if ops::parse_tag(key).0 == TagKind::Person);
+        let faces = (person && result.is_ok()).then(|| catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default());
+        match &result {
+            Ok(()) => log::info!("details: {change:?} on {} done", path.display()),
+            Err(e) => log::warn!("details: {change:?} on {}: {e}", path.display()),
+        }
+        if result.is_ok() {
+            pipeline::changed(&path, false);
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let details = ui.global::<DetailsBridge>();
+            details.set_info_tag_working(false);
+            if faces.is_some() {
+                crate::people::faces_changed(&ui);
+            }
+            if SHOWN.with_borrow(|s| s.path() != Some(path.as_path())) {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    if let TagChange::Add(_) = change {
+                        details.set_info_tag_serial(details.get_info_tag_serial() + 1);
+                        details.set_info_tag_matches(ModelRc::default());
+                    }
+                    if let Some(faces) = faces.filter(|_| details.get_editing() < 0) {
+                        show_faces(&ui, faces, None);
+                    }
+                    load_info(&ui);
+                }
+                Err(e) => details.set_info_tag_error(e.into()),
             }
         });
     });
@@ -1406,5 +1681,62 @@ mod tests {
         assert_eq!(other_side(&front), Some((back.clone(), false)));
         assert_eq!(other_side(&back), Some((front.clone(), true)));
         assert_eq!(read_other_side(None, &back), Some((front, true)));
+    }
+
+    #[test]
+    fn the_catalog_pairing_wins_over_the_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let [front, back, other] = ["photo-0001-front.png", "photo-0001-back.png", "x.png"].map(|n| root.join(n));
+        for path in [&front, &back, &other] {
+            image::RgbImage::new(4, 4).save(path).unwrap();
+        }
+        let mut catalog = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let [f, b, x] = [&front, &back, &other].map(|p| catalog.asset(p).unwrap());
+        assert_eq!(read_other_side(Some(&catalog), &front), Some((back.clone(), false)));
+        ops::unpair(&mut catalog, f).unwrap();
+        assert_eq!(read_other_side(Some(&catalog), &front), None, "unpaired by hand, whatever the names");
+        ops::pair(&mut catalog, x, b).unwrap();
+        assert_eq!(read_other_side(Some(&catalog), &back), Some((other.clone(), true)));
+        ops::swap_sides(&mut catalog, b).unwrap();
+        assert_eq!(read_other_side(Some(&catalog), &back), Some((other, false)));
+    }
+
+    #[test]
+    fn info_lists_tags_by_kind_people_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.png");
+        image::RgbImage::new(30, 20).save(&path).unwrap();
+        let mut catalog = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let a = catalog.asset(&path).unwrap();
+        ops::add_tag(&catalog, a, "Holidays|1998").unwrap();
+        ops::add_tag(&catalog, a, "People|Alice").unwrap();
+        let beach = catalog.tag("Scenes|Beach", TagKind::Scene).unwrap();
+        let dog = catalog.tag("Objects|Dog", TagKind::Object).unwrap();
+        let found = |tag, confidence| archive_core::catalog::Detection { tag, confidence, region: None };
+        catalog.set_detections(a, "clip/tinyclip-8m", &[found(beach, 0.8), found(dog, 0.4)]).unwrap();
+        catalog.add_tag(a, beach, None).unwrap();
+
+        let p = ops::properties(&catalog, a).unwrap();
+        let tags: Vec<(bool, String, String, String)> =
+            info_tags(&p.tags).into_iter().map(|t| (t.heading, t.label.into(), t.key.into(), t.note.into())).collect();
+        let row = |heading, label: &str, key: &str, note: &str| (heading, label.to_owned(), key.to_owned(), note.to_owned());
+        assert_eq!(
+            tags,
+            [
+                row(true, "People", "", ""),
+                row(false, "Alice", "person:People|Alice", ""),
+                row(true, "Keywords", "", ""),
+                row(false, "Holidays / 1998", "keyword:Holidays|1998", ""),
+                // Once, as the user's; the unlikely dog not at all.
+                row(true, "Scenes", "", ""),
+                row(false, "Scenes / Beach", "scene:Scenes|Beach", ""),
+            ]
+        );
+        let rows = info_rows(&p);
+        assert!(rows.contains(&("Dimensions".to_owned(), "30 × 20".to_owned())));
+        assert!(rows.contains(&("Kind".to_owned(), "Image · PNG".to_owned())));
+        assert!(!rows.iter().any(|(label, _)| label == "Status"));
     }
 }

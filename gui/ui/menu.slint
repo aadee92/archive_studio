@@ -1,4 +1,4 @@
-// The item context menu (Rotate, Delete, Add tag…, Properties) shared by every page, and
+// The item context menu (Rotate, Delete, Add tag…, Front & back, Properties) shared by every page, and
 // the dialogs it opens. All of it is driven from Rust (`src/actions.rs`): a page reports a
 // right-click (after storing where the pointer was in `ItemMenu.x` / `y`), Rust resolves
 // the item and bumps `serial`, and the window shows the menu there.
@@ -21,7 +21,11 @@ export global ItemMenu {
     // Bumped by Rust to show the menu at (x, y) for the item it resolved.
     in property <int> serial;
     in property <bool> can-rotate;
-    // "rotate-left", "rotate-right", "delete", "tag", "properties".
+    // The view it was right-clicked in has an item before / after it, to pair it with.
+    in property <bool> can-pair-prev;
+    in property <bool> can-pair-next;
+    // "rotate-left", "rotate-right", "delete", "tag", "properties", "pair-prev", "pair-next"
+    // (it is the back of that item), "swap-sides", "unpair".
     callback action(string);
 
     // Add tag dialog.

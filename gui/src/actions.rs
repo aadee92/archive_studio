@@ -1,4 +1,5 @@
-//! The item context menu: Rotate left / right, Add tag…, Properties, Delete, for any item
+//! The item context menu: Rotate left / right, Add tag…, front and back (pair as the back of
+//! the previous / next item of the view, swap, unpair), Properties, Delete, for any item
 //! a page shows (a Review tile, a face in People, a recent capture in Acquire, the Details
 //! picture and its similar strip). Pages resolve the item under the pointer and call
 //! [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the menu
@@ -7,8 +8,10 @@
 //! Every action is an [`archive_core::ops`] call, run on a worker: rotating goes to the
 //! pipeline's engine if it runs in this window (else straight to the core), deleting moves
 //! to the library's trash (undoable from the notice), tagging takes what the user typed
-//! ([`ops::add_tag`]). What changed is reported with [`pipeline::changed`], which refreshes
-//! every view showing it, as for the engine's own reports.
+//! ([`ops::add_tag`]), pairing goes through [`ops::pair`] / [`ops::swap_sides`] /
+//! [`ops::unpair`]. What changed is reported with [`pipeline::changed`], which refreshes
+//! every view showing it, as for the engine's own reports (Details' dog-ear and "Front &
+//! back" follow a pairing that way).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -120,9 +123,13 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 /// Shows the menu for `target` where the page saw the right-click (`ItemMenu.x` / `y`).
 pub fn show_menu(ui: &AppWindow, target: Target) {
     let rotatable = classify(&target.path) == Some(MediaKind::Image) && archive_core::pipeline::rotate::can_rotate(&target.path);
+    // Whether the view has an item before / after it; checked again when picked.
+    let (at, len) = (target.scope.current, target.scope.len);
     with_state(|s| s.target = Some(target));
     let menu = ui.global::<ItemMenu>();
     menu.set_can_rotate(rotatable);
+    menu.set_can_pair_prev(at.is_some_and(|i| i > 0));
+    menu.set_can_pair_next(at.is_some_and(|i| i + 1 < len));
     menu.set_serial(menu.get_serial() + 1);
 }
 
@@ -161,6 +168,10 @@ fn act(ui: &AppWindow, action: &str, target: Target) {
         "delete" => delete(ui, target.path),
         "tag" => open_tag_dialog(ui, target.path),
         "properties" => properties(ui, target.path),
+        "pair-prev" => pair_with_neighbour(ui, target, -1),
+        "pair-next" => pair_with_neighbour(ui, target, 1),
+        "swap-sides" => change_pair(ui, target.path, PairChange::Swap),
+        "unpair" => change_pair(ui, target.path, PairChange::Unpair),
         other => log::warn!("context menu: unknown action {other:?}"),
     }
 }
@@ -179,6 +190,72 @@ fn rotate_item(ui: &AppWindow, path: PathBuf, cw: u16) {
                 log::warn!("rotate {}: {e}", path.display());
                 notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, None);
             }
+        });
+    });
+}
+
+/// A change to the item's front/back pairing.
+#[derive(Clone, Debug)]
+enum PairChange {
+    /// The item is the back of this front.
+    BackOf(PathBuf),
+    Swap,
+    Unpair,
+}
+
+/// The item becomes the back of the item `delta` items from it in its view (scanned right
+/// before or after it).
+fn pair_with_neighbour(ui: &AppWindow, target: Target, delta: isize) {
+    let paths = target.scope.paths();
+    // The menu's item may not be one of the view's (the other side of a photo on Details).
+    let at = target.scope.current.filter(|&i| paths.get(i) == Some(&target.path));
+    let Some(front) = at.and_then(|i| i.checked_add_signed(delta)).and_then(|i| paths.get(i)).cloned() else {
+        log::debug!("pair with item {delta:+}: {:?} has no such neighbour in its view", target.path);
+        notify(ui, format!("{} has no {} item in this view", file_name(&target.path), if delta < 0 { "previous" } else { "next" }), true, None);
+        return;
+    };
+    change_pair(ui, target.path, PairChange::BackOf(front));
+}
+
+/// Makes `change` to the pairing of the item at `path` on a worker, and reports every file
+/// whose other side changed.
+fn change_pair(ui: &AppWindow, path: PathBuf, change: PairChange) {
+    let Some((root, _)) = context() else { return };
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let result = open(&root).and_then(|mut catalog| {
+            let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
+            let (changed, done) = match &change {
+                PairChange::BackOf(front) => {
+                    let front = catalog.asset(front).map_err(|e| e.to_string())?;
+                    let changed = ops::pair(&mut catalog, front, asset).map_err(|e| e.to_string())?;
+                    let name = catalog.asset_path(front).map(|p| file_name(&p)).unwrap_or_default();
+                    (changed, format!("{} is the back of {name}", file_name(&path)))
+                }
+                PairChange::Swap => {
+                    let (front, back) = ops::swap_sides(&mut catalog, asset).map_err(|e| e.to_string())?;
+                    let name = |a| catalog.asset_path(a).map(|p| file_name(&p)).unwrap_or_default();
+                    (vec![front, back], format!("{} is the front now, {} the back", name(front), name(back)))
+                }
+                PairChange::Unpair => match ops::unpair(&mut catalog, asset).map_err(|e| e.to_string())? {
+                    Some(other) => (vec![asset, other], format!("{} has no other side now", file_name(&path))),
+                    None => return Err("it isn't paired with another side".to_owned()),
+                },
+            };
+            for a in changed {
+                if let Ok(p) = catalog.asset_path(a) {
+                    pipeline::changed(&p, false);
+                }
+            }
+            Ok(done)
+        });
+        match &result {
+            Ok(done) => log::info!("{change:?} on {}: {done}", path.display()),
+            Err(e) => log::warn!("{change:?} on {}: {e}", path.display()),
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(done) => notify(&ui, done, false, None),
+            Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, None),
         });
     });
 }
@@ -287,7 +364,7 @@ fn open_tag_dialog(ui: &AppWindow, path: PathBuf) {
 }
 
 /// The known tags matching `text`, those starting with it first.
-fn matching_tags<'a>(tags: &'a [String], text: &str) -> Vec<&'a str> {
+pub(crate) fn matching_tags<'a>(tags: &'a [String], text: &str) -> Vec<&'a str> {
     let text = text.trim().to_lowercase();
     if text.is_empty() {
         return Vec::new();
@@ -525,7 +602,7 @@ fn exposure(seconds: f64) -> String {
 }
 
 /// `2024-05-12 14:30`, in local time.
-fn local_time(t: SystemTime) -> String {
+pub(crate) fn local_time(t: SystemTime) -> String {
     let Ok(since) = t.duration_since(SystemTime::UNIX_EPOCH) else { return String::new() };
     let secs = since.as_secs() as libc::time_t;
     // SAFETY: `localtime_r` only writes the `tm` we pass it.
