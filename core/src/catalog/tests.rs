@@ -312,6 +312,24 @@ fn on_disk_reopen_and_shared_use() {
 }
 
 #[test]
+fn exact_terms_match_a_path_and_its_subtree() {
+    let lib = sample();
+    let ann = lib.asset("ann.jpg");
+    lib.tag(ann, "People|Family|Alicia", TagKind::Person);
+    lib.tag(ann, "Trips|People|Family|Alice", TagKind::Keyword);
+    assert_eq!(lib.search("=people|family"), ["ann.jpg", "beach.jpg", "park.jpg"]);
+    assert_eq!(lib.search("=People|Family|Alice"), ["beach.jpg"], "not Alicia, nor under Trips");
+    assert_eq!(lib.search("alice"), ["ann.jpg", "beach.jpg"], "a plain term matches segments anywhere");
+    assert_eq!(lib.search("=keyword:people"), Vec::<String>::new());
+    assert_eq!(lib.search("=family"), Vec::<String>::new(), "from the top");
+    // In memory, as front ends filter.
+    let expr = parse("=People|Family|Alice").unwrap();
+    let tags = |paths: &[&str]| paths.iter().map(|p| (p.to_string(), Some(TagKind::Person))).collect::<Vec<_>>();
+    assert!(expr.matches(&tags(&["people | family|alice|Kid"])));
+    assert!(!expr.matches(&tags(&["People|Family|Alicia", "Trips|People|Family|Alice"])));
+}
+
+#[test]
 fn query_parsing() {
     let term = |text: &str| Expr::Term { kind: None, text: text.into() };
     assert_eq!(parse("  ").unwrap(), Expr::All);
@@ -328,7 +346,12 @@ fn query_parsing() {
     assert_eq!(parse("a && b").unwrap(), Expr::And(vec![term("a"), term("b")]));
     assert_eq!(parse("(a OR b) and c").unwrap(), Expr::And(vec![Expr::Or(vec![term("a"), term("b")]), term("c")]));
     assert_eq!(parse("a and not b").unwrap(), Expr::And(vec![term("a"), Expr::Not(Box::new(term("b")))]));
-    for bad in ["(a", "a)", "a OR", "OR a", "a AND", "AND a", "(a and)", "-", "\"a", "a\"b\"", "person:", "()", "a||b"] {
+    assert_eq!(parse("=\"People | Ann Lee\"").unwrap(), Expr::Under { kind: None, path: "People|Ann Lee".into() });
+    assert_eq!(parse("= person:Family -x").unwrap(), Expr::And(vec![
+        Expr::Under { kind: Some(TagKind::Person), path: "Family".into() },
+        Expr::Not(Box::new(term("x")))
+    ]));
+    for bad in ["(a", "a)", "a OR", "OR a", "a AND", "AND a", "(a and)", "-", "\"a", "a\"b\"", "person:", "()", "a||b", "=", "=-a", "=(a b)"] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
 }
@@ -356,6 +379,8 @@ fn sync_sidecars_writes_and_tracks() {
     assert!(!text.contains("Cat"), "below the confidence threshold");
     assert!(text.contains(r#"stDim:w="40" stDim:h="20""#));
     assert!(text.contains(r#"stArea:x="0.625000" stArea:y="0.750000""#));
+
+    assert_eq!(lib.cat.sidecar_tags(a).unwrap(), ["Dog", "People|Alice"], "what the sidecar has of ours");
 
     // Nothing pending: nothing written.
     assert_eq!(lib.cat.sync_sidecars(DEFAULT_MIN_CONFIDENCE).unwrap().written, 0);

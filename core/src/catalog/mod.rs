@@ -27,6 +27,7 @@ pub mod query;
 pub mod runs;
 pub mod semantic;
 pub mod similar;
+pub mod tags;
 pub mod trash;
 pub mod xmp;
 
@@ -447,22 +448,6 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Renames a tag and everything under it (`People|Fam` → `People|Family` also renames
-    /// `People|Fam|Alice`). Fails, changing nothing, if a new path is already taken.
-    pub fn rename_tag(&mut self, tag: TagId, new_path: &str) -> Result<()> {
-        log::debug!("rename_tag {} -> {new_path:?}", tag.0);
-        let new_path = normalize_tag(new_path)?;
-        let tx = self.conn.transaction()?;
-        let old: String = tx.query_row("SELECT path FROM tags WHERE id = ?1", [tag.0], |row| row.get(0))?;
-        tx.execute(
-            "UPDATE tags SET path = ?2 || substr(path, length(?1) + 1)
-             WHERE path = ?1 OR (path > ?1 || '|' AND path < ?1 || '}')",
-            [&old, &new_path],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// The user puts `tag` on `asset` (again, if they had removed it).
     pub fn add_tag(&self, asset: AssetId, tag: TagId, region: Option<Region>) -> Result<()> {
         let r = region.map(|r| [r.x, r.y, r.w, r.h]);
@@ -627,6 +612,15 @@ impl Catalog {
         let mut stmt = self.conn.prepare_cached("SELECT id FROM assets WHERE needs_sync ORDER BY id")?;
         let rows = stmt.query_map([], |row| row.get(0).map(AssetId))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The tag paths [`sync_sidecars`](Self::sync_sidecars) last wrote to the asset's
+    /// sidecar. A reader of the sidecar skips these: they are the catalog's own (as they
+    /// were), superseded by [`tags_of`](Self::tags_of) until the next sync; the rest are
+    /// another program's.
+    pub fn sidecar_tags(&self, asset: AssetId) -> Result<Vec<String>> {
+        let written: String = self.conn.prepare_cached("SELECT sidecar_tags FROM assets WHERE id = ?1")?.query_row([asset.0], |row| row.get(0))?;
+        Ok(written.lines().map(str::to_owned).collect())
     }
 
     /// Writes the tags of every asset that [needs it](Self::needing_sync) to its XMP sidecar

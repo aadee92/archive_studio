@@ -56,6 +56,33 @@ export global ItemMenu {
     callback notice-clicked();
 }
 
+// Managing a tag from Review's tag tree (`src/tags.rs`): its menu reports `action`, and
+// Rust opens the dialog for it (`mode`).
+export global TagEdit {
+    // From the tag tree's menu: the tag's path, how many items it is on, whether tags are
+    // under it, and "rename", "merge" or "delete".
+    callback action(string, int, bool, string);
+
+    // The dialog: "" (closed), "rename", "merge" or "delete".
+    in property <string> mode;
+    // The tag, as shown ("People / Ann").
+    in property <string> label;
+    // What the change will do (how many items, the tags under it, faces).
+    in property <string> message;
+    // The box's text when the dialog opens (rename: the tag's path).
+    in property <string> initial;
+    // Merge: the catalog's tags matching what is typed.
+    in property <[string]> matches;
+    in property <string> error;
+    in property <bool> working;
+    // Rename: the new path is another tag's; the dialog offers to merge into it instead.
+    in property <string> taken;
+    callback edited(string);
+    // The box's text; `merge`: merge into the tag that is there.
+    callback submit(string, /* merge */ bool);
+    callback cancel();
+}
+
 component Card inherits Rectangle {
     background: Theme.surface;
     border-radius: 10px;
@@ -142,6 +169,118 @@ export component TagDialog inherits Rectangle {
                         primary: true;
                         enabled: edit.text != "" && !ItemMenu.tag-working;
                         clicked => { ItemMenu.tag-submit(edit.text); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Rename, merge or delete a tag (`TagEdit.mode`).
+export component TagEditDialog inherits Rectangle {
+    background: #0000002a;
+    TouchArea {
+        clicked => {
+            UiLog.debug("tag-edit-dialog", "backdrop clicked: cancel");
+            TagEdit.cancel();
+        }
+    }
+    init => {
+        UiLog.debug("tag-edit-dialog", "created (\{TagEdit.mode}); focusing it");
+        if (TagEdit.mode == "delete") {
+            keys.focus();
+        } else {
+            edit.text = TagEdit.initial;
+            edit.focus();
+            edit.select-all();
+        }
+    }
+
+    Card {
+        width: Math.min(440px, root.width - 40px);
+        height: col.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: Math.max(20px, (root.height - self.height) / 3);
+        TouchArea { }
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    UiLog.debug("tag-edit-dialog", "Esc: cancel");
+                    TagEdit.cancel();
+                    return accept;
+                }
+                if (event.text == Key.Return && TagEdit.mode == "delete" && !TagEdit.working) {
+                    TagEdit.submit("", false);
+                    return accept;
+                }
+                reject
+            }
+            col := VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: TagEdit.mode == "rename" ? "Rename tag" : TagEdit.mode == "merge" ? "Merge tag into…" : "Delete tag";
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text { text: TagEdit.label; color: Theme.text-muted; overflow: elide; font-size: 12px; }
+                Text { text: TagEdit.message; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+                edit := LineEdit {
+                    visible: TagEdit.mode != "delete";
+                    height: TagEdit.mode != "delete" ? self.preferred-height : 0px;
+                    placeholder-text: TagEdit.mode == "merge" ? "The tag to merge it into" : "New name, e.g. Holidays|1998";
+                    enabled: !TagEdit.working;
+                    edited(text) => { TagEdit.edited(text); }
+                    accepted(text) => { TagEdit.submit(text, false); }
+                }
+                for tag in TagEdit.matches: Rectangle {
+                    height: 26px;
+                    border-radius: 4px;
+                    background: match-ta.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        Text { text: tag; vertical-alignment: center; color: Theme.text; font-size: 12px; overflow: elide; }
+                    }
+                    match-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            edit.text = tag;
+                            TagEdit.edited(tag);
+                            edit.focus();
+                        }
+                    }
+                }
+                if TagEdit.taken != "": Text {
+                    text: "“\{TagEdit.taken}” already exists. Merge into it? Its items and the tags under it join that tag.";
+                    color: Theme.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                if TagEdit.error != "": Text {
+                    text: TagEdit.error;
+                    color: Theme.danger;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Cancel";
+                        clicked => { TagEdit.cancel(); }
+                    }
+                    if TagEdit.taken != "": Button {
+                        text: "Merge";
+                        primary: true;
+                        enabled: !TagEdit.working;
+                        clicked => { TagEdit.submit(edit.text, true); }
+                    }
+                    if TagEdit.taken == "": Button {
+                        text: TagEdit.mode == "rename" ? "Rename" : TagEdit.mode == "merge" ? "Merge" : "Delete";
+                        primary: true;
+                        enabled: !TagEdit.working && (TagEdit.mode == "delete" || edit.text != "");
+                        clicked => { TagEdit.submit(edit.text, false); }
                     }
                 }
             }

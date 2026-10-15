@@ -12,6 +12,10 @@
 //!   [`Catalog::name_faces`] and the rest of [`catalog::people`](crate::catalog::people).
 //!   Taking a person tag off a picture un-names that person's faces on it (they go back to
 //!   the unknown faces), rather than being refused: the tag is what says they are there.
+//! - Tags as a whole: [`tag_tree`] (with how many pictures each is on), [`rename_tag`]
+//!   (asks before merging onto a taken path), [`merge_tags`], [`delete_tag`], with their
+//!   subtrees; people go through the person operations so their faces follow (see
+//!   [`catalog::tags`](crate::catalog::tags)). Each returns the assets whose tags changed.
 //! - Front and back: [`pair`] a back scan with its front by hand, [`unpair`],
 //!   [`swap_sides`] when they were paired the wrong way round (see
 //!   [`catalog::pairs`](crate::catalog::pairs)).
@@ -37,7 +41,8 @@ use crate::catalog::faces::{self as catalog_faces, FaceId};
 use crate::catalog::people::FaceBox;
 use crate::catalog::runs::{RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
-use crate::catalog::people::{display_name, PEOPLE};
+use crate::catalog::people::{display_name, person_path, PEOPLE};
+use crate::catalog::tags::{self, TagNode};
 use crate::catalog::{AppliedTag, AssetId, Catalog, Region, TagId, TagKind};
 use crate::exif::{self, Exif};
 use crate::media::{classify, MediaKind};
@@ -175,6 +180,177 @@ fn remove_typed_tag(catalog: &mut Catalog, asset: AssetId, text: &str) -> crate:
     let Some(tag) = found.map(|t| t.tag) else { return Ok(false) };
     catalog.remove_tag(asset, tag)?;
     Ok(true)
+}
+
+/// A tag renamed or merged: where it is now, and the assets whose tags changed (to refresh).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Retagged {
+    /// The tag's path now (the tag merged into), as the catalog spells it.
+    pub to: String,
+    pub assets: Vec<AssetId>,
+}
+
+/// What [`rename_tag`] did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Renamed {
+    /// Renamed (or merged, if asked to).
+    Done(Retagged),
+    /// The new path is another tag's (as it is spelled): nothing changed. Merge into it?
+    Taken(String),
+}
+
+/// The tags in the catalog as a tree (`People|Ann` under `People`), each with how many
+/// pictures (not in the trash) carry it or a tag under it; detector tags from
+/// [`DEFAULT_MIN_CONFIDENCE`](crate::catalog::DEFAULT_MIN_CONFIDENCE), as searches count
+/// them. See [`Catalog::tag_counts`].
+pub fn tag_tree(catalog: &Catalog) -> crate::catalog::Result<Vec<TagNode>> {
+    Ok(tags::tree(catalog.tag_counts(crate::catalog::DEFAULT_MIN_CONFIDENCE)?.into_iter().map(|c| (c.path, c.count))))
+}
+
+/// The user renames the tag at `from` (as typed, `kind:` allowed) to `to`, along with the
+/// tags under it ([`Catalog::rename_tag`]). A person stays a person under `People|`: `to`
+/// without a `|` keeps their place (`People|Family|Al` → `People|Family|Alice`), and the
+/// rename goes through [`Catalog::rename_person`]; another tag can't move under `People|`.
+/// If `to` is another tag's path, that is [`Renamed::Taken`] unless `merge`, which merges
+/// the two as [`merge_tags`] does. `People` itself can't be renamed.
+pub fn rename_tag(catalog: &mut Catalog, from: &str, to: &str, merge: bool) -> crate::catalog::Result<Renamed> {
+    let result = (|| {
+        let (tag, path, kind) = existing_tag(catalog, from)?;
+        let target = match kind {
+            TagKind::Person if !to.contains('|') => match path.rsplit_once('|') {
+                Some((parent, _)) => format!("{parent}|{}", to.trim()),
+                None => person_path(to)?,
+            },
+            _ => target_path(kind, to)?,
+        };
+        retag(catalog, (tag, &path, kind), &target, merge)
+    })();
+    match &result {
+        Ok(Renamed::Done(done)) => log::debug!("rename_tag {from:?} to {to:?} (merge {merge}): now {:?}, {} assets changed", done.to, done.assets.len()),
+        Ok(Renamed::Taken(path)) => log::debug!("rename_tag {from:?} to {to:?}: {path} is taken, nothing changed"),
+        Err(e) => log::warn!("rename_tag {from:?} to {to:?} (merge {merge}): {e}"),
+    }
+    result
+}
+
+/// The user merges the tag at `from` into `into` (both as typed): the pictures, faces and
+/// tags under `from` become `into`'s ([`Catalog::merge_tags`]; two people without people
+/// under them go through [`Catalog::merge_people`]). A person can only be merged into a
+/// person, named by path or by name (`Alice`, if only one person is called that); a tag
+/// into one that doesn't exist yet is a rename.
+pub fn merge_tags(catalog: &mut Catalog, from: &str, into: &str) -> crate::catalog::Result<Retagged> {
+    let result = (|| {
+        let (tag, path, kind) = existing_tag(catalog, from)?;
+        let target = match kind {
+            TagKind::Person if !into.contains('|') => {
+                let named: Vec<String> = catalog
+                    .leaf_tags(TagKind::Person)?
+                    .into_iter()
+                    .map(|(_, p)| p)
+                    .filter(|p| display_name(p).eq_ignore_ascii_case(into.trim()))
+                    .collect();
+                match named.as_slice() {
+                    [only] => only.clone(),
+                    _ => person_path(into)?,
+                }
+            }
+            _ => target_path(kind, into)?,
+        };
+        match retag(catalog, (tag, &path, kind), &target, true)? {
+            Renamed::Done(done) => Ok(done),
+            Renamed::Taken(path) => Err(crate::catalog::Error::Invalid(format!("{path} is taken"))),
+        }
+    })();
+    match &result {
+        Ok(done) => log::debug!("merge_tags {from:?} into {into:?}: now {:?}, {} assets changed", done.to, done.assets.len()),
+        Err(e) => log::warn!("merge_tags {from:?} into {into:?}: {e}"),
+    }
+    result
+}
+
+/// The user deletes the tag at `path` (as typed) and the tags under it: off every picture,
+/// faces named as them un-named ([`Catalog::delete_tag`]; a person without people under
+/// them through [`Catalog::delete_person`]). Not undoable: a front end confirms first, with
+/// the count from [`tag_tree`]. `People` itself can't be deleted. Returns the assets whose
+/// tags changed.
+pub fn delete_tag(catalog: &mut Catalog, path: &str) -> crate::catalog::Result<Vec<AssetId>> {
+    let result = (|| {
+        let (tag, path, kind) = existing_tag(catalog, path)?;
+        not_people_root(&path)?;
+        let assets = catalog.tag_assets(tag)?;
+        if kind == TagKind::Person && !has_children(catalog, &path)? {
+            catalog.delete_person(tag)?;
+        } else {
+            catalog.delete_tag(tag)?;
+        }
+        Ok(assets)
+    })();
+    match &result {
+        Ok(assets) => log::debug!("delete_tag {path:?}: off {} assets", assets.len()),
+        Err(e) => log::warn!("delete_tag {path:?}: {e}"),
+    }
+    result
+}
+
+/// The tag at a typed path (`kind:` prefix dropped), or an error naming it.
+fn existing_tag(catalog: &Catalog, text: &str) -> crate::catalog::Result<(TagId, String, TagKind)> {
+    let (_, path) = parse_tag(text);
+    catalog.find_tag(&path)?.ok_or_else(|| crate::catalog::Error::Invalid(format!("no tag {path}")))
+}
+
+/// Where a tag of `kind` goes for a typed path: a person under `People|`, anything else
+/// anywhere but there.
+fn target_path(kind: TagKind, text: &str) -> crate::catalog::Result<String> {
+    let (_, path) = parse_tag(text);
+    if kind == TagKind::Person {
+        return person_path(&path);
+    }
+    let first = path.split('|').next().unwrap_or_default().trim();
+    if first.eq_ignore_ascii_case(PEOPLE) && path.contains('|') {
+        return Err(crate::catalog::Error::Invalid(format!("{PEOPLE}|… is for people; {path} would be a {}", kind.name())));
+    }
+    Ok(path)
+}
+
+fn not_people_root(path: &str) -> crate::catalog::Result<()> {
+    if path.eq_ignore_ascii_case(PEOPLE) {
+        return Err(crate::catalog::Error::Invalid(format!("{PEOPLE} holds everyone named; rename, merge or delete people one by one")));
+    }
+    Ok(())
+}
+
+fn has_children(catalog: &Catalog, path: &str) -> crate::catalog::Result<bool> {
+    let prefix = format!("{}|", path.to_ascii_lowercase());
+    Ok(catalog.all_tags()?.iter().any(|t| t.to_ascii_lowercase().starts_with(&prefix)))
+}
+
+/// Renames `tag` to `target`, or merges it into the tag there if there is one and `merge`.
+fn retag(catalog: &mut Catalog, (tag, path, kind): (TagId, &str, TagKind), target: &str, merge: bool) -> crate::catalog::Result<Renamed> {
+    use crate::catalog::Error;
+    not_people_root(path)?;
+    let assets = catalog.tag_assets(tag)?;
+    let now = match catalog.find_tag(target)? {
+        Some((other, spelled, other_kind)) if other != tag => {
+            if !merge {
+                return Ok(Renamed::Taken(spelled));
+            }
+            if (kind == TagKind::Person) != (other_kind == TagKind::Person) {
+                return Err(Error::Invalid(format!("{path} is a {} and {spelled} a {}: only people merge with people", kind.name(), other_kind.name())));
+            }
+            if kind == TagKind::Person && !has_children(catalog, path)? {
+                catalog.merge_people(tag, other)?;
+            } else {
+                catalog.merge_tags(tag, other)?;
+            }
+            other
+        }
+        _ if kind == TagKind::Person => catalog.rename_person(tag, target)?,
+        _ => {
+            catalog.rename_tag(tag, target)?;
+            tag
+        }
+    };
+    Ok(Renamed::Done(Retagged { to: catalog.tag_path(now)?, assets }))
 }
 
 /// The user pairs `back` (a scan of a photo's back) with `front`: both images in the
@@ -435,6 +611,50 @@ mod tests {
         assert!(paths(&cat).is_empty());
         let boxes = cat.face_boxes(a).unwrap();
         assert_eq!((boxes.len(), boxes[0].person.is_none()), (1, true));
+    }
+
+    #[test]
+    fn managing_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        image::RgbImage::from_pixel(40, 20, image::Rgb([200, 150, 120])).save(root.join("a.png")).unwrap();
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let a = cat.asset(&root.join("a.png")).unwrap();
+        let b = cat.asset(&root.join("b.png")).unwrap();
+        add_tag(&cat, a, "Holidays|1998").unwrap();
+        add_tag(&cat, b, "Trips|1998").unwrap();
+        add_tag(&cat, b, "People|Bob").unwrap();
+        let face = add_face(&mut cat, a, Region { x: 0.5, y: 0.0, w: 0.25, h: 0.5 }, None).unwrap();
+        cat.name_faces(&[face], "Family|Al").unwrap();
+        let paths = |cat: &Catalog, asset| cat.tags_of(asset).unwrap().into_iter().map(|t| t.path).collect::<Vec<_>>();
+        let tree = |cat: &Catalog| tag_tree(cat).unwrap().into_iter().map(|n| format!("{}{} {}", "-".repeat(n.depth), n.name, n.count)).collect::<Vec<_>>();
+        assert_eq!(tree(&cat), ["Holidays 1", "-1998 1", "People 2", "-Bob 1", "-Family 1", "--Al 1", "Trips 1", "-1998 1"]);
+
+        // Onto a taken path: asked first, then merged.
+        assert_eq!(rename_tag(&mut cat, "trips", "HOLIDAYS", false).unwrap(), Renamed::Taken("Holidays".into()));
+        assert_eq!(rename_tag(&mut cat, "trips", "HOLIDAYS", true).unwrap(), Renamed::Done(Retagged { to: "Holidays".into(), assets: vec![b] }));
+        assert_eq!(paths(&cat, b), ["Holidays|1998", "People|Bob"]);
+        assert!(matches!(rename_tag(&mut cat, "Holidays", "People|Holidays", false), Err(_)), "not a person");
+        assert!(rename_tag(&mut cat, "nothing", "x", false).is_err());
+
+        // A person keeps their place, and is renamed as a person (faces follow).
+        assert_eq!(
+            rename_tag(&mut cat, "People|Family|Al", "Alan", false).unwrap(),
+            Renamed::Done(Retagged { to: "People|Family|Alan".into(), assets: vec![a] })
+        );
+        assert_eq!(cat.face_boxes(a).unwrap()[0].person.as_ref().map(|p| p.1.clone()), Some("Alan".into()));
+        // Merged by name into another person; a keyword into a person isn't.
+        assert!(merge_tags(&mut cat, "Holidays", "People|Bob").is_err());
+        assert_eq!(merge_tags(&mut cat, "People|Family|Alan", "bob").unwrap(), Retagged { to: "People|Bob".into(), assets: vec![a] });
+        assert_eq!(paths(&cat, a), ["Holidays|1998", "People|Bob"]);
+        assert_eq!(cat.face_boxes(a).unwrap()[0].person.as_ref().map(|p| p.1.clone()), Some("Bob".into()));
+
+        assert!(delete_tag(&mut cat, "People").is_err());
+        assert!(rename_tag(&mut cat, "People", "Folks", false).is_err());
+        assert_eq!(delete_tag(&mut cat, "people|bob").unwrap(), [a, b]);
+        assert_eq!(paths(&cat, a), ["Holidays|1998"]);
+        assert!(cat.face_boxes(a).unwrap()[0].person.is_none(), "un-named");
+        assert_eq!(tree(&cat), ["Holidays 2", "-1998 2"]);
     }
 
     #[test]

@@ -163,25 +163,12 @@ impl Catalog {
             return Ok(());
         }
         self.person_tag_path(into)?;
-        self.childless_person(from)?;
+        let path = self.childless_person(from)?;
         let tx = self.conn.transaction()?;
-        tx.execute("UPDATE faces SET person = ?2 WHERE person = ?1", [from.0, into.0])?;
-        tx.execute("UPDATE faces SET suggested = ?2 WHERE suggested = ?1", [from.0, into.0])?;
-        tx.execute("INSERT OR IGNORE INTO face_rejections (face_id, tag_id) SELECT face_id, ?2 FROM face_rejections WHERE tag_id = ?1", [
-            from.0, into.0,
-        ])?;
-        tx.execute("DELETE FROM face_rejections WHERE tag_id = ?1 AND face_id IN (SELECT id FROM faces WHERE person = ?1)", [into.0])?;
-        tx.execute(
-            "INSERT INTO asset_tags (asset_id, tag_id, source, confidence, hidden, x, y, w, h)
-                 SELECT asset_id, ?2, source, confidence, hidden, x, y, w, h FROM asset_tags WHERE tag_id = ?1
-             ON CONFLICT DO UPDATE SET hidden = hidden AND excluded.hidden,
-                 x = CASE WHEN x IS NULL THEN excluded.x ELSE x END, y = CASE WHEN x IS NULL THEN excluded.y ELSE y END,
-                 w = CASE WHEN x IS NULL THEN excluded.w ELSE w END, h = CASE WHEN x IS NULL THEN excluded.h ELSE h END",
-            [from.0, into.0],
-        )?;
-        tx.execute("DELETE FROM asset_tags WHERE tag_id = ?1", [from.0])?;
+        super::tags::move_tag_rows(&tx, from, into)?;
         tx.execute("DELETE FROM tags WHERE id = ?1", [from.0])?;
         backfill_person_tags(&tx)?;
+        super::tags::prune_ancestors(&tx, &path)?;
         tx.commit()?;
         Ok(())
     }
@@ -194,15 +181,11 @@ impl Catalog {
     }
 
     fn delete_person_inner(&mut self, person: TagId) -> Result<()> {
-        self.childless_person(person)?;
+        let path = self.childless_person(person)?;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "UPDATE faces SET person = NULL, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL WHERE person = ?1",
-            [person.0],
-        )?;
-        tx.execute("UPDATE faces SET suggested = NULL, similarity = NULL WHERE suggested = ?1", [person.0])?;
-        tx.execute("DELETE FROM asset_tags WHERE tag_id = ?1", [person.0])?;
+        super::tags::drop_tag_rows(&tx, person)?;
         tx.execute("DELETE FROM tags WHERE id = ?1", [person.0])?;
+        super::tags::prune_ancestors(&tx, &path)?;
         tx.commit()?;
         Ok(())
     }

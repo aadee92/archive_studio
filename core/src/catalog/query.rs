@@ -12,6 +12,8 @@
 //! "birthday party"       quotes for spaces
 //! person:alice           only tags of that kind (keyword, scene, object, person, place, event)
 //! person:*               any tag of that kind: photos with someone recognized in them
+//! =People|Ann            exactly that tag and the tags under it (People|Ann|…), not
+//!                        People|Anna or Family|People|Ann; =person:Family too
 //! -*                     untagged
 //! ```
 //!
@@ -20,7 +22,8 @@
 //! A term matches a tag if it is one or more consecutive segments of the tag's path,
 //! ignoring ASCII case: `alice`, `family`, `family|alice` and `people|family|alice` all
 //! match `People|Family|Alice`. So searching a tag also finds everything under it
-//! (`people` finds every person tagged under `People|…`).
+//! (`people` finds every person tagged under `People|…`). A term led by `=` is a whole
+//! path from the top instead, with its subtree: what a front end's tag tree filters by.
 
 use rusqlite::types::Value;
 
@@ -31,6 +34,8 @@ pub enum Expr {
     /// Matches everything (the empty query).
     All,
     Term { kind: Option<TagKind>, text: String },
+    /// `=path`: the tag at `path` (ignoring ASCII case) and the tags under it.
+    Under { kind: Option<TagKind>, path: String },
     Not(Box<Expr>),
     And(Vec<Expr>),
     Or(Vec<Expr>),
@@ -44,6 +49,7 @@ impl Expr {
             Expr::Term { kind, text } => {
                 tags.iter().any(|(t, k)| tag_matches(t, *k, *kind, text))
             }
+            Expr::Under { kind, path } => tags.iter().any(|(t, k)| kind_matches(*k, *kind) && is_under(t, path)),
             Expr::Not(inner) => !inner.matches(tags),
             Expr::And(items) => items.iter().all(|item| item.matches(tags)),
             Expr::Or(items) => items.iter().any(|item| item.matches(tags)),
@@ -51,13 +57,20 @@ impl Expr {
     }
 }
 
+/// A tag of unknown kind (a folder name, a sidecar's keyword) matches any kind.
+fn kind_matches(tag_kind: Option<TagKind>, term_kind: Option<TagKind>) -> bool {
+    term_kind.is_none_or(|expected| tag_kind.is_none_or(|actual| actual == expected))
+}
+
+/// Whether `tag_path` is `path` or under it, ignoring ASCII case and spaces around `|`.
+fn is_under(tag_path: &str, path: &str) -> bool {
+    let mut tag = tag_path.split('|').map(str::trim);
+    path.split('|').all(|segment| tag.next().is_some_and(|t| t.eq_ignore_ascii_case(segment)))
+}
+
 fn tag_matches(tag_path: &str, tag_kind: Option<TagKind>, term_kind: Option<TagKind>, term_text: &str) -> bool {
-    if let Some(expected_kind) = term_kind {
-        if let Some(actual_kind) = tag_kind {
-            if actual_kind != expected_kind {
-                return false;
-            }
-        }
+    if !kind_matches(tag_kind, term_kind) {
+        return false;
     }
     if term_text == "*" {
         return true;
@@ -83,6 +96,8 @@ enum Token {
     And,
     Or,
     Not,
+    /// `=`: the term after it is a whole path, with its subtree.
+    Exact,
     Term { kind: Option<TagKind>, text: String },
 }
 
@@ -105,6 +120,10 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
             '-' | '!' => {
                 chars.next();
                 tokens.push(Token::Not);
+            }
+            '=' => {
+                chars.next();
+                tokens.push(Token::Exact);
             }
             '&' => {
                 chars.next();
@@ -191,11 +210,11 @@ impl Parser {
         let mut all = Vec::new();
         loop {
             if !all.is_empty() && self.tokens.next_if_eq(&Token::And).is_some() {
-                if !matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Term { .. })) {
+                if !matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Exact | Token::Term { .. })) {
                     return Err("AND needs a term after it".into());
                 }
             }
-            if matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Term { .. })) {
+            if matches!(self.tokens.peek(), Some(Token::Open | Token::Not | Token::Exact | Token::Term { .. })) {
                 all.push(self.unary()?);
             } else {
                 break;
@@ -223,6 +242,11 @@ impl Parser {
                     _ => Err("unclosed '('".into()),
                 }
             }
+            Some(Token::Exact) => match self.unary() {
+                Ok(Expr::Term { kind, text }) if text != "*" => Ok(Expr::Under { kind, path: text }),
+                Ok(term @ Expr::Term { .. }) => Ok(term),
+                _ => Err("= needs a tag after it".into()),
+            },
             Some(Token::Term { kind, text }) => {
                 let text = text.split('|').map(str::trim).collect::<Vec<_>>().join("|");
                 if text.split('|').any(str::is_empty) {
@@ -261,6 +285,21 @@ fn write(expr: &Expr, min_confidence: f32, sql: &mut String, values: &mut Vec<Va
         Expr::Not(inner) => {
             sql.push_str("NOT ");
             write(inner, min_confidence, sql, values);
+        }
+        Expr::Under { kind, path } => {
+            if values.is_empty() {
+                values.push(Value::Real(min_confidence.into()));
+            }
+            sql.push_str("a.id IN (SELECT t.asset_id FROM tags g CROSS JOIN asset_tags t ON t.tag_id = g.id WHERE ");
+            sql.push_str("NOT t.hidden AND (t.confidence IS NULL OR t.confidence >= ?1)");
+            // Paths are stored trimmed; LIKE ignores ASCII case.
+            values.push(Value::Text(format!("{}|%", escape_like(path))));
+            sql.push_str(&format!(" AND (g.path || '|') LIKE ?{} ESCAPE '\\'", values.len()));
+            if let Some(kind) = kind {
+                values.push(Value::Text(kind.name().into()));
+                sql.push_str(&format!(" AND g.kind = ?{}", values.len()));
+            }
+            sql.push(')');
         }
         Expr::Term { kind, text } => {
             if values.is_empty() {

@@ -1,14 +1,20 @@
 import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
-import { ScrollRestore } from "nav.slint";
-import { ItemMenu } from "menu.slint";
+import { ScrollRestore, UiLog } from "nav.slint";
+import { ItemMenu, TagEdit } from "menu.slint";
 
-// A tag in the filter list: shown as `label` ("People / Alice"), filtered by `query` (the
-// tag path, quoted if it has spaces).
+// A line of the tag tree: `label` is the last segment ("Alice" for `People|Alice`), indented
+// by `depth`; `count` items carry it or a tag under it. Picking it filters by `query`
+// (`=People|Alice`: the tag and its subtree, quoted if it has spaces).
 export struct TagItem {
     label: string,
+    path: string,
     query: string,
+    depth: int,
+    count: int,
+    has-children: bool,
+    expanded: bool,
 }
 
 // The "Needs attention" filters; each one that is on narrows the view further.
@@ -81,6 +87,8 @@ export global ReviewBridge {
     callback open(int, int);
     // Right-click. Shows the item context menu (`ItemMenu`).
     callback context-menu(int, int);
+    // The tag tree: a node's triangle was clicked (expands or collapses it).
+    callback toggle-tag(/* path */ string);
 }
 
 component Chip inherits Rectangle {
@@ -376,6 +384,32 @@ export component ReviewPage inherits Rectangle {
 
     background: Theme.bg;
 
+    // The tag tree's right-click menu (`TagEdit.action` opens the dialog for it), shown where
+    // a tag was right-clicked; never opened by its own right-clicks.
+    property <TagItem> menu-tag;
+    tag-menu-area := ContextMenuArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        enabled: false;
+        Menu {
+            MenuItem {
+                title: "Rename…";
+                activated => { TagEdit.action(root.menu-tag.path, root.menu-tag.count, root.menu-tag.has-children, "rename"); }
+            }
+            MenuItem {
+                title: "Merge into…";
+                activated => { TagEdit.action(root.menu-tag.path, root.menu-tag.count, root.menu-tag.has-children, "merge"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Delete…";
+                activated => { TagEdit.action(root.menu-tag.path, root.menu-tag.count, root.menu-tag.has-children, "delete"); }
+            }
+        }
+    }
+
     HorizontalLayout {
         // Full height left pane for Search & Filter (just to the right of the scan/review buttons)
         Rectangle {
@@ -605,30 +639,59 @@ export component ReviewPage inherits Rectangle {
                         }
 
                         ListView {
-                            for tag in ReviewBridge.available-tags: Rectangle {
-                                height: 28px;
-                                background: (root.selected-tag == tag.query || tag-search.text == tag.query)
-                                    ? Theme.accent-soft
-                                    : tag-ta.has-hover ? Theme.hover : transparent;
+                            for tag in ReviewBridge.available-tags: tag-row := Rectangle {
+                                property <bool> picked: root.selected-tag == tag.query || tag-search.text == tag.query;
+                                height: 26px;
+                                background: self.picked ? Theme.accent-soft : tag-ta.has-hover ? Theme.hover : transparent;
 
-                                HorizontalLayout {
-                                    padding-left: 10px;
-                                    padding-right: 10px;
-                                    alignment: start;
-                                    Text {
-                                        text: tag.label;
-                                        font-size: 12px;
-                                        color: (root.selected-tag == tag.query || tag-search.text == tag.query)
-                                            ? Theme.accent
-                                            : Theme.text;
-                                        overflow: elide;
-                                        vertical-alignment: center;
-                                    }
-                                }
-
+                                // Picks the tag (again: unpicks it); right-click for its menu.
                                 tag-ta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.select-tag(tag.query); }
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                            root.menu-tag = tag;
+                                            UiLog.debug("review.tags", "tag menu for \{tag.path}");
+                                            tag-menu-area.show({
+                                                x: self.absolute-position.x + self.mouse-x - root.absolute-position.x,
+                                                y: self.absolute-position.y + self.mouse-y - root.absolute-position.y });
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 4px + tag.depth * 14px;
+                                    padding-right: 10px;
+                                    spacing: 2px;
+                                    // Expands / collapses the tags under it.
+                                    Rectangle {
+                                        width: 16px;
+                                        if tag.has-children: Text {
+                                            text: tag.expanded ? "▾" : "▸";
+                                            font-size: 11px;
+                                            color: twisty-ta.has-hover ? Theme.text : Theme.text-muted;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        twisty-ta := TouchArea {
+                                            enabled: tag.has-children;
+                                            mouse-cursor: tag.has-children ? pointer : default;
+                                            clicked => { ReviewBridge.toggle-tag(tag.path); }
+                                        }
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: tag.label;
+                                        font-size: 12px;
+                                        color: tag-row.picked ? Theme.accent : Theme.text;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: tag.count;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                         }

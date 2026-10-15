@@ -180,6 +180,10 @@ pub fn rotate(root: &Path, pipeline: &Handle, path: &Path, cw: u16) -> Result<()
 }
 
 fn open(root: &Path) -> Result<Catalog, String> {
+    open_catalog(root)
+}
+
+pub(crate) fn open_catalog(root: &Path) -> Result<Catalog, String> {
     Catalog::open(&Catalog::default_path(root), root).map_err(|e| format!("catalog: {e}"))
 }
 

@@ -16,8 +16,8 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), and bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag; `tag` and `delete` / `restore` take several files), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`) |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction), and tags as a whole (`tag_tree`, `rename_tag`, `merge_tags`, `delete_tag`). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag; `tag` and `delete` / `restore` take several files; `tags` as a tree with counts, `rename-tag`, `merge-tag`, `delete-tag`), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`) |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -111,6 +111,25 @@ XMP sidecar sync.
   tags (ignoring case; `kind:path` restricts the kind; a bare name can be a person). A
   person tag taken off un-names that person's faces on the asset rather than being refused:
   the tag is what says they are in the picture (`Catalog::remove_tag`).
+- **Tags as a whole** (`tags`): `tag_counts(min_confidence)` gives every tag with how many
+  live assets (not trashed) carry it or a tag under it, in one query (detector tags from the
+  confidence asked, as searches count them); `tags::tree` lays counts out as the hierarchy,
+  and `TagCounter` counts the same way in memory for a front end that holds every asset's
+  tags. `rename_tag` moves a tag with its subtree (a change of case too), makes missing
+  ancestors of the new path and fails, changing nothing, onto a taken path; `merge_tags`
+  moves each tag of `from`'s subtree onto its counterpart under `into` (or renames it there),
+  with its asset rows, faces named or suggested as it and rejections; `delete_tag` takes the
+  subtree off every asset and un-names faces named as one of them. All mark the assets for
+  sidecar sync, and drop ancestors left with nothing on or under them. `tag_assets` lists
+  the live assets a change touches. Front ends go through `ops::tag_tree`, `ops::rename_tag`
+  (`Renamed::Taken` onto another tag's path unless asked to merge), `ops::merge_tags`,
+  `ops::delete_tag`: a person stays under `People|` and goes through `rename_person` /
+  `merge_people` / `delete_person`; only people merge with people; `People` itself is kept.
+  A front end that reads sidecars as well skips what the catalog wrote there itself
+  (`sidecar_tags`): it may be stale until the next sync.
+- **Search syntax** (`query`): a plain term matches consecutive segments of a tag path
+  anywhere; `=People|Ann` is that path from the top and its subtree (not `People|Anna`),
+  what a tag tree filters by.
 - **Many at once** (`ops::delete_all`, `ops::restore_all`, `ops::add_tag_all`): deleting
   and restoring go asset by asset (files move; one failing doesn't stop the others) and
   return each asset's result, so a front end can undo exactly what went; tagging is one

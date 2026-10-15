@@ -42,7 +42,13 @@ person rename NAME NEW     rename a person (onto an existing one: merge)
 person merge NAME INTO     NAME's faces and tags become INTO's
 person delete NAME         un-name their faces and drop their tag
 sync-people                put missing People| tags on files with named faces
-tags PATH                  the file's tags
+tags [PATH]                every tag as a tree with how many files carry it (or one
+                           under it), or the file's tags
+rename-tag OLD -> NEW      rename a tag and the tags under it (one word each: no ->); a
+                           person stays under People| (NEW alone keeps their place)
+merge-tag FROM -> INTO     FROM's files, faces and sub-tags become INTO's
+delete-tag TAG             take a tag and the tags under it off every file (faces named
+                           by a person tag are un-named)
 tag PATH... [KIND:]TAG     add a tag to one or more files (KIND: keyword, scene, object,
                            person, place, event; People|NAME is a person)
 untag PATH [KIND:]TAG      remove a tag (a bare NAME can be a person; a person tag also
@@ -304,7 +310,11 @@ impl Shell {
             "add-face" => self.add_face(rest),
             "person" => self.person(rest),
             "sync-people" => self.catalog.sync_person_tags().map(|n| println!("added {n} person tags")).map_err(|e| e.to_string()),
+            "tags" if rest.is_empty() => self.tag_tree(),
             "tags" => self.tags(rest),
+            "rename-tag" => self.rename_tag(rest),
+            "merge-tag" => self.merge_tag(rest),
+            "delete-tag" => self.delete_tag(rest),
             "tag" => self.tag(rest),
             "untag" => self.untag(rest),
             "props" => self.props(rest),
@@ -565,13 +575,7 @@ impl Shell {
     fn person(&mut self, args: &[&str]) -> Result<(), String> {
         let usage = "person rename NAME -> NEW | person merge NAME -> INTO | person delete NAME";
         let Some((&action, rest)) = args.split_first() else { return Err(usage.into()) };
-        let two = || -> Result<(String, String), String> {
-            match rest.iter().position(|w| *w == "->") {
-                Some(i) => Ok((rest[..i].join(" "), rest[i + 1..].join(" "))),
-                None if rest.len() == 2 => Ok((rest[0].to_owned(), rest[1].to_owned())),
-                None => Err(usage.to_owned()),
-            }
-        };
+        let two = || two_names(rest, usage);
         let existing = |catalog: &Catalog, name: &str| -> Result<archive_core::catalog::TagId, String> {
             let known = catalog.leaf_tags(TagKind::Person).map_err(err)?;
             let lower = name.to_lowercase();
@@ -603,6 +607,43 @@ impl Shell {
             _ => return Err(usage.into()),
         }
         println!("done");
+        Ok(())
+    }
+
+    /// Every tag as an indented tree, with how many files carry it or a tag under it.
+    fn tag_tree(&self) -> Result<(), String> {
+        let nodes = ops::tag_tree(&self.catalog).map_err(err)?;
+        if nodes.is_empty() {
+            println!("no tags");
+        }
+        for node in nodes {
+            println!("{:>6}  {}{}", node.count, "  ".repeat(node.depth), node.name);
+        }
+        Ok(())
+    }
+
+    fn rename_tag(&mut self, args: &[&str]) -> Result<(), String> {
+        let (old, new) = two_names(args, "rename-tag OLD -> NEW")?;
+        match ops::rename_tag(&mut self.catalog, &old, &new, false).map_err(err)? {
+            ops::Renamed::Done(done) => println!("now {}; {} files changed", done.to, done.assets.len()),
+            ops::Renamed::Taken(path) => return Err(format!("{path} already exists; merge-tag {old} -> {path} merges them")),
+        }
+        Ok(())
+    }
+
+    fn merge_tag(&mut self, args: &[&str]) -> Result<(), String> {
+        let (from, into) = two_names(args, "merge-tag FROM -> INTO")?;
+        let done = ops::merge_tags(&mut self.catalog, &from, &into).map_err(err)?;
+        println!("merged into {}; {} files changed", done.to, done.assets.len());
+        Ok(())
+    }
+
+    fn delete_tag(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.is_empty() {
+            return Err("delete-tag TAG".into());
+        }
+        let assets = ops::delete_tag(&mut self.catalog, &args.join(" ")).map_err(err)?;
+        println!("deleted; it was on {} files", assets.len());
         Ok(())
     }
 
@@ -881,6 +922,15 @@ impl Shell {
         let n = self.catalog.empty_trash(std::time::Duration::from_secs(days * 86_400)).map_err(err)?;
         println!("deleted {n} files for good");
         Ok(())
+    }
+}
+
+/// Two names (tags, people) from the arguments: separated by `->`, or one word each.
+fn two_names(args: &[&str], usage: &str) -> Result<(String, String), String> {
+    match args.iter().position(|w| *w == "->") {
+        Some(i) if i > 0 && i + 1 < args.len() => Ok((args[..i].join(" "), args[i + 1..].join(" "))),
+        None if args.len() == 2 => Ok((args[0].to_owned(), args[1].to_owned())),
+        _ => Err(usage.to_owned()),
     }
 }
 

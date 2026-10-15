@@ -6,11 +6,11 @@ import { PeoplePage, PeopleBridge } from "people.slint";
 import { DetailsPage, DetailsBridge } from "details.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
-import { ItemMenu, PropRow, TagDialog, PropertiesDialog, Notice } from "menu.slint";
+import { ItemMenu, PropRow, TagDialog, PropertiesDialog, Notice, TagEdit, TagEditDialog } from "menu.slint";
 import { StatusBar, LogPanel, LogBridge, LogLine } from "log.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
-export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, UiLog, ItemMenu, PropRow, LogBridge, LogLine }
+export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, UiLog, ItemMenu, TagEdit, PropRow, LogBridge, LogLine }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
@@ -110,6 +110,8 @@ export component AppWindow inherits Window {
     changed tag-open => { UiLog.debug("window.overlay", "tag dialog \{self.tag-open ? "shown" : "hidden"}"); }
     property <bool> props-open: ItemMenu.props-open;
     changed props-open => { UiLog.debug("window.overlay", "properties dialog \{self.props-open ? "shown" : "hidden"}"); }
+    property <string> tag-edit: TagEdit.mode;
+    changed tag-edit => { UiLog.debug("window.overlay", self.tag-edit == "" ? "tag edit dialog hidden" : "tag edit dialog shown (\{self.tag-edit})"); }
     property <string> notice: ItemMenu.notice;
     changed notice => { UiLog.debug("window.overlay", self.notice == "" ? "notice hidden" : "notice shown: \{self.notice}"); }
 
@@ -170,6 +172,10 @@ export component AppWindow inherits Window {
         y: root.height - self.height - 80px - (LogBridge.open ? LogBridge.panel-height : 0px);
     }
     if ItemMenu.tag-open: TagDialog {
+        width: root.width;
+        height: root.height;
+    }
+    if TagEdit.mode != "": TagEditDialog {
         width: root.width;
         height: root.height;
     }

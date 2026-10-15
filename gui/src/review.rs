@@ -33,6 +33,11 @@
 //! it, so an action on the selection only ever touches what is shown. Back snapshots keep
 //! it by path. Right-clicking an item of a multi-selection gives the menu for all of them.
 //!
+//! Tags: the left pane's tag tree counts each tag on the live entries (with the tags under
+//! it: `TagCounter`, kept up as entries come and go) and filters by a picked tag's subtree
+//! (`=People|Ann`); nodes collapse. Its right-click menu renames, merges or deletes a tag
+//! ([`crate::tags`]); [`tag_moved`] then makes a filter on that tag follow.
+//!
 //! Search by description: in "Description" mode the search text is ranked against the
 //! images' CLIP embeddings on a worker ([`semantic`]), as is "Find similar" from the item
 //! menu ([`find_similar`]). The ranking (path hash -> rank) becomes part of the [`Query`]:
@@ -44,7 +49,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicBool};
@@ -57,6 +62,7 @@ use slint::{ComponentHandle, Model, ModelNotify, ModelRc, ModelTracker, SharedSt
 use crate::thumbs::{self, sched, Delivery, ThumbCache, Threads, Tier};
 use archive_core::catalog::query::{self, Expr};
 use archive_core::catalog::flags::AssetFlags;
+use archive_core::catalog::tags::{TagCounter, TagNode};
 use archive_core::catalog::{AssetId, Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
@@ -590,7 +596,12 @@ struct GridModel {
     deferred: RefCell<Vec<FileUpdate>>,
     thumbs: ThumbCache,
     ready: Arc<Mailbox<Ready>>,
-    available_tags: RefCell<BTreeSet<String>>,
+    /// How many live entries carry each tag or one under it: the tag tree.
+    tag_counts: RefCell<TagCounter>,
+    /// Tag tree nodes collapsed, by lowercase path.
+    collapsed: RefCell<HashSet<String>>,
+    /// The tag tree's lines as shown; updated in place.
+    tag_model: Rc<VecModel<TagItem>>,
     /// A scroll position to return to (Back) once the refilter in flight lands: the first
     /// tile that was in view, how far its row was scrolled past, and a tile to keep in view
     /// (the item last shown on Details).
@@ -712,6 +723,9 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
             with_grid(|g| g.set_filters(filters.clone()))
         });
     });
+
+    bridge.set_available_tags(ModelRc::from(grid.tag_model.clone()));
+    bridge.on_toggle_tag(|path| with_grid(|g| g.toggle_tag(&path)));
 
     grid.publish_status();
     grid.publish_tags();
@@ -895,13 +909,15 @@ fn extract_file_tags(path: &Path, root: &Path, cat: Option<&Catalog>, asset: Opt
         }
     }
 
-    // 2. Tags from XMP sidecar
+    // 2. Tags from XMP sidecar, but those the catalog wrote there itself: they may be stale
+    // (renamed, taken off) until the pipeline syncs the sidecar again.
+    let ours = cat.zip(asset).and_then(|(cat, asset)| cat.sidecar_tags(asset).ok()).unwrap_or_default();
     let sidecar = archive_core::catalog::xmp::sidecar_path(path);
     if sidecar.is_file() {
         if let Ok(content) = fs::read_to_string(&sidecar) {
             if let Ok(xmp_tags) = archive_core::catalog::xmp::extract_tags(&content) {
                 for (path, kind) in xmp_tags {
-                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&path)) {
+                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&path)) && !ours.iter().any(|p| p.eq_ignore_ascii_case(&path)) {
                         tags.push((path, Some(kind)));
                     }
                 }
@@ -1076,7 +1092,9 @@ impl GridModel {
             deferred: RefCell::default(),
             thumbs,
             ready,
-            available_tags: RefCell::default(),
+            tag_counts: RefCell::default(),
+            collapsed: RefCell::default(),
+            tag_model: Rc::default(),
             restore: RefCell::default(),
             #[cfg(test)]
             redrain_due: Cell::new(false),
@@ -1100,13 +1118,10 @@ impl GridModel {
         self.indexing.set(!done);
         let mut tags_changed = false;
         {
-            let mut known = self.available_tags.borrow_mut();
-            for entry in batch.iter() {
-                for (t, _) in entry.tags.iter() {
-                    if known.insert(t.clone()) {
-                        tags_changed = true;
-                    }
-                }
+            let mut counts = self.tag_counts.borrow_mut();
+            for entry in batch.iter().filter(|e| !e.tags.is_empty()) {
+                counts.add(entry.tags.iter().map(|(t, _)| t.as_str()));
+                tags_changed = true;
             }
         }
         if tags_changed {
@@ -1152,10 +1167,12 @@ impl GridModel {
             return;
         }
         let (mut retired, mut fresh, mut replaced) = (Vec::new(), Vec::new(), Vec::new());
-        // A file's tags changed or a tagged file left: the tag list may have lost some.
+        // A tagged file was replaced or left: its tags no longer count (a replacement's are
+        // counted as it is appended).
         let mut tags_changed = false;
         {
             let (index, by_path) = (self.entries.borrow(), self.by_path.borrow());
+            let mut counts = self.tag_counts.borrow_mut();
             let mut seen = HashSet::new();
             // Newest first: only the last report of a path counts.
             for update in updates.into_iter().rev() {
@@ -1174,14 +1191,20 @@ impl GridModel {
                             if !changed && (old.size, old.mtime, &old.tags, old.flags) == (entry.size, entry.mtime, &entry.tags, entry.flags) {
                                 continue;
                             }
-                            tags_changed |= old.tags != entry.tags;
+                            if !old.tags.is_empty() {
+                                counts.remove(old.tags.iter().map(|(t, _)| t.as_str()));
+                                tags_changed = true;
+                            }
                             retired.push(id);
                             replaced.push((id, fresh.len()));
                         }
                         fresh.push(entry);
                     }
                     FileUpdate::Gone(_) => {
-                        tags_changed |= current.and_then(|id| index.get(id)).is_some_and(|e| !e.tags.is_empty());
+                        if let Some(old) = current.and_then(|id| index.get(id)).filter(|e| !e.tags.is_empty()) {
+                            counts.remove(old.tags.iter().map(|(t, _)| t.as_str()));
+                            tags_changed = true;
+                        }
                         retired.extend(current)
                     }
                 }
@@ -1212,7 +1235,7 @@ impl GridModel {
             self.prune_selection();
         }
         if tags_changed {
-            self.recompute_tags();
+            self.publish_tags();
         }
         self.publish_status();
         self.publish_selection();
@@ -1945,20 +1968,36 @@ impl GridModel {
         bridge.set_empty(shown == 0);
     }
 
+    /// Shows the tag tree as counted now, without the lines under collapsed nodes; lines
+    /// that didn't change aren't touched (it is redone for every indexer batch).
     fn publish_tags(&self) {
-        let Some(ui) = self.ui.upgrade() else { return };
-        let tags: Vec<TagItem> = self.available_tags.borrow().iter().map(|path| tag_item(path)).collect();
-        ui.global::<ReviewBridge>().set_available_tags(ModelRc::new(VecModel::from(tags)));
+        let items = tag_items(&self.tag_counts.borrow().tree(), &self.collapsed.borrow());
+        let model = &self.tag_model;
+        if model.row_count() == items.len() {
+            for (i, item) in items.into_iter().enumerate() {
+                if model.row_data(i).as_ref() != Some(&item) {
+                    model.set_row_data(i, item);
+                }
+            }
+        } else {
+            model.set_vec(items);
+        }
     }
 
-    /// Lists the tags of the entries still in the library afresh (tags were taken off,
-    /// renamed, or their files left), republishing them if that changed anything.
-    fn recompute_tags(&self) {
-        let tags: BTreeSet<String> = self.entries.borrow().live_from(0).flat_map(|(_, e)| e.tags.iter().map(|(t, _)| t.clone())).collect();
-        if *self.available_tags.borrow() != tags {
-            *self.available_tags.borrow_mut() = tags;
-            self.publish_tags();
-        }
+    /// Expands or collapses the tag tree's node at `path`.
+    fn toggle_tag(&self, path: &str) {
+        let key = path.to_ascii_lowercase();
+        let collapsed = {
+            let mut set = self.collapsed.borrow_mut();
+            if !set.remove(&key) {
+                set.insert(key);
+                true
+            } else {
+                false
+            }
+        };
+        log::debug!("review tag tree: {} {path:?}", if collapsed { "collapse" } else { "expand" });
+        self.publish_tags();
     }
 }
 
@@ -2041,16 +2080,65 @@ fn attention_label(a: &Attention) -> String {
     on.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect::<Vec<_>>().join(", ")
 }
 
-/// A tag for the filter list: `People|Alice` is shown as "People / Alice" and filtered by
-/// its path, quoted if it has spaces (so `People|Ann Lee` isn't two terms).
-fn tag_item(path: &str) -> TagItem {
-    let label = path.split('|').map(str::trim).collect::<Vec<_>>().join(" / ");
-    let query = if path.chars().any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '&' | '!')) && !path.contains('"') {
-        format!("\"{path}\"")
-    } else {
-        path.to_owned()
-    };
-    TagItem { label: label.into(), query: query.into() }
+/// The tag tree's lines, but those under a collapsed node.
+fn tag_items(nodes: &[TagNode], collapsed: &HashSet<String>) -> Vec<TagItem> {
+    let mut items = Vec::new();
+    // Lines deeper than this are under a collapsed node.
+    let mut hide_below: Option<usize> = None;
+    for node in nodes {
+        if hide_below.is_some_and(|depth| node.depth > depth) {
+            continue;
+        }
+        let expanded = !collapsed.contains(&node.path.to_ascii_lowercase());
+        hide_below = (node.has_children && !expanded).then_some(node.depth);
+        items.push(TagItem {
+            label: node.name.as_str().into(),
+            path: node.path.as_str().into(),
+            query: tag_query(&node.path).into(),
+            depth: node.depth as i32,
+            count: node.count.min(i32::MAX as usize) as i32,
+            has_children: node.has_children,
+            expanded,
+        });
+    }
+    items
+}
+
+/// What picking the tag at `path` filters by: it and the tags under it (`=People|Ann`), the
+/// path quoted if it has spaces or the like (so `People|Ann Lee` isn't two terms).
+pub(crate) fn tag_query(path: &str) -> String {
+    let plain = !path.chars().any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '&' | '!' | '"'))
+        && !path.starts_with(['-', '='])
+        && !["or", "and", "not", "||", "&&"].iter().any(|w| path.eq_ignore_ascii_case(w));
+    if plain || path.contains('"') { format!("={path}") } else { format!("=\"{path}\"") }
+}
+
+/// The tag path a tag tree pick filters by ([`tag_query`]'s), if `query` is one.
+fn picked_path(query: &str) -> Option<&str> {
+    let path = query.strip_prefix('=')?;
+    Some(path.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(path))
+}
+
+/// The tag at `from` was renamed or merged (into `to`) or deleted (`None`): a tag filter
+/// picked from the tree for it, or for a tag under it, follows (or is cleared).
+pub fn tag_moved(ui: &AppWindow, from: &str, to: Option<&str>) {
+    let bridge = ui.global::<ReviewBridge>();
+    let picked = bridge.get_tag_text();
+    let Some(path) = picked_path(&picked) else { return };
+    let (path_lc, from_lc) = (path.to_ascii_lowercase(), from.to_ascii_lowercase());
+    if path_lc != from_lc && !path_lc.starts_with(&format!("{from_lc}|")) {
+        return;
+    }
+    let query = to.map(|to| tag_query(&format!("{to}{}", &path[from.len().min(path.len())..]))).unwrap_or_default();
+    log::debug!("review: the tag filter {picked:?} follows {from:?} -> {to:?}: {query:?}");
+    let picked_from_tree = bridge.get_selected_tag() == picked;
+    bridge.set_tag_text(query.clone().into());
+    bridge.set_selected_tag(if picked_from_tree { query.clone().into() } else { SharedString::default() });
+    with_grid(|g| {
+        let mut filters = g.filters.borrow().clone();
+        filters.tag = query;
+        g.set_filters(filters);
+    });
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -2463,26 +2551,51 @@ mod tests {
         let a = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at);
         let b = Entry::new("/x/b.png".into(), "b.png".into(), MediaKind::Image, 20, at);
         g.append(vec![a, b].into(), true);
-        assert!(g.available_tags.borrow().is_empty());
+        assert!(g.tag_counts.borrow().is_empty());
 
         let named = Entry::with_tags("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at, vec![
             ("People|Ann Lee".to_owned(), Some(TagKind::Person)),
         ]);
-        g.update_files(vec![present(&named, false)]);
-        assert_eq!(g.available_tags.borrow().iter().collect::<Vec<_>>(), ["People|Ann Lee"]);
-        let item = tag_item("People|Ann Lee");
-        assert_eq!((item.label.as_str(), item.query.as_str()), ("People / Ann Lee", "\"People|Ann Lee\""));
+        let anna = Entry::with_tags("/x/b.png".into(), "b.png".into(), MediaKind::Image, 20, at, vec![
+            ("People|Ann Leeds".to_owned(), Some(TagKind::Person)),
+        ]);
+        g.update_files(vec![present(&named, false), present(&anna, false)]);
+        let items = tag_items(&g.tag_counts.borrow().tree(), &HashSet::new());
+        let lines: Vec<(&str, i32, i32, bool)> = items.iter().map(|t| (t.label.as_str(), t.depth, t.count, t.has_children)).collect();
+        assert_eq!(lines, [("People", 0, 2, true), ("Ann Lee", 1, 1, false), ("Ann Leeds", 1, 1, false)]);
+        assert_eq!((items[0].query.as_str(), items[1].query.as_str()), ("=People", "=\"People|Ann Lee\""));
+        // Collapsed, the people are hidden.
+        let collapsed = tag_items(&g.tag_counts.borrow().tree(), &HashSet::from(["people".to_owned()]));
+        assert_eq!((collapsed.len(), collapsed[0].expanded), (1, false));
 
-        g.set_query(Query::new(String::new(), item.query.to_string(), 0, Sort::Name));
-        let index = g.entries.borrow();
-        let shown: Vec<&str> = g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.as_str()).collect();
-        assert_eq!(shown, ["a.png"]);
-        drop(index);
+        // A pick filters by exactly that tag (not Ann Leeds), a parent by its subtree.
+        let shown = |query: &str| {
+            g.set_query(Query::new(String::new(), query.to_owned(), 0, Sort::Name));
+            let index = g.entries.borrow();
+            g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&items[1].query), ["a.png"]);
+        assert_eq!(shown(&items[0].query), ["a.png", "b.png"]);
 
-        // Un-named again: the tag leaves the list.
+        // Un-named again: the tag leaves the tree, its parent counts one.
         let unnamed = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at);
         g.update_files(vec![present(&unnamed, false)]);
-        assert!(g.available_tags.borrow().is_empty());
+        let tree: Vec<(String, usize)> = g.tag_counts.borrow().tree().into_iter().map(|n| (n.path, n.count)).collect();
+        assert_eq!(tree, [("People".to_owned(), 1), ("People|Ann Leeds".to_owned(), 1)]);
+        g.update_files(vec![FileUpdate::Gone("/x/b.png".into())]);
+        assert!(g.tag_counts.borrow().is_empty());
+    }
+
+    #[test]
+    fn tag_queries_and_picks() {
+        assert_eq!(tag_query("Dog"), "=Dog");
+        assert_eq!(tag_query("or"), "=\"or\"");
+        assert_eq!(tag_query("-x"), "=\"-x\"");
+        for path in ["Dog", "People|Ann Lee", "a(b)"] {
+            assert_eq!(picked_path(&tag_query(path)), Some(path));
+            assert!(query::parse(&tag_query(path)).is_ok());
+        }
+        assert_eq!(picked_path("dog"), None);
     }
 
     fn flagged(name: &str, flags: AssetFlags) -> Entry {
