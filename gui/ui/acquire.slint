@@ -10,6 +10,10 @@ export global AcquireBridge {
     callback start-alt(int);  // the device's secondary action, e.g. "Scan backs"
     callback stop(int);
     callback start-all();
+    // Double-click on a recent capture: (device row, slot in `recent`). Opens Details.
+    callback open-recent(int, int);
+    // Right-click on one. Hook for the item context menu (not implemented yet).
+    callback context-menu(int, int);
 }
 
 component StatusPill inherits Rectangle {
@@ -44,32 +48,65 @@ component StatusPill inherits Rectangle {
 }
 
 // The device's last few saved captures, newest first; empty slots keep the strip steady.
-component RecentStrip inherits HorizontalLayout {
+component RecentStrip inherits Rectangle {
     in property <[image]> thumbs;
+    // Double-click / right-click on the thumbnail in slot `i`.
+    callback open(int);
+    callback context-menu(int);
     property <int> slots: 5;
+    property <length> spacing: 6px;
+    property <length> slot-width: (self.width - (root.slots - 1) * root.spacing) / root.slots;
 
     height: 56px;
-    spacing: 6px;
 
-    for thumb in root.thumbs: Rectangle {
-        horizontal-stretch: 1;
-        min-width: 0;
-        background: Theme.well;
-        border-radius: 4px;
-        clip: true;
-        Image {
-            width: parent.width;
-            height: parent.height;
-            source: thumb;
-            image-fit: contain;
+    HorizontalLayout {
+        spacing: root.spacing;
+
+        for thumb[i] in root.thumbs: Rectangle {
+            horizontal-stretch: 1;
+            min-width: 0;
+            background: Theme.well;
+            border-radius: 4px;
+            border-width: i == root.hover ? 1px : 0px;
+            border-color: Theme.accent;
+            clip: true;
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: thumb;
+                image-fit: contain;
+            }
+        }
+        for i in Math.max(0, root.slots - root.thumbs.length): Rectangle {
+            horizontal-stretch: 1;
+            min-width: 0;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.border;
         }
     }
-    for i in Math.max(0, root.slots - root.thumbs.length): Rectangle {
-        horizontal-stretch: 1;
-        min-width: 0;
-        border-radius: 4px;
-        border-width: 1px;
-        border-color: Theme.border;
+
+    // One TouchArea over the strip: the thumbnails' model is replaced on every capture,
+    // which would recreate per-thumbnail TouchAreas between the clicks of a double-click.
+    property <int> hover: ta.has-hover ? root.slot-at(ta.mouse-x) : -1;
+    pure function slot-at(x: length) -> int {
+        return x < 0 || Math.mod(x / 1px, (root.slot-width + root.spacing) / 1px) > root.slot-width / 1px
+            || Math.floor(x / (root.slot-width + root.spacing)) >= root.thumbs.length
+            ? -1 : Math.floor(x / (root.slot-width + root.spacing));
+    }
+    ta := TouchArea {
+        mouse-cursor: root.hover >= 0 ? pointer : default;
+        double-clicked => {
+            if (root.slot-at(self.mouse-x) >= 0) {
+                root.open(root.slot-at(self.mouse-x));
+            }
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down
+                && root.slot-at(self.mouse-x) >= 0) {
+                root.context-menu(root.slot-at(self.mouse-x));
+            }
+        }
     }
 }
 
@@ -78,6 +115,8 @@ component DevicePanel inherits Rectangle {
     callback start();
     callback start-alt();
     callback stop();
+    callback open-recent(int);
+    callback recent-menu(int);
 
     property <bool> busy: device.state == DeviceState.acquiring;
 
@@ -131,7 +170,11 @@ component DevicePanel inherits Rectangle {
             }
         }
 
-        RecentStrip { thumbs: root.device.recent; }
+        RecentStrip {
+            thumbs: root.device.recent;
+            open(i) => { root.open-recent(i); }
+            context-menu(i) => { root.recent-menu(i); }
+        }
 
         HorizontalLayout {
             spacing: 8px;
@@ -210,6 +253,8 @@ export component AcquirePage inherits Rectangle {
                 start => { AcquireBridge.start(i); }
                 start-alt => { AcquireBridge.start-alt(i); }
                 stop => { AcquireBridge.stop(i); }
+                open-recent(slot) => { AcquireBridge.open-recent(i, slot); }
+                recent-menu(slot) => { AcquireBridge.context-menu(i, slot); }
             }
 
             if root.count == 0: Rectangle {

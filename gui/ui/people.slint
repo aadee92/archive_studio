@@ -1,5 +1,6 @@
 import { ListView, LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { ScrollRestore } from "nav.slint";
 
 // A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
 export struct PersonItem {
@@ -41,12 +42,18 @@ export global PeopleBridge {
     in property <string> person-name;
     // Person names matching the name box.
     in property <[string]> name-matches;
+    // Scroll position of the face grid, reported by the page (see ReviewBridge).
+    in-out property <int> scroll-row;
+    in-out property <length> scroll-offset;
+    // Set by Rust to scroll somewhere (Back).
+    in property <ScrollRestore> restore;
 
-    callback refresh();
     callback columns-changed(int);
     callback select(int);
     // (row, column); -1 for neither when the click missed every face.
     callback open(int, int);
+    // Right-click on a face. Hook for the item context menu (not implemented yet).
+    callback context-menu(int, int);
     callback click(int, int, /* extend */ bool, /* toggle */ bool);
     // A drag starts: `keep` adds to the current selection instead of replacing it.
     callback drag-begin(bool);
@@ -140,15 +147,27 @@ export component PeoplePage inherits Rectangle {
     property <int> match-index: -1;
 
     changed columns => { PeopleBridge.columns-changed(self.columns); }
-    // Faces get named elsewhere (and by scans): re-read the catalog whenever the page is shown.
     // `init` runs before Rust handles columns-changed, so the count is sent again here.
+    // (Whether the catalog is re-read on showing the page, or the view left is restored,
+    // is up to `nav.rs`.)
     changed visible => {
         if (self.visible) {
             PeopleBridge.columns-changed(self.columns);
-            PeopleBridge.refresh();
         }
     }
     init => { PeopleBridge.columns-changed(self.columns); }
+
+    // Scroll position for snapshots, and scrolling back to one.
+    property <length> scrolled: -list.content-y;
+    changed scrolled => {
+        PeopleBridge.scroll-row = Math.floor(self.scrolled / root.row-height);
+        PeopleBridge.scroll-offset = self.scrolled - PeopleBridge.scroll-row * root.row-height;
+    }
+    property <ScrollRestore> restore: PeopleBridge.restore;
+    changed restore => {
+        list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
+            Math.min(0px, -(self.restore.row * root.row-height + self.restore.offset)));
+    }
 
     background: Theme.bg;
 
@@ -363,6 +382,9 @@ export component PeoplePage inherits Rectangle {
                         changed has-hover => { root.track(); }
 
                         pointer-event(event) => {
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                PeopleBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
+                            }
                             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                                 root.press-x = self.mouse-x;
                                 root.press-y = self.mouse-y - list.content-y;

@@ -26,7 +26,8 @@ install -Dm644 ui/icons/app.svg ~/.local/share/icons/hicolor/scalable/apps/archi
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
 | `ui/review.slint` | Search, kind chips, sort, virtualized thumbnail grid, size slider in the bottom bar |
 | `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops: click / Shift / Ctrl / drag to select, name box (with matching names) and Ignore above the list. A person's suggested faces come first, highlighted |
-| `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review or a face in People. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes |
+| `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review, a face in People or a recent capture in Acquire. Back arrow / Esc returns to that view as it was. Face boxes over the picture (placed in displayed-image coordinates) with names under confirmed ones, toggled independently in the bottom bar; a face opened from People pulses 3× over 1.5 s. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes |
+| `ui/nav.slint`, `src/nav.rs` | Navigation: `nav::open(Target)` for every double-click, `nav::go` for the sidebar; both push a snapshot of the view left (Review: filters, selection, scroll anchor; People: person, selected faces, scroll anchor; Details: its item) that `nav::back` restores. A `Target` carries the origin view's `Scope` (its filtered items) for a future "similar" strip; `nav::context_menu` is the (empty) hook every page's right-click reaches |
 | `ui/pipeline.slint` | `PipelineStatus`: the pipeline's status line with Pause / Resume (in Review's bottom bar) |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
 | `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
@@ -216,4 +217,4 @@ Source decoding (`src/thumbs/decode.rs`, cache misses only) never builds more pi
   (64-bit path hashes computed on the indexer thread) finds the entry.
 
 Stubs: video/audio thumbnails, the in-app viewer
-(double-click currently hands off to `xdg-open`), real device backends, persistent index.
+(Details has no zoom yet), real device backends, persistent index.

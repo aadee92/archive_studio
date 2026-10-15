@@ -11,7 +11,7 @@
 //! faces like the ones just named are listed under that person on the next load.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, SharedString, VecModel};
 
+use crate::nav::{self, Scope, Target};
 use crate::thumbs::Pixels;
-use crate::{details, AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem};
+use crate::{AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
 use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, DEFAULT_MIN_SIMILARITY};
 use archive_core::catalog::{Catalog, TagId, TagKind};
 
@@ -100,6 +101,20 @@ struct FaceGrid {
     names: RefCell<Vec<Name>>,
     writer: mpsc::Sender<Change>,
     changes: Cell<u64>,
+    /// A view to return to (Back) once the load in flight lands.
+    restore: RefCell<Option<Snapshot>>,
+}
+
+/// The People view as it was left, for Back (see `nav`): whose faces, which were
+/// selected, and the scroll position. Faces are kept by id, so this holds across a reload.
+pub(crate) struct Snapshot {
+    person: i32,
+    selected: Vec<FaceId>,
+    anchor: Option<FaceId>,
+    /// Where a shift-click range starts.
+    anchor_click: Option<FaceId>,
+    /// How far the first row in view was scrolled past.
+    offset: f32,
 }
 
 thread_local! {
@@ -131,24 +146,32 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
         names: RefCell::default(),
         writer: spawn_writer(root, ui.as_weak()),
         changes: Cell::new(0),
+        restore: RefCell::default(),
     });
     GRID.set(Some(grid.clone()));
 
     let bridge = ui.global::<PeopleBridge>();
     bridge.set_rows(ModelRc::from(grid.clone()));
-    bridge.on_refresh(|| with_grid(|g| g.load(None)));
     bridge.on_select(|key| with_grid(|g| g.load(Some(key))));
     bridge.on_columns_changed(|n| {
         with_grid(|g| {
-            g.columns.set(n.max(1) as usize);
-            g.notify.reset();
+            // Also sent each time the page is shown; only a change re-lays the grid.
+            if g.columns.replace(n.max(1) as usize) != n.max(1) as usize {
+                g.notify.reset();
+            }
         })
     });
     bridge.on_open(|row, col| {
         with_grid(|g| {
-            let path = g.position(row, col).map(|i| g.faces.borrow()[i].path.clone());
-            if let (Some(ui), Some(path)) = (g.ui.upgrade(), path) {
-                details::show_path(&ui, path);
+            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.position(row, col).map(|i| g.target(i))) {
+                nav::open(&ui, target);
+            }
+        })
+    });
+    bridge.on_context_menu(|row, col| {
+        with_grid(|g| {
+            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.position(row, col).map(|i| g.target(i))) {
+                nav::context_menu(&ui, target);
             }
         })
     });
@@ -166,14 +189,51 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     bridge.on_ignore(|| with_grid(|g| g.ignore()));
 }
 
-/// Sidebar index of the People page.
-const PAGE: i32 = 2;
+/// The page was picked in the sidebar: faces get named elsewhere (and found by scans), so
+/// the catalog is re-read.
+pub fn entered() {
+    with_grid(|g| g.load(None));
+}
+
+pub(crate) fn snapshot() -> Option<Snapshot> {
+    GRID.with_borrow(|grid| {
+        let g = grid.as_ref()?;
+        let ui = g.ui.upgrade()?;
+        let bridge = ui.global::<PeopleBridge>();
+        let faces = g.faces.borrow();
+        let first = bridge.get_scroll_row().max(0) as usize * g.columns.get();
+        Some(Snapshot {
+            person: bridge.get_selected(),
+            selected: g.selection.borrow().iter().filter_map(|&i| faces.get(i)).map(|f| f.id).collect(),
+            anchor: faces.get(first).map(|f| f.id),
+            anchor_click: g.anchor.get().and_then(|i| faces.get(i)).map(|f| f.id),
+            offset: bridge.get_scroll_offset(),
+        })
+    })
+}
+
+/// Back to a view left earlier. The grid isn't re-read if it still shows that person
+/// (the faces stay where they were, as do any just named); only the people list is.
+pub(crate) fn restore(snapshot: Snapshot) {
+    with_grid(|g| {
+        let Some(ui) = g.ui.upgrade() else { return };
+        let bridge = ui.global::<PeopleBridge>();
+        if bridge.get_selected() == snapshot.person && !bridge.get_loading() {
+            g.apply_restore(snapshot);
+            g.load_people();
+        } else {
+            let person = snapshot.person;
+            *g.restore.borrow_mut() = Some(snapshot);
+            g.load(Some(person));
+        }
+    });
+}
 
 /// Re-reads the catalog if the page is on screen (e.g. the pipeline just grouped faces);
 /// otherwise it is re-read when next shown anyway. While faces are selected or were just
 /// named, only the people list is: the grid mustn't move under the user.
 pub fn refresh_if_shown(ui: &AppWindow) {
-    if ui.get_page() == PAGE {
+    if ui.get_page() == nav::PEOPLE {
         with_grid(|g| {
             let working = !g.selection.borrow().is_empty() || g.faces.borrow().iter().any(|f| f.mask.is_some());
             if working {
@@ -248,6 +308,36 @@ impl FaceGrid {
         self.clear_selection();
         self.notify.reset();
         self.publish_status();
+        let restore = self.restore.take();
+        if let Some(snapshot) = restore.filter(|s| s.person == loaded.selected) {
+            self.apply_restore(snapshot);
+        }
+    }
+
+    /// Selects and scrolls as `snapshot` was, for the faces still there.
+    fn apply_restore(&self, snapshot: Snapshot) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let position: HashMap<FaceId, usize> = self.faces.borrow().iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+        self.anchor.set(snapshot.anchor_click.and_then(|id| position.get(&id).copied()));
+        self.set_selection(snapshot.selected.iter().filter_map(|id| position.get(id).copied()).collect());
+        if let Some(&first) = snapshot.anchor.and_then(|id| position.get(&id)) {
+            let bridge = ui.global::<PeopleBridge>();
+            let serial = bridge.get_restore().serial + 1;
+            let row = (first / self.columns.get()) as i32;
+            bridge.set_restore(ScrollRestore { serial, row, offset: snapshot.offset });
+        }
+    }
+
+    /// The face at position `i` as an item to open: its picture, pointing the face out.
+    /// The scope is the pictures of the faces on screen, in grid order.
+    fn target(&self, i: usize) -> Target {
+        let faces = self.faces.borrow();
+        let mut seen = HashSet::new();
+        let paths: Vec<PathBuf> = faces.iter().filter(|f| seen.insert(&f.path)).map(|f| f.path.clone()).collect();
+        let face = &faces[i];
+        let current = paths.iter().position(|p| *p == face.path);
+        let title = self.ui.upgrade().map(|ui| ui.global::<PeopleBridge>().get_title()).unwrap_or_default();
+        Target { path: face.path.clone(), face: Some(face.id), scope: Scope::of(format!("People · {title}"), paths, current) }
     }
 
     fn show_people(&self, people: People) {

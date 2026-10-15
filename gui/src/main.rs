@@ -9,6 +9,7 @@
 
 mod acquire;
 mod details;
+mod nav;
 mod people;
 mod pipeline;
 mod review;
@@ -32,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // icon; the window's own `icon` covers X11 and other platforms. Needs the platform
     // that `AppWindow::new` sets up, and must come before the window is shown.
     slint::set_xdg_app_id("archive-studio")?;
+    nav::install(&ui);
     let pipeline = pipeline::install(&ui, root.clone());
     let _acquire = acquire::install(&ui, &root, pipeline.clone());
     details::install(&ui, root.clone(), pipeline);
