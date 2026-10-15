@@ -10,6 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use archive_core::catalog::runs::{RunCounts, RunStatus};
 use archive_core::catalog::faces::FaceId;
+use archive_core::catalog::flags::AssetFlags;
 use archive_core::catalog::{AssetId, Catalog, Region, TagKind};
 use archive_core::ops;
 use archive_core::pipeline::describe::TextSearch;
@@ -24,6 +25,10 @@ accept PATH|all            apply the proposed rotation
 keep PATH|all              the file is upright as it is
 rotate PATH 90|180|270     turn the file clockwise (rewrites it)
 failed                     files a stage failed on
+list [STATE]...            files in all of these states: review (a rotation to review),
+                           failed, untagged (no tag of yours; named faces count),
+                           faces, unknown-faces, has-back, is-back, tagged; no-STATE
+                           for files not in it (list faces no-tagged)
 retry                      run the failed stages again
 add PATH...                take in files now, without waiting for them to settle
 faces [PATH]               people and unknown faces, or the faces in one file
@@ -284,6 +289,7 @@ impl Shell {
             "keep" => self.each_review(rest, |engine, path| engine.keep(path)),
             "rotate" => self.rotate(rest),
             "failed" => self.failed(),
+            "list" => self.list(rest),
             "retry" => self.engine().map(|e| e.retry_failed()),
             "add" => self.engine().map(|engine| {
                 for arg in rest {
@@ -430,6 +436,36 @@ impl Shell {
         if !any {
             println!("no failures");
         }
+        Ok(())
+    }
+
+    fn list(&self, args: &[&str]) -> Result<(), String> {
+        let (mut with, mut without) = (AssetFlags::NONE, AssetFlags::NONE);
+        for arg in args {
+            let arg = arg.trim_start_matches("--");
+            let (negated, name) = match arg.strip_prefix("no-") {
+                Some(name) => (true, name),
+                None => (false, arg),
+            };
+            let (flag, negated) = match name {
+                "untagged" => (AssetFlags::TAGGED, !negated),
+                "rotation" => (AssetFlags::REVIEW, negated),
+                _ => match AssetFlags::NAMED.iter().find(|(_, n)| *n == name) {
+                    Some(&(flag, _)) => (flag, negated),
+                    None => return Err(format!("unknown state {arg:?}; see help")),
+                },
+            };
+            if negated {
+                without |= flag;
+            } else {
+                with |= flag;
+            }
+        }
+        let paths = self.catalog.assets_flagged(with, without).map_err(|e| e.to_string())?;
+        for path in &paths {
+            println!("{}", show(&self.root, path));
+        }
+        println!("{} files", paths.len());
         Ok(())
     }
 

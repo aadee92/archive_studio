@@ -9,8 +9,34 @@ export global PipelineBridge {
     in property <bool> paused;
     // `text` is a warning or failure.
     in property <bool> alert;
+    // What needs the user, after `text` ("3 rotations to review", "2 failed"; empty for
+    // none): each a link to those items in Review.
+    in property <string> review-text;
+    in property <string> failed-text;
 
     callback toggle-pause();
+    callback show-review();
+    callback show-failed();
+}
+
+// A count in the status line that shows its items in Review.
+component CountLink inherits HorizontalLayout {
+    in property <string> text;
+    in property <color> tone;
+    callback clicked;
+
+    spacing: 6px;
+    Text { vertical-alignment: center; text: "·"; color: Theme.text-muted; font-size: 12px; }
+    Text {
+        vertical-alignment: center;
+        text: root.text;
+        color: ta.has-hover ? Theme.accent : root.tone;
+        font-size: 12px;
+        ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.clicked(); }
+        }
+    }
 }
 
 // The pipeline's standing in one line, with Pause / Resume.
@@ -33,6 +59,16 @@ export component PipelineStatus inherits HorizontalLayout {
         font-size: 12px;
         overflow: elide;
         min-width: 80px;
+    }
+    if PipelineBridge.review-text != "": CountLink {
+        text: PipelineBridge.review-text;
+        tone: #b45309;
+        clicked => { PipelineBridge.show-review(); }
+    }
+    if PipelineBridge.failed-text != "": CountLink {
+        text: PipelineBridge.failed-text;
+        tone: Theme.danger;
+        clicked => { PipelineBridge.show-failed(); }
     }
     if PipelineBridge.running: Text {
         vertical-alignment: center;

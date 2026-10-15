@@ -28,11 +28,12 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Timer, TimerMode};
 
+use archive_core::catalog::flags::AttentionCounts;
 use archive_core::catalog::Catalog;
 use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, Status, FACES, ORIENT};
 
 use crate::review::{self, FileUpdate};
-use crate::{acquire, details, people, AppWindow, PipelineBridge};
+use crate::{acquire, details, people, AppWindow, Attention, PipelineBridge};
 
 /// A burst of engine events is gathered this long before it is passed on.
 const GATHER: Duration = Duration::from_millis(100);
@@ -116,6 +117,8 @@ struct Batch {
     /// The last of `Busy` / `Idle`.
     busy: Option<bool>,
     status: Option<Status>,
+    /// Counted with `status`.
+    attention: Option<AttentionCounts>,
     message: Option<String>,
 }
 
@@ -131,6 +134,7 @@ struct Host {
     /// The mode last sent to the engine.
     mode: Cell<Option<Mode>>,
     status: RefCell<Option<Status>>,
+    attention: Cell<AttentionCounts>,
     message: RefCell<Option<String>>,
     message_timer: Timer,
 }
@@ -184,6 +188,7 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
         paused: Cell::new(false),
         mode: Cell::new(None),
         status: RefCell::default(),
+        attention: Cell::default(),
         message: RefCell::default(),
         message_timer: Timer::default(),
     });
@@ -194,6 +199,19 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
             h.paused.set(!h.paused.get());
             h.apply_mode();
         })
+    });
+    // The status line's counts show those items in Review.
+    let weak = ui.as_weak();
+    ui.global::<PipelineBridge>().on_show_review(move || {
+        if let Some(ui) = weak.upgrade() {
+            review::show_attention(&ui, Attention { review: true, ..Attention::default() });
+        }
+    });
+    let weak = ui.as_weak();
+    ui.global::<PipelineBridge>().on_show_failed(move || {
+        if let Some(ui) = weak.upgrade() {
+            review::show_attention(&ui, Attention { failed: true, ..Attention::default() });
+        }
     });
     host.publish();
     handle
@@ -287,6 +305,9 @@ impl Host {
         if let Some(status) = batch.status {
             *self.status.borrow_mut() = Some(status);
         }
+        if let Some(attention) = batch.attention {
+            self.attention.set(attention);
+        }
         if let Some(message) = batch.message {
             *self.message.borrow_mut() = Some(message);
             self.message_timer.start(TimerMode::SingleShot, MESSAGE_FOR, || {
@@ -307,13 +328,19 @@ impl Host {
         let bridge = ui.global::<PipelineBridge>();
         bridge.set_text(self.message.borrow().clone().unwrap_or(line).into());
         bridge.set_alert(self.message.borrow().is_some());
+        // Shown after the line (not over a message), each a link to those items in Review.
+        let attention = if running && self.message.borrow().is_none() { self.attention.get() } else { AttentionCounts::default() };
+        let (review, failed) = counts_text(attention);
+        bridge.set_review_text(review.into());
+        bridge.set_failed_text(failed.into());
         bridge.set_busy(running && self.busy.get() && !self.paused.get());
         bridge.set_running(running);
         bridge.set_paused(self.paused.get());
     }
 }
 
-/// The status line, e.g. "Processing… orient 12 · faces 40 left · 3 rotations to review".
+/// The status line, e.g. "Processing… orient 12 · faces 40 left" (the counts of what needs
+/// the user follow it: [`counts_text`]).
 fn describe(state: &EngineState, busy: bool, mode: Mode, status: Option<&Status>, availability: Availability) -> String {
     match state {
         EngineState::Starting => return "Pipeline starting…".into(),
@@ -337,17 +364,20 @@ fn describe(state: &EngineState, busy: bool, mode: Mode, status: Option<&Status>
     if !left.is_empty() && (busy || mode == Mode::Paused) {
         line = format!("{line} {} left", left.join(" · "));
     }
-    if let Some(status) = status {
-        let plural = |n: usize, one: &str, many: &str| format!("{} {}", review::grouped(n), if n == 1 { one } else { many });
-        if status.orient.review > 0 {
-            line.push_str(&format!(" · {} to review", plural(status.orient.review, "rotation", "rotations")));
-        }
-        let failed = status.orient.failed + status.faces.failed;
-        if failed > 0 {
-            line.push_str(&format!(" · {failed} failed"));
-        }
-    }
     line
+}
+
+/// "3 rotations to review" and "2 failed" (empty for none): the files in the library with
+/// a rotation waiting for review and with a failed stage, as Review's filters count them.
+fn counts_text(attention: AttentionCounts) -> (String, String) {
+    let n = review::grouped;
+    let review = match attention.review {
+        0 => String::new(),
+        1 => "1 rotation to review".to_owned(),
+        count => format!("{} rotations to review", n(count)),
+    };
+    let failed = if attention.failed > 0 { format!("{} failed", n(attention.failed)) } else { String::new() };
+    (review, failed)
 }
 
 /// What one burst of notes amounts to.
@@ -416,6 +446,11 @@ impl Digest {
             Event::Failed { path, stage, error } => {
                 // Logged by the engine itself, as are warnings.
                 self.message = Some(format!("{stage} failed: {}: {error}", show(&path)));
+                // Its badge and the "Failed" filter.
+                self.files.entry(path).or_insert(false);
+            }
+            Event::Review { path, .. } => {
+                self.files.entry(path).or_insert(false);
             }
             Event::Warning(warning) => {
                 self.message = Some(format!("Warning: {warning}"));
@@ -423,7 +458,7 @@ impl Digest {
             Event::Identified { .. } => self.identified = true,
             Event::Busy => self.busy = Some(true),
             Event::Idle => self.busy = Some(false),
-            Event::Review { .. } | Event::Synced { .. } => {}
+            Event::Synced { .. } => {}
         }
     }
 }
@@ -460,17 +495,17 @@ fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
             message: digest.message,
             ..Batch::default()
         };
-        batch.files = digest
-            .files
-            .into_iter()
-            .filter_map(|(path, changed)| FileUpdate::read(&path, root, catalog.as_ref(), changed))
-            .collect();
+        batch.files = FileUpdate::read_all(digest.files, root, catalog.as_ref());
         // Counted at most every STATUS_EVERY while busy, and once more when it goes idle.
         if owed && (batch.busy == Some(false) || count_due(counted).is_zero()) {
             if let (Some(catalog), Some(availability)) = (&catalog, availability) {
                 match pipeline::status(catalog, availability) {
                     Ok(status) => batch.status = Some(status),
                     Err(e) => log::warn!("pipeline: status: {e}"),
+                }
+                match catalog.attention_counts() {
+                    Ok(counts) => batch.attention = Some(counts),
+                    Err(e) => log::warn!("pipeline: attention counts: {e}"),
                 }
             }
             (owed, counted) = (false, Some(Instant::now()));
@@ -528,9 +563,11 @@ mod tests {
         assert_eq!(describe(&running, true, Mode::Paused, Some(&status), both), "Paused orient 12 · faces 40 left");
 
         let done = Status { orient: counts(0, 3, 1), faces: counts(0, 0, 2), ..status };
-        assert_eq!(describe(&running, false, Mode::Normal, Some(&done), both), "All caught up · 3 rotations to review · 3 failed");
-        let one = Status { orient: counts(0, 1, 0), faces: counts(0, 0, 0), ..status };
-        assert_eq!(describe(&running, false, Mode::Normal, Some(&one), both), "All caught up · 1 rotation to review");
+        assert_eq!(describe(&running, false, Mode::Normal, Some(&done), both), "All caught up");
+        let counts = |review, failed| counts_text(AttentionCounts { review, failed });
+        assert_eq!(counts(3, 1200), ("3 rotations to review".to_owned(), "1,200 failed".to_owned()));
+        assert_eq!(counts(1, 0), ("1 rotation to review".to_owned(), String::new()));
+        assert_eq!(counts(0, 0), (String::new(), String::new()));
 
         assert_eq!(describe(&EngineState::Elsewhere, true, Mode::Normal, None, both), "Pipeline running in another window");
         assert_eq!(describe(&EngineState::Starting, false, Mode::Normal, None, both), "Pipeline starting…");

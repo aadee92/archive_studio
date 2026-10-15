@@ -19,6 +19,10 @@
 //!   callback, which re-reads each affected row once. `row_data` only reads what has arrived.
 //! - Files the pipeline adds, changes or loses are merged in, replaced or taken out
 //!   ([`update_files`]) the same way, without re-walking.
+//! - Each entry carries its catalog flags (faces, back side, review, failure, the user's
+//!   tags) for the tile badges and the "Needs attention" filters, read in one bulk query
+//!   per indexer batch or relay burst (`Catalog::flags_of`), never per tile; a file whose
+//!   flags change is replaced like a changed one.
 //!
 //! Selection: a set of entry ids (no per-tile state; `row_data` asks the set), with a focus
 //! (the keyboard cursor, also the item clicked last) and an anchor for Shift ranges. Click,
@@ -43,12 +47,13 @@ use slint::{ComponentHandle, Model, ModelNotify, ModelRc, ModelTracker, SharedSt
 
 use crate::thumbs::{self, sched, Delivery, ThumbCache, Threads, Tier};
 use archive_core::catalog::query::{self, Expr};
-use archive_core::catalog::{Catalog, TagKind};
+use archive_core::catalog::flags::AssetFlags;
+use archive_core::catalog::{AssetId, Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
 use crate::actions;
 use crate::nav::{self, Scope, Target};
-use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge, ScrollRestore, TagItem};
+use crate::{AppWindow, Attention, MediaRow, MediaTile, ReviewBridge, ScrollRestore, TagItem};
 
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Entry {
@@ -64,6 +69,10 @@ pub(crate) struct Entry {
     /// Modification time in ns since the epoch (0 if earlier or unknown).
     mtime: u64,
     tags: Arc<[(String, Option<TagKind>)]>,
+    /// What the catalog says about it at a glance (faces, back side, review, failure, the
+    /// user's tags), read in bulk off the UI thread; for the tile's badges and the
+    /// "Needs attention" filters.
+    flags: AssetFlags,
 }
 
 impl Entry {
@@ -95,6 +104,7 @@ impl Entry {
             size,
             mtime,
             tags: tags.into(),
+            flags: AssetFlags::NONE,
         }
     }
 }
@@ -220,6 +230,10 @@ struct Query {
     tag_expr: Option<Arc<Expr>>,
     /// 0 all, 1 images, 2 video, 3 audio
     kind: i32,
+    /// The "Needs attention" filters: entries with all of `need`'s flags and none of
+    /// `without`'s.
+    need: AssetFlags,
+    without: AssetFlags,
     sort: Sort,
 }
 
@@ -243,8 +257,16 @@ impl Query {
             tag: tag_trimmed.to_string(),
             tag_expr,
             kind,
+            need: AssetFlags::NONE,
+            without: AssetFlags::NONE,
             sort,
         }
+    }
+
+    /// Narrowed to what the "Needs attention" chips ask for.
+    fn needing(mut self, attention: &Attention) -> Self {
+        (self.need, self.without) = attention_flags(attention);
+        self
     }
 
     fn accepts(&self, e: &Entry) -> bool {
@@ -254,7 +276,7 @@ impl Query {
             3 => e.kind == MediaKind::Audio,
             _ => true,
         };
-        if !kind_ok {
+        if !kind_ok || !e.flags.matches(self.need, self.without) {
             return false;
         }
 
@@ -575,9 +597,12 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     });
 
     let debounce = Timer::default();
-    bridge.on_filter_changed(move |text, tag, kind, sort| {
-        log::debug!("review filter changed: search {text:?}, tags {tag:?}, kind {kind}, sort {sort}");
-        let query = Query::new(text.to_string(), tag.to_string(), kind, Sort::from_index(sort));
+    bridge.on_filter_changed(move |text, tag, kind, sort, attention| {
+        log::debug!(
+            "review filter changed: search {text:?}, tags {tag:?}, kind {kind}, sort {sort}, needs attention [{}]",
+            attention_label(&attention)
+        );
+        let query = Query::new(text.to_string(), tag.to_string(), kind, Sort::from_index(sort)).needing(&attention);
         debounce.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
             with_grid(|g| g.set_query(query.clone()))
         });
@@ -586,6 +611,22 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     grid.publish_status();
     grid.publish_tags();
     spawn_indexer(root, ui.as_weak());
+}
+
+/// Shows Review with only the items that need `attention` (the status line's "3 rotations to
+/// review", "2 failed"): search, tags and media type are cleared, the sort is kept. Coming
+/// from another page, Back returns there.
+pub fn show_attention(ui: &AppWindow, attention: Attention) {
+    log::debug!("review: show what needs attention [{}]", attention_label(&attention));
+    nav::go(ui, nav::REVIEW);
+    let bridge = ui.global::<ReviewBridge>();
+    bridge.set_search_text(SharedString::default());
+    bridge.set_tag_text(SharedString::default());
+    bridge.set_selected_tag(SharedString::default());
+    bridge.set_kind_filter(0);
+    bridge.set_attention(attention.clone());
+    let query = Query::new(String::new(), String::new(), 0, Sort::from_index(bridge.get_sort_index())).needing(&attention);
+    with_grid(|g| g.set_query(query));
 }
 
 /// Where [`GridModel::apply_restore`] scrolls: the first tile that was in view, how far its
@@ -600,6 +641,7 @@ pub(crate) struct Snapshot {
     selected_tag: SharedString,
     kind: i32,
     sort: i32,
+    attention: Attention,
     /// Entries are kept by path ([`path_hash`]): one replaced meanwhile (e.g. rotated) has
     /// a new id.
     selected: Vec<u64>,
@@ -631,12 +673,13 @@ impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, {} selected, focus {:?}{}, scroll anchor {:?} +{:.0}px }}",
+            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, needs attention [{}], {} selected, focus {:?}{}, scroll anchor {:?} +{:.0}px }}",
             self.search.as_str(),
             self.tag.as_str(),
             self.selected_tag.as_str(),
             self.kind,
             self.sort,
+            attention_label(&self.attention),
             self.selected.len(),
             self.focus,
             if self.followed { " (followed from Details)" } else { "" },
@@ -660,6 +703,7 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
             selected_tag: bridge.get_selected_tag(),
             kind: bridge.get_kind_filter(),
             sort: bridge.get_sort_index(),
+            attention: bridge.get_attention(),
             selected: g.selection.borrow().iter().filter_map(|&id| g.entries.borrow().get(id).map(|e| e.path_hash)).collect(),
             focus: g.focus.get().and_then(path_of),
             anchor,
@@ -698,18 +742,14 @@ fn spawn_indexer(root: PathBuf, ui: slint::Weak<AppWindow>) {
     });
 }
 
-fn extract_file_tags(path: &Path, root: &Path, cat: Option<&Catalog>) -> Vec<(String, Option<TagKind>)> {
+fn extract_file_tags(path: &Path, root: &Path, cat: Option<&Catalog>, asset: Option<AssetId>) -> Vec<(String, Option<TagKind>)> {
     let mut tags: Vec<(String, Option<TagKind>)> = Vec::new();
 
     // 1. Tags from catalog
-    if let Some(cat) = cat {
-        if let Ok(Some(asset_id)) = cat.find_asset(path) {
-            if let Ok(applied) = cat.tags_of(asset_id) {
-                for t in applied {
-                    if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&t.path)) {
-                        tags.push((t.path, Some(t.kind)));
-                    }
-                }
+    if let Some(applied) = cat.zip(asset).and_then(|(cat, asset)| cat.tags_of(asset).ok()) {
+        for t in applied {
+            if !tags.iter().any(|(p, _)| p.eq_ignore_ascii_case(&t.path)) {
+                tags.push((t.path, Some(t.kind)));
             }
         }
     }
@@ -746,12 +786,32 @@ fn extract_file_tags(path: &Path, root: &Path, cat: Option<&Catalog>) -> Vec<(St
     tags
 }
 
-fn entry_for(path: PathBuf, kind: MediaKind, meta: Option<fs::Metadata>, root: &Path, catalog: Option<&Catalog>) -> Entry {
+/// The entry for the file at `path`, and its catalog asset if it has one. Its flags are left
+/// for [`read_flags`], which reads a batch's at once.
+fn entry_for(path: PathBuf, kind: MediaKind, meta: Option<fs::Metadata>, root: &Path, catalog: Option<&Catalog>) -> (Entry, Option<AssetId>) {
     let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let size = meta.as_ref().map_or(0, |m| m.len());
     let modified = meta.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-    let tags = extract_file_tags(&path, root, catalog);
-    Entry::with_tags(path, name, kind, size, modified, tags)
+    let asset = catalog.and_then(|c| c.find_asset(&path).ok().flatten());
+    let tags = extract_file_tags(&path, root, catalog, asset);
+    (Entry::with_tags(path, name, kind, size, modified, tags), asset)
+}
+
+/// Fills in the flags of `entries` (whose catalog assets are `assets`, in the same order)
+/// with one bulk read for the lot (`Catalog::flags_of`). Blocking: indexer and relay threads.
+fn read_flags<'a>(entries: impl Iterator<Item = &'a mut Entry>, assets: &[Option<AssetId>], catalog: Option<&Catalog>) {
+    let Some(catalog) = catalog else { return };
+    let ids: Vec<AssetId> = assets.iter().flatten().copied().collect();
+    let flags = match catalog.flags_of(&ids) {
+        Ok(flags) => flags,
+        Err(e) => {
+            log::warn!("review: reading the flags of {} files: {e}", ids.len());
+            return;
+        }
+    };
+    for (entry, asset) in entries.zip(assets) {
+        entry.flags = asset.and_then(|a| flags.get(&a).copied()).unwrap_or_default();
+    }
 }
 
 /// A file the pipeline (or a capture) reported, as the grid should now show it.
@@ -763,18 +823,37 @@ pub(crate) enum FileUpdate {
 }
 
 impl FileUpdate {
-    /// Reads the file at `path` (blocking: stat, catalog tags, sidecar), or `None` if it
-    /// isn't media the grid shows. For a worker thread; hand the result to [`update_files`].
+    /// Reads the file at `path` (blocking: stat, catalog tags and flags, sidecar), or `None`
+    /// if it isn't media the grid shows. For a worker thread; hand the result to
+    /// [`update_files`].
+    #[cfg(test)]
     pub(crate) fn read(path: &Path, root: &Path, catalog: Option<&Catalog>, changed: bool) -> Option<Self> {
-        let kind = classify(path)?;
-        let hidden = path.strip_prefix(root).ok()?.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
-        if hidden {
-            return None;
+        Self::read_all([(path.to_owned(), changed)], root, catalog).pop()
+    }
+
+    /// [`read`](Self::read) for each of `files` (path, whether its pixels changed), the
+    /// flags of all of them read at once.
+    pub(crate) fn read_all(files: impl IntoIterator<Item = (PathBuf, bool)>, root: &Path, catalog: Option<&Catalog>) -> Vec<Self> {
+        let mut updates = Vec::new();
+        let mut assets = Vec::new();
+        for (path, changed) in files {
+            let Some(kind) = classify(&path) else { continue };
+            let Ok(rel) = path.strip_prefix(root) else { continue };
+            if rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+                continue;
+            }
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    let (entry, asset) = entry_for(path, kind, Some(meta), root, catalog);
+                    updates.push(Self::Present(entry, changed));
+                    assets.push(asset);
+                }
+                _ => updates.push(Self::Gone(path)),
+            }
         }
-        Some(match fs::metadata(path) {
-            Ok(meta) if meta.is_file() => Self::Present(entry_for(path.to_owned(), kind, Some(meta), root, catalog), changed),
-            _ => Self::Gone(path.to_owned()),
-        })
+        let present = updates.iter_mut().filter_map(|u| if let Self::Present(entry, _) = u { Some(entry) } else { None });
+        read_flags(present, &assets, catalog);
+        updates
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -794,7 +873,7 @@ pub(crate) fn update_files(updates: Vec<FileUpdate>) {
 /// Calls `flush` with what was found every ~150 ms, and once more at the end (`done`).
 fn walk(root: PathBuf, mut flush: impl FnMut(Arc<[Entry]>, bool)) {
     let catalog = Catalog::open(&Catalog::default_path(&root), &root).ok();
-    let mut batch = Vec::new();
+    let (mut batch, mut assets) = (Vec::new(), Vec::new());
     let mut last_flush = Instant::now();
     let mut dirs = vec![root.clone()];
 
@@ -810,13 +889,17 @@ fn walk(root: PathBuf, mut flush: impl FnMut(Arc<[Entry]>, bool)) {
             }
             let path = item.path();
             let Some(kind) = classify(&path) else { continue };
-            batch.push(entry_for(path, kind, item.metadata().ok(), &root, catalog.as_ref()));
+            let (entry, asset) = entry_for(path, kind, item.metadata().ok(), &root, catalog.as_ref());
+            batch.push(entry);
+            assets.push(asset);
             if last_flush.elapsed() > Duration::from_millis(150) {
+                read_flags(batch.iter_mut(), &std::mem::take(&mut assets), catalog.as_ref());
                 flush(std::mem::take(&mut batch).into(), false);
                 last_flush = Instant::now();
             }
         }
     }
+    read_flags(batch.iter_mut(), &assets, catalog.as_ref());
     flush(batch.into(), true);
 }
 
@@ -942,7 +1025,7 @@ impl GridModel {
                     FileUpdate::Present(entry, changed) => {
                         if let Some(id) = current {
                             let old = index.get(id).expect("mapped ids are indexed");
-                            if !changed && (old.size, old.mtime, &old.tags) == (entry.size, entry.mtime, &entry.tags) {
+                            if !changed && (old.size, old.mtime, &old.tags, old.flags) == (entry.size, entry.mtime, &entry.tags, entry.flags) {
                                 continue;
                             }
                             tags_changed |= old.tags != entry.tags;
@@ -1473,6 +1556,10 @@ impl GridModel {
             3 => " · Audio",
             _ => "",
         };
+        let attention = attention_label(&attention_of(query.need, query.without));
+        if !attention.is_empty() {
+            label += &format!(" · {attention}");
+        }
         Scope::new(label, visible.len(), current, move || {
             visible.iter().filter_map(|&id| index.get(id).map(|e| e.path.clone())).collect()
         })
@@ -1483,14 +1570,15 @@ impl GridModel {
     fn restore(&self, s: Snapshot) {
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<ReviewBridge>();
-        let now = (bridge.get_search_text(), bridge.get_tag_text(), bridge.get_kind_filter(), bridge.get_sort_index());
-        let refilter = now != (s.search.clone(), s.tag.clone(), s.kind, s.sort);
+        let now = (bridge.get_search_text(), bridge.get_tag_text(), bridge.get_kind_filter(), bridge.get_sort_index(), bridge.get_attention());
+        let refilter = now != (s.search.clone(), s.tag.clone(), s.kind, s.sort, s.attention.clone());
         log::debug!("review restore {s:?} (refilter {refilter})");
         bridge.set_search_text(s.search.clone());
         bridge.set_tag_text(s.tag.clone());
         bridge.set_selected_tag(s.selected_tag);
         bridge.set_kind_filter(s.kind);
         bridge.set_sort_index(s.sort);
+        bridge.set_attention(s.attention.clone());
         let reveal = s.focus.clone().filter(|_| s.followed);
         let focus = s.focus.and_then(|path| self.id_of(&path));
         if let Some(old) = self.focus.replace(focus) {
@@ -1501,7 +1589,7 @@ impl GridModel {
         self.set_selection(ids);
         *self.restore.borrow_mut() = Some((s.anchor, s.offset, reveal));
         if refilter {
-            self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)));
+            self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)).needing(&s.attention));
         }
         self.apply_restore();
     }
@@ -1612,6 +1700,11 @@ impl GridModel {
             color,
             selected: self.selection.borrow().contains(&id),
             focused: self.focus.get() == Some(id),
+            faces: entry.flags.contains(AssetFlags::FACES),
+            unknown_faces: entry.flags.contains(AssetFlags::UNKNOWN_FACES),
+            two_sided: entry.flags.intersects(AssetFlags::HAS_BACK | AssetFlags::IS_BACK),
+            review: entry.flags.contains(AssetFlags::REVIEW),
+            failed: entry.flags.contains(AssetFlags::FAILED),
         }
     }
 
@@ -1698,6 +1791,35 @@ fn ui_kind(kind: MediaKind) -> crate::MediaKind {
         MediaKind::Video => crate::MediaKind::Video,
         MediaKind::Audio => crate::MediaKind::Audio,
     }
+}
+
+/// The flags an entry needs (and must not have) for the "Needs attention" chips: each chip
+/// narrows the view further.
+fn attention_flags(a: &Attention) -> (AssetFlags, AssetFlags) {
+    let mut need = AssetFlags::NONE;
+    for (on, flag) in [(a.review, AssetFlags::REVIEW), (a.failed, AssetFlags::FAILED), (a.unknown_faces, AssetFlags::UNKNOWN_FACES), (a.has_back, AssetFlags::HAS_BACK)] {
+        if on {
+            need |= flag;
+        }
+    }
+    (need, if a.untagged { AssetFlags::TAGGED } else { AssetFlags::NONE })
+}
+
+/// The chips that ask for these flags (the other way round).
+fn attention_of(need: AssetFlags, without: AssetFlags) -> Attention {
+    Attention {
+        review: need.contains(AssetFlags::REVIEW),
+        failed: need.contains(AssetFlags::FAILED),
+        untagged: without.contains(AssetFlags::TAGGED),
+        unknown_faces: need.contains(AssetFlags::UNKNOWN_FACES),
+        has_back: need.contains(AssetFlags::HAS_BACK),
+    }
+}
+
+/// The chips that are on, for the log and the Details scope ("Failed, Untagged").
+fn attention_label(a: &Attention) -> String {
+    let on = [(a.review, "Rotation to review"), (a.failed, "Failed"), (a.untagged, "Untagged"), (a.unknown_faces, "Unknown faces"), (a.has_back, "Has back")];
+    on.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect::<Vec<_>>().join(", ")
 }
 
 /// A tag for the filter list: `People|Alice` is shown as "People / Alice" and filtered by
@@ -2138,6 +2260,84 @@ mod tests {
         let unnamed = Entry::new("/x/a.png".into(), "a.png".into(), MediaKind::Image, 10, at);
         g.update_files(vec![present(&unnamed, false)]);
         assert!(g.available_tags.borrow().is_empty());
+    }
+
+    fn flagged(name: &str, flags: AssetFlags) -> Entry {
+        let mut e = Entry::new(PathBuf::from(format!("/x/{name}")), name.into(), MediaKind::Image, 10, SystemTime::UNIX_EPOCH);
+        e.flags = flags;
+        e
+    }
+
+    /// The "Needs attention" chips narrow the view by the entries' flags, each one further,
+    /// and a file whose flags change is re-filtered (in place, never a reset).
+    #[test]
+    fn attention_filters_follow_flag_updates() {
+        let g = grid(usize::MAX, 4, |_| {});
+        let failed = flagged("a.png", AssetFlags::FAILED);
+        let faces = flagged("b.png", AssetFlags::REVIEW | AssetFlags::FACES | AssetFlags::UNKNOWN_FACES);
+        let tagged = flagged("c.png", AssetFlags::TAGGED | AssetFlags::HAS_BACK);
+        g.append(vec![failed.clone(), faces.clone(), tagged.clone()].into(), true);
+        let shown = |g: &GridModel| -> Vec<String> {
+            let index = g.entries.borrow();
+            g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.to_string()).collect()
+        };
+        let filter = |attention: Attention| {
+            g.set_query(Query::new(String::new(), String::new(), 0, Sort::Name).needing(&attention));
+            shown(&g)
+        };
+        assert_eq!(filter(Attention { failed: true, ..Default::default() }), ["a.png"]);
+        assert_eq!(filter(Attention { untagged: true, ..Default::default() }), ["a.png", "b.png"]);
+        assert_eq!(filter(Attention { untagged: true, review: true, ..Default::default() }), ["b.png"], "chips narrow together");
+        assert_eq!(filter(Attention { unknown_faces: true, ..Default::default() }), ["b.png"]);
+        assert_eq!(filter(Attention { has_back: true, ..Default::default() }), ["c.png"]);
+        assert_eq!(filter(Attention::default()).len(), 3);
+
+        let id = g.visible.borrow()[1];
+        let tile = g.tile(id, g.entries.borrow().get(id).unwrap());
+        assert!(tile.faces && tile.unknown_faces && tile.review && !tile.failed && !tile.two_sided, "b.png's badges");
+
+        // Fixed: it leaves the "Failed" view; failing again brings it back.
+        assert_eq!(filter(Attention { failed: true, ..Default::default() }), ["a.png"]);
+        g.select_only(g.visible.borrow()[0]);
+        g.notify.log.take();
+        g.update_files(vec![present(&flagged("a.png", AssetFlags::NONE), false)]);
+        assert!(shown(&g).is_empty());
+        assert!(g.selection.borrow().is_empty(), "what the filter hides leaves the selection");
+        g.update_files(vec![present(&flagged("b.png", AssetFlags::FAILED | AssetFlags::FACES), false)]);
+        assert_eq!(shown(&g), ["b.png"]);
+        assert!(!g.notify.log.borrow().contains(&Change::Reset), "updates never reset the view");
+        let label = g.scope(None).label;
+        assert_eq!(label, "Review · Failed");
+    }
+
+    /// Files read for the grid carry the catalog's flags, from a walk and from the relay.
+    #[test]
+    fn entries_carry_catalog_flags() {
+        use archive_core::catalog::runs::{Run, RunStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::path::absolute(dir.path()).unwrap();
+        for name in ["ok.png", "bad.png", "photo-front.png", "photo-back.png"] {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let catalog = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        for name in ["ok.png", "photo-front.png", "photo-back.png"] {
+            catalog.asset(&root.join(name)).unwrap();
+        }
+        let (bad, _) = catalog.record_file(&root.join("bad.png"), MediaKind::Image, 1, 2).unwrap();
+        let run = Run { stage: "faces", version: "v", input: "1:2", status: RunStatus::Failed, value: None, detail: "" };
+        catalog.set_run(bad, &run).unwrap();
+
+        let mut walked = HashMap::new();
+        walk(root.clone(), |batch, _| walked.extend(batch.iter().map(|e| (e.name.to_string(), e.flags))));
+        assert_eq!(walked["ok.png"], AssetFlags::NONE);
+        assert_eq!(walked["bad.png"], AssetFlags::FAILED);
+        assert_eq!(walked["photo-front.png"], AssetFlags::HAS_BACK);
+        assert_eq!(walked["photo-back.png"], AssetFlags::IS_BACK);
+
+        let files = ["ok.png", "bad.png", "gone.png", ".hidden.png", "photo-back.png"].map(|n| (root.join(n), false));
+        let read = FileUpdate::read_all(files, &root, Some(&catalog));
+        let flags: Vec<Option<AssetFlags>> = read.iter().map(|u| if let FileUpdate::Present(e, _) = u { Some(e.flags) } else { None }).collect();
+        assert_eq!(flags, [Some(AssetFlags::NONE), Some(AssetFlags::FAILED), None, Some(AssetFlags::IS_BACK)]);
     }
 
     #[test]

@@ -11,6 +11,15 @@ export struct TagItem {
     query: string,
 }
 
+// The "Needs attention" filters; each one that is on narrows the view further.
+export struct Attention {
+    review: bool,         // a rotation waits for review
+    failed: bool,         // a pipeline stage failed on it
+    untagged: bool,       // no tag of the user's (named faces count; detectors' tags don't)
+    unknown-faces: bool,  // a face nobody named yet
+    has-back: bool,       // a front with a back
+}
+
 export global ReviewBridge {
     // Virtual model: rows are produced on demand by Rust, only for what is on screen.
     in property <[MediaRow]> rows;
@@ -27,6 +36,7 @@ export global ReviewBridge {
     in-out property <string> selected-tag;
     in-out property <int> kind-filter: 0;
     in-out property <int> sort-index: 0;
+    in-out property <Attention> attention;
     // Scroll position, reported by the page: the first row (partly) in view and how far it
     // is scrolled past.
     in-out property <int> scroll-row;
@@ -42,8 +52,9 @@ export global ReviewBridge {
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
     callback viewport-changed(int, int);
-    // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
-    callback filter-changed(string, string, int, int);
+    // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type),
+    // the "Needs attention" filters
+    callback filter-changed(string, string, int, int, Attention);
     // Pointer input on the grid, by (row, column); -1 for neither when it missed every tile.
     // A click with Shift (range from the anchor) / Ctrl (toggle).
     callback click(int, int, /* shift */ bool, /* ctrl */ bool);
@@ -82,6 +93,29 @@ component Chip inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// A small round badge on a tile: an icon (or a glyph) on a tinted disc.
+component TileBadge inherits Rectangle {
+    in property <image> icon;
+    in property <string> glyph;
+    in property <color> tone: #000000a0;
+
+    width: self.height;
+    border-radius: self.height / 2;
+    background: root.tone;
+    if root.glyph == "": Image {
+        width: parent.height * 0.66;
+        height: parent.height * 0.66;
+        source: root.icon;
+        colorize: white;
+    }
+    if root.glyph != "": Text {
+        text: root.glyph;
+        color: white;
+        font-size: parent.height * 0.66;
+        font-weight: 700;
     }
 }
 
@@ -135,6 +169,23 @@ component MediaCell inherits Rectangle {
         border-width: root.tile.selected ? (root.tile.focused ? 3px : 2px) : root.tile.focused ? 2px : root.hover ? 1px : 0px;
         border-color: root.tile.selected ? Theme.accent : root.tile.focused ? Theme.accent-soft : Theme.border;
     }
+    // Badges in the top-left corner, scaled with the tile: a failed stage, a rotation to
+    // review, faces (amber while one isn't named), a back side.
+    property <length> badge: Math.clamp(root.size * 0.11, 16px, 24px);
+    HorizontalLayout {
+        x: 6px;
+        y: 6px;
+        height: root.badge;
+        spacing: 3px;
+        if root.tile.failed: TileBadge { glyph: "!"; tone: #dc2626e0; }
+        if root.tile.review: TileBadge { icon: @image-url("icons/rotate.svg"); tone: #d97706e0; }
+        if root.tile.faces: TileBadge {
+            icon: @image-url("icons/people.svg");
+            tone: root.tile.unknown-faces ? #d97706e0 : #000000a0;
+        }
+        if root.tile.two-sided: TileBadge { icon: @image-url("icons/sides.svg"); }
+    }
+
     // Selected: a check mark in the corner, so a multi-selection reads at a glance.
     if root.tile.selected: Rectangle {
         x: root.size - self.width - 6px;
@@ -169,6 +220,8 @@ component MediaCell inherits Rectangle {
 export component ReviewPage inherits Rectangle {
     property <int> kind-filter <=> ReviewBridge.kind-filter;
     property <string> selected-tag <=> ReviewBridge.selected-tag;
+    property <bool> attention-on: ReviewBridge.attention.review || ReviewBridge.attention.failed
+        || ReviewBridge.attention.untagged || ReviewBridge.attention.unknown-faces || ReviewBridge.attention.has-back;
     property <length> gap: 14px;
     property <length> row-height: ReviewBridge.tile-size + 44px;
     property <length> pitch: ReviewBridge.tile-size + root.gap;
@@ -275,7 +328,7 @@ export component ReviewPage inherits Rectangle {
     }
 
     function apply() {
-        ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index);
+        ReviewBridge.filter-changed(search.text, tag-search.text, root.kind-filter, sort.current-index, ReviewBridge.attention);
     }
 
     function select-tag(tag: string) {
@@ -350,6 +403,71 @@ export component ReviewPage inherits Rectangle {
                         alignment: start;
                         Chip { text: "Video";  active: root.kind-filter == 2; clicked => { root.kind-filter = 2; root.apply(); } }
                         Chip { text: "Audio";  active: root.kind-filter == 3; clicked => { root.kind-filter = 3; root.apply(); } }
+                    }
+                }
+
+                // What needs the user: each chip narrows the view (with the search, type and tags).
+                VerticalLayout {
+                    spacing: 6px;
+                    HorizontalLayout {
+                        Text {
+                            text: "Needs attention";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: Theme.text-muted;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.attention-on: Text {
+                            text: "Clear";
+                            font-size: 11px;
+                            color: Theme.accent;
+                            vertical-alignment: center;
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    ReviewBridge.attention = { review: false, failed: false, untagged: false, unknown-faces: false, has-back: false };
+                                    root.apply();
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Chip {
+                            text: "Rotation to review";
+                            active: ReviewBridge.attention.review;
+                            clicked => { ReviewBridge.attention.review = !ReviewBridge.attention.review; root.apply(); }
+                        }
+                        Chip {
+                            text: "Failed";
+                            active: ReviewBridge.attention.failed;
+                            clicked => { ReviewBridge.attention.failed = !ReviewBridge.attention.failed; root.apply(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Chip {
+                            text: "Unknown faces";
+                            active: ReviewBridge.attention.unknown-faces;
+                            clicked => { ReviewBridge.attention.unknown-faces = !ReviewBridge.attention.unknown-faces; root.apply(); }
+                        }
+                        Chip {
+                            text: "Untagged";
+                            active: ReviewBridge.attention.untagged;
+                            clicked => { ReviewBridge.attention.untagged = !ReviewBridge.attention.untagged; root.apply(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Chip {
+                            text: "Has back";
+                            active: ReviewBridge.attention.has-back;
+                            clicked => { ReviewBridge.attention.has-back = !ReviewBridge.attention.has-back; root.apply(); }
+                        }
                     }
                 }
 

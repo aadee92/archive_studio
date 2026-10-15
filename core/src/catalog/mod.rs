@@ -20,6 +20,7 @@
 //! readers run alongside a writer.
 
 pub mod faces;
+pub mod flags;
 pub mod pairs;
 pub mod people;
 pub mod query;

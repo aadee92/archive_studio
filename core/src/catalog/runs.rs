@@ -47,7 +47,7 @@ CREATE TABLE pipeline_state (
 ) WITHOUT ROWID;
 ";
 
-const FINGERPRINT: &str = "(a.size || ':' || a.mtime)";
+pub(super) const FINGERPRINT: &str = "(a.size || ':' || a.mtime)";
 
 /// An asset's file as the catalog last saw it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

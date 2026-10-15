@@ -1610,8 +1610,9 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
             Err(e) => log::warn!("details: {action:?} {}: {e}", path.display()),
         }
         if result.is_ok() {
-            // "N rotations to review" (a rotation is reported, a kept file isn't).
-            pipeline.recount();
+            // "N rotations to review" and Review's badge (a rotation is reported, a kept
+            // file isn't).
+            pipeline::changed(&path, false);
         }
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SHOWN.with_borrow(|shown| shown.path() != Some(path.as_path())) {

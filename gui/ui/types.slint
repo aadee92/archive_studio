@@ -32,6 +32,13 @@ export struct MediaTile {
 
     selected: bool,
     focused: bool,     // the keyboard cursor (Review)
+
+    // Badges (Review): what the catalog knows at a glance.
+    faces: bool,         // has faces (not counting ignored ones)
+    unknown-faces: bool, // one of them isn't named yet
+    two-sided: bool,     // a front with a back, or the back
+    review: bool,        // a rotation waits for review
+    failed: bool,        // a pipeline stage failed on it
 }
 
 // The review grid is a ListView of rows; each row carries `columns` tiles.
