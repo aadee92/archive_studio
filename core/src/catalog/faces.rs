@@ -15,6 +15,10 @@
 //!    run of faces ages gradually instead of jumping from child to grandparent. The user
 //!    [confirms](Catalog::confirm_faces), [rejects a suggestion](Catalog::reject_suggestions),
 //!    or [ignores](Catalog::ignore_faces) faces, in bulk.
+//! 4. **Fix up**, one picture at a time: say a named face is [not that person](Catalog::not_person),
+//!    [delete](Catalog::delete_faces) a box that isn't a face at all, or [add](Catalog::add_face)
+//!    one the detector missed ([`scan_region`] embeds it, so suggestions and clusters use it).
+//!    An added face is *manual*: a rescan keeps it, like a reviewed one.
 //!
 //! A confirmed face also puts its person tag, with the face's region, on the asset as a user
 //! tag, so searches and XMP sidecars (as face regions) see it like any other tag.
@@ -76,6 +80,13 @@ CREATE TABLE face_scans (
 );
 ";
 
+/// Schema 6: faces someone boxed by hand.
+pub(super) const SCHEMA_6: &str = "
+-- Boxed by the user, not found by a scan: rescans keep it. Its embedding may be empty
+-- (added without the face model), which suggestions and clusters skip.
+ALTER TABLE faces ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
+";
+
 /// The name [`scan_image`]'s faces are stored under: InsightFace's `buffalo_l` models.
 pub const MODEL: &str = "buffalo_l";
 
@@ -112,6 +123,8 @@ pub struct Face {
     /// For unreviewed faces: the suggested person and the similarity behind it.
     pub suggestion: Option<(TagId, f32)>,
     pub cluster: Option<i64>,
+    /// Boxed by the user ([`Catalog::add_face`]), not found by a scan.
+    pub manual: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,16 +176,7 @@ pub struct PersonFaces {
 /// cores to spare (with [`faces::set_threads`] left at 1) and hand the results to one writer.
 pub fn scan_image(models: &Faces, path: &Path) -> std::result::Result<Vec<NewFace>, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    let mut decoder = ImageReader::open(path)
-        .map_err(|e| fail(&e))?
-        .with_guessed_format()
-        .map_err(|e| fail(&e))?
-        .into_decoder()
-        .map_err(|e| fail(&e))?;
-    let orientation = decoder.orientation().map_err(|e| fail(&e))?;
-    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|e| fail(&e))?;
-    image.apply_orientation(orientation);
-    let image = image.to_rgb8();
+    let image = open_upright(path)?;
     let (iw, ih) = (image.width() as f32, image.height() as f32);
 
     let found = models.analyze(&image).map_err(|e| fail(&e))?;
@@ -190,6 +194,46 @@ pub fn scan_image(models: &Faces, path: &Path) -> std::result::Result<Vec<NewFac
             })
         })
         .collect()
+}
+
+/// A face the user boxed at `region` of the image at `path` (fractions of the
+/// orientation-corrected image, like every region), for [`Catalog::add_face`]: its crop, and
+/// its embedding with `models` ([`Faces::embed_region`]), or an empty one without (it is then
+/// left out of suggestions and clusters). The score is 1: the user says it is a face. Needs no
+/// catalog: run it on a worker.
+pub fn scan_region(models: Option<&Faces>, path: &Path, region: Region) -> std::result::Result<NewFace, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let region = clamp_region(region).ok_or_else(|| format!("{}: the face box {region:?} is empty", path.display()))?;
+    let image = open_upright(path)?;
+    let (iw, ih) = (image.width() as f32, image.height() as f32);
+    let bbox = [region.x * iw, region.y * ih, (region.x + region.w) * iw, (region.y + region.h) * ih];
+    let embedding = match models {
+        Some(models) => models.embed_region(&image, bbox).map_err(|e| fail(&e))?.embedding,
+        None => Embedding::new(Vec::new()),
+    };
+    Ok(NewFace { region, score: 1.0, embedding, crop: crop_jpeg(&image, bbox).map_err(|e| fail(&e))? })
+}
+
+/// `region` within the image (0..=1), if anything of it is left.
+fn clamp_region(r: Region) -> Option<Region> {
+    let (x1, y1) = (r.x.clamp(0.0, 1.0), r.y.clamp(0.0, 1.0));
+    let (x2, y2) = ((r.x + r.w).clamp(0.0, 1.0), (r.y + r.h).clamp(0.0, 1.0));
+    (x2 > x1 && y2 > y1 && [x1, y1, x2, y2].iter().all(|v| v.is_finite())).then_some(Region { x: x1, y: y1, w: x2 - x1, h: y2 - y1 })
+}
+
+/// The image at `path`, decoded with its EXIF orientation applied.
+fn open_upright(path: &Path) -> std::result::Result<RgbImage, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut decoder = ImageReader::open(path)
+        .map_err(|e| fail(&e))?
+        .with_guessed_format()
+        .map_err(|e| fail(&e))?
+        .into_decoder()
+        .map_err(|e| fail(&e))?;
+    let orientation = decoder.orientation().map_err(|e| fail(&e))?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|e| fail(&e))?;
+    image.apply_orientation(orientation);
+    Ok(image.to_rgb8())
 }
 
 /// A square around the box, [`CROP_CONTEXT`] times its larger side and kept inside the
@@ -216,11 +260,11 @@ impl Catalog {
     }
 
     /// Stores what a scan of `asset` with `model` found. Rescanning replaces the unreviewed
-    /// faces and keeps the reviewed ones; a new face overlapping a reviewed one is that face
-    /// found again and is dropped.
+    /// faces and keeps the reviewed and [manual](Self::add_face) ones; a new face overlapping
+    /// one of those is that face found again and is dropped.
     pub fn set_faces(&mut self, asset: AssetId, model: &str, found: &[NewFace]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM faces WHERE asset_id = ?1 AND person IS NULL AND NOT ignored", [asset.0])?;
+        tx.execute("DELETE FROM faces WHERE asset_id = ?1 AND person IS NULL AND NOT ignored AND NOT manual", [asset.0])?;
         let reviewed: Vec<Region> = {
             let mut stmt = tx.prepare("SELECT x, y, w, h FROM faces WHERE asset_id = ?1")?;
             let rows = stmt.query_map([asset.0], |row| Ok(Region { x: row.get(0)?, y: row.get(1)?, w: row.get(2)?, h: row.get(3)? }))?;
@@ -263,7 +307,7 @@ impl Catalog {
             FaceOrder::Asset | FaceOrder::Similarity => "ORDER BY a.path, f.x, f.id",
         };
         let sql = format!(
-            "SELECT f.id, f.asset_id, f.x, f.y, f.w, f.h, f.score, f.person, f.ignored, f.suggested, f.similarity, f.cluster, f.embedding
+            "SELECT f.id, f.asset_id, f.x, f.y, f.w, f.h, f.score, f.person, f.ignored, f.suggested, f.similarity, f.cluster, f.embedding, f.manual
              FROM faces f JOIN assets a ON a.id = f.asset_id WHERE {condition} {sort}"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -287,6 +331,7 @@ impl Catalog {
                 status,
                 suggestion,
                 cluster: row.get(11)?,
+                manual: row.get(13)?,
             };
             Ok((face, embedding(row.get_ref(12)?.as_blob()?)))
         })?;
@@ -425,14 +470,85 @@ impl Catalog {
         Ok(())
     }
 
+    /// The user says these faces are not who they are named as (or, if unnamed, suggested
+    /// as): they are unreviewed again, the person's tag comes off a picture where no other
+    /// face is them, and that person isn't suggested for them again.
+    pub fn not_person(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.not_person_inner(faces);
+        super::logged(format_args!("not_person {}", super::face_ids(faces)), result)
+    }
+
+    fn not_person_inner(&mut self, faces: &[FaceId]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &face in faces {
+            tx.execute(
+                "INSERT OR IGNORE INTO face_rejections (face_id, tag_id)
+                     SELECT id, coalesce(person, suggested) FROM faces WHERE id = ?1 AND coalesce(person, suggested) IS NOT NULL",
+                [face.0],
+            )?;
+            release(&tx, face, None)?;
+            tx.execute(
+                "UPDATE faces SET person = NULL, ignored = 0, suggested = NULL, similarity = NULL, cluster = NULL WHERE id = ?1",
+                [face.0],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes these faces altogether (a box that isn't a face): a named one's person tag
+    /// comes off its picture unless another face there is them. A rescan of the file (it
+    /// changed, or a new face model) may find a deleted detection again; [ignoring](Self::ignore_faces)
+    /// keeps it out of the way for good.
+    pub fn delete_faces(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.delete_faces_inner(faces);
+        super::logged(format_args!("delete_faces {}", super::face_ids(faces)), result)
+    }
+
+    fn delete_faces_inner(&mut self, faces: &[FaceId]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &face in faces {
+            release(&tx, face, None)?;
+            // Crops and rejections go with it (ON DELETE CASCADE).
+            tx.execute("DELETE FROM faces WHERE id = ?1", [face.0])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds a face the user boxed on `asset` (see [`scan_region`]), unreviewed and
+    /// [manual](Face::manual): rescans keep it. Returns the new face.
+    pub fn add_face(&mut self, asset: AssetId, face: &NewFace) -> Result<FaceId> {
+        let result = self.add_face_inner(asset, face);
+        let r = face.region;
+        let dims = face.embedding.as_slice().len();
+        super::logged(format_args!("add_face on asset {} at {:.3},{:.3} {:.3}x{:.3} ({dims}-d embedding)", asset.0, r.x, r.y, r.w, r.h), result)
+    }
+
+    fn add_face_inner(&mut self, asset: AssetId, face: &NewFace) -> Result<FaceId> {
+        let r = clamp_region(face.region).ok_or_else(|| Error::Invalid(format!("the face box {:?} is empty", face.region)))?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO faces (asset_id, x, y, w, h, score, embedding, manual) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![asset.0, r.x, r.y, r.w, r.h, face.score.clamp(0.0, 1.0), face.embedding.to_bytes()],
+        )?;
+        let id = FaceId(tx.last_insert_rowid());
+        if !face.crop.is_empty() {
+            tx.execute("INSERT INTO face_crops (face_id, jpeg) VALUES (?1, ?2)", params![id.0, face.crop])?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Suggests a person for every unreviewed face: the person owning its most similar
     /// confirmed face, if that similarity is at least `min_similarity` (see
     /// [`DEFAULT_MIN_SIMILARITY`]) and the user hasn't rejected that person for the face.
     /// Returns how many faces have a suggestion.
     pub fn refresh_suggestions(&mut self, min_similarity: f32) -> Result<usize> {
-        let confirmed: Vec<(i64, Embedding)> = self.load_embeddings("SELECT person, embedding FROM faces WHERE person IS NOT NULL")?;
+        let confirmed: Vec<(i64, Embedding)> =
+            self.load_embeddings("SELECT person, embedding FROM faces WHERE person IS NOT NULL AND length(embedding) > 0")?;
         let unreviewed: Vec<(i64, Embedding)> =
-            self.load_embeddings("SELECT id, embedding FROM faces WHERE person IS NULL AND NOT ignored")?;
+            self.load_embeddings("SELECT id, embedding FROM faces WHERE person IS NULL AND NOT ignored AND length(embedding) > 0")?;
         let mut rejected: HashMap<i64, HashSet<i64>> = HashMap::new();
         {
             let mut stmt = self.conn.prepare("SELECT face_id, tag_id FROM face_rejections")?;
@@ -469,7 +585,7 @@ impl Catalog {
     /// clusters. For naming people before anyone is confirmed, and finding people nobody has
     /// named yet. Returns the number of clusters.
     pub fn cluster_faces(&mut self, params: &cluster::Params) -> Result<usize> {
-        let unreviewed = self.load_embeddings("SELECT id, embedding FROM faces WHERE person IS NULL AND NOT ignored")?;
+        let unreviewed = self.load_embeddings("SELECT id, embedding FROM faces WHERE person IS NULL AND NOT ignored AND length(embedding) > 0")?;
         let embeddings: Vec<Embedding> = unreviewed.iter().map(|(_, e)| e.clone()).collect();
         let labels = cluster::cluster(&embeddings, params);
         let tx = self.conn.transaction()?;
@@ -524,7 +640,7 @@ fn release(tx: &Transaction, face: FaceId, keep: Option<TagId>) -> Result<()> {
 }
 
 fn embedding(bytes: &[u8]) -> Embedding {
-    // Only set_faces writes embeddings, always whole f32s.
+    // Only set_faces and add_face write embeddings, always whole f32s (none: empty).
     Embedding::from_bytes(bytes).unwrap_or_else(|| Embedding::new(Vec::new()))
 }
 
@@ -701,6 +817,111 @@ mod tests {
         assert_eq!(after[0].status, FaceStatus::Confirmed(alice));
         assert_eq!(after[1].region.x, 0.6);
         assert_eq!(lib.cat.face_crop(after[1].id).unwrap(), Some(vec![0xff, 0xd8]));
+    }
+
+    #[test]
+    fn not_person_unnames_untags_and_stops_suggesting_them() {
+        let mut lib = Lib::new();
+        let alice = lib.person("Alice");
+        let (_, known) = lib.photo("alice.jpg", &[0.0]);
+        lib.cat.confirm_faces(&known, alice).unwrap();
+        let (asset, faces) = lib.photo("two.jpg", &[5.0, 10.0]);
+        lib.cat.confirm_faces(&faces, alice).unwrap();
+
+        // One of two Alices on the picture: the tag stays, on the other face's box.
+        lib.cat.not_person(&faces[..1]).unwrap();
+        assert_eq!(lib.user_tags(asset), [("People|Alice".to_owned(), Some(Region { x: 0.2, y: 0.1, w: 0.1, h: 0.1 }))]);
+        lib.cat.not_person(&faces[1..]).unwrap();
+        assert_eq!(lib.user_tags(asset), []);
+        assert_eq!(lib.ids(FaceFilter::Unreviewed), faces);
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(faces[0]), None, "not suggested as Alice again");
+
+        // An unnamed face: its suggestion is what it is not.
+        let (_, other) = lib.photo("other.jpg", &[2.0]);
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(other[0]), Some(alice));
+        lib.cat.not_person(&other).unwrap();
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(other[0]), None);
+    }
+
+    #[test]
+    fn deleting_a_face_takes_its_tag_and_crop_along() {
+        let mut lib = Lib::new();
+        let alice = lib.person("Alice");
+        let (asset, faces) = lib.photo("a.jpg", &[0.0, 90.0]);
+        lib.cat.confirm_faces(&faces[..1], alice).unwrap();
+        lib.cat.delete_faces(&faces[..1]).unwrap();
+        assert_eq!(lib.user_tags(asset), []);
+        assert_eq!(lib.ids(FaceFilter::Asset(asset)), [faces[1]]);
+        assert_eq!(lib.cat.face_crop(faces[0]).unwrap(), None);
+        // Gone already: nothing to do.
+        lib.cat.delete_faces(&faces[..1]).unwrap();
+    }
+
+    #[test]
+    fn added_faces_are_manual_kept_by_rescans_and_suggested_with_an_embedding() {
+        let mut lib = Lib::new();
+        let alice = lib.person("Alice");
+        let (_, known) = lib.photo("alice.jpg", &[0.0]);
+        lib.cat.confirm_faces(&known, alice).unwrap();
+        let (asset, found) = lib.photo("b.jpg", &[90.0]);
+
+        // Out of the picture on the right: clamped to it.
+        let added = NewFace { region: Region { x: 0.8, y: 0.5, w: 0.4, h: 0.2 }, ..face(0.0, 3.0) };
+        let id = lib.cat.add_face(asset, &added).unwrap();
+        let no_model = NewFace { embedding: Embedding::new(Vec::new()), crop: vec![], ..face(0.4, 0.0) };
+        let bare = lib.cat.add_face(asset, &no_model).unwrap();
+        let all = lib.cat.faces(FaceFilter::Asset(asset), FaceOrder::Asset).unwrap();
+        let mine = all.iter().find(|f| f.id == id).unwrap();
+        assert!(mine.manual && mine.status == FaceStatus::Unreviewed);
+        assert!((mine.region.w - 0.2).abs() < 1e-6);
+        assert_eq!(lib.cat.face_crop(bare).unwrap(), None);
+        let empty = NewFace { region: Region { x: 1.2, y: 0.0, w: 0.1, h: 0.1 }, ..face(0.0, 0.0) };
+        assert!(matches!(lib.cat.add_face(asset, &empty), Err(Error::Invalid(_))));
+
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(id), Some(alice));
+        assert_eq!(lib.suggestion(bare), None, "no embedding, no suggestion");
+        let params = cluster::Params { min_faces: 1, ..Default::default() };
+        lib.cat.cluster_faces(&params).unwrap();
+
+        // A rescan replaces the detected face and keeps the added ones.
+        lib.cat.set_faces(asset, MODEL, &[face(0.0, 200.0)]).unwrap();
+        let after = lib.ids(FaceFilter::Asset(asset));
+        assert!(after.contains(&id) && after.contains(&bare) && !after.contains(&found[0]));
+        assert_eq!(after.len(), 3);
+        // Found again where the user boxed it: not added twice.
+        lib.cat.set_faces(asset, MODEL, &[face(0.41, 200.0)]).unwrap();
+        assert_eq!(lib.ids(FaceFilter::Asset(asset)), [bare, id]);
+    }
+
+    /// With the face models: a face boxed by hand, roughly where the detector put it, embeds
+    /// like the detected one (redetected score 0: aligned on the template). `ARCHIVE_STUDIO_FACES_IMAGE=photo.jpg cargo test --release -p
+    /// archive-core -- --ignored --nocapture boxed_faces_embed_like_detected_ones`.
+    #[test]
+    #[ignore]
+    fn boxed_faces_embed_like_detected_ones() {
+        let path = std::path::PathBuf::from(std::env::var_os("ARCHIVE_STUDIO_FACES_IMAGE").expect("ARCHIVE_STUDIO_FACES_IMAGE"));
+        let dir = crate::pipeline::Models::locate().faces.expect("face models");
+        let models = Faces::from_dir(dir).unwrap();
+        let found = scan_image(&models, &path).unwrap();
+        assert!(!found.is_empty(), "no faces in {}", path.display());
+        for (i, f) in found.iter().enumerate() {
+            let r = f.region;
+            // Drawn a little loose and off-centre, as by hand.
+            let loose = Region { x: r.x - r.w * 0.1, y: r.y - r.h * 0.05, w: r.w * 1.25, h: r.h * 1.15 };
+            let boxed = scan_region(Some(&models), &path, loose).unwrap();
+            let similarity = boxed.embedding.similarity(&f.embedding);
+            let image = open_upright(&path).unwrap();
+            let (iw, ih) = (image.width() as f32, image.height() as f32);
+            let d = models.embed_region(&image, [loose.x * iw, loose.y * ih, (loose.x + loose.w) * iw, (loose.y + loose.h) * ih]).unwrap();
+            println!("face {i} (score {:.2}, {:.0}px): similarity {similarity:.3}, redetected score {:.2}", f.score, r.w * iw, d.detection.score);
+            // Typically 0.95+; a hard face (profile, blur) the detector can't find again in
+            // the box is aligned on the template instead, and matches less well.
+            assert!(similarity > 0.5, "face {i}: {similarity}");
+        }
     }
 
     #[test]

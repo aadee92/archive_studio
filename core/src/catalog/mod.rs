@@ -37,8 +37,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// 1: assets and tags. 2: faces. 3: file states and pipeline runs. 4: front/back pairs,
 /// image signatures, the trash, and person tags backfilled from confirmed faces. 5: image
-/// embeddings for search by description.
-const SCHEMA_VERSION: i32 = 5;
+/// embeddings for search by description. 6: faces boxed by hand.
+const SCHEMA_VERSION: i32 = 6;
 
 const SCHEMA_4: &str = "
 -- While the asset is in the trash: where it was (relative to the root) and when it was
@@ -335,6 +335,9 @@ impl Catalog {
         }
         if version < 5 {
             tx.execute_batch(semantic::SCHEMA)?;
+        }
+        if version < 6 {
+            tx.execute_batch(faces::SCHEMA_6)?;
         }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;

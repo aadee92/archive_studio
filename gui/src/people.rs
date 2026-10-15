@@ -26,7 +26,7 @@ use crate::nav::{self, Scope, Target};
 use crate::thumbs::Pixels;
 use crate::{AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
 use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, DEFAULT_MIN_SIMILARITY};
-use archive_core::catalog::people::{display_name, person_path};
+use archive_core::catalog::people::{display_name, matching_people, person_path};
 use archive_core::catalog::{Catalog, TagId, TagKind};
 
 /// `PersonItem.key` of the faces nobody has named.
@@ -136,6 +136,9 @@ impl std::fmt::Debug for Snapshot {
 
 thread_local! {
     static GRID: RefCell<Option<Rc<FaceGrid>>> = const { RefCell::new(None) };
+    /// Faces were changed elsewhere (on Details) while the page was hidden: Back re-reads
+    /// the grid instead of keeping it as it was.
+    static STALE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn with_grid(f: impl FnOnce(&Rc<FaceGrid>)) {
@@ -270,6 +273,7 @@ fn person_label(key: i32) -> String {
 /// the catalog is re-read.
 pub fn entered() {
     log::debug!("people page shown from the sidebar: re-reading the catalog");
+    STALE.set(false);
     with_grid(|g| g.load(None, "page shown"));
 }
 
@@ -290,19 +294,32 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
     })
 }
 
+/// Faces were named, un-named, added or deleted elsewhere (on Details): re-read now if the
+/// page is shown, else when it is next (Back included).
+pub fn faces_changed(ui: &AppWindow) {
+    if ui.get_page() == nav::PEOPLE {
+        refresh_if_shown(ui);
+    } else {
+        log::debug!("faces changed elsewhere: the grid will be re-read when shown");
+        STALE.set(true);
+    }
+}
+
 /// Back to a view left earlier. The grid isn't re-read if it still shows that person
-/// (the faces stay where they were, as do any just named); only the people list is.
+/// (the faces stay where they were, as do any just named), unless faces were changed
+/// elsewhere meanwhile; only the people list is.
 pub(crate) fn restore(snapshot: Snapshot) {
+    let stale = STALE.replace(false);
     with_grid(|g| {
         let Some(ui) = g.ui.upgrade() else { return };
         let bridge = ui.global::<PeopleBridge>();
-        if bridge.get_selected() == snapshot.person && !bridge.get_loading() {
+        if bridge.get_selected() == snapshot.person && !bridge.get_loading() && !stale {
             log::debug!("restore {snapshot:?}: same person on screen, applying now and re-reading the list");
             g.apply_restore(snapshot);
             g.load_people();
         } else {
             log::debug!(
-                "restore {snapshot:?}: on screen person {} (loading {}), reloading first",
+                "restore {snapshot:?}: on screen person {} (loading {}, faces changed elsewhere {stale}), reloading first",
                 bridge.get_selected(),
                 bridge.get_loading()
             );
@@ -578,32 +595,12 @@ impl FaceGrid {
         self.anchor.set(None);
     }
 
-    /// Offers the person tags matching `text` under the name box, names starting with it
-    /// first. A name shared by two tags is offered by path.
+    /// Offers the person tags matching `text` under the name box
+    /// ([`matching_people`]: names starting with it first; a name shared by two people by path).
     fn offer_names(&self, text: &str) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let text = text.trim().to_lowercase();
-        let names = self.names.borrow();
-        let mut matches: Vec<(bool, &Name)> = if text.is_empty() {
-            Vec::new()
-        } else {
-            names
-                .iter()
-                .filter_map(|n| {
-                    let lower = n.display.to_lowercase();
-                    lower.contains(&text).then(|| (!lower.starts_with(&text), n))
-                })
-                .collect()
-        };
-        matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.display.to_lowercase().cmp(&b.1.display.to_lowercase())));
-        let offered: Vec<SharedString> = matches
-            .iter()
-            .take(MATCHES)
-            .map(|(_, n)| {
-                let shared = names.iter().filter(|o| o.display.eq_ignore_ascii_case(&n.display)).count() > 1;
-                if shared { n.path.as_str().into() } else { n.display.as_str().into() }
-            })
-            .collect();
+        let paths: Vec<String> = self.names.borrow().iter().map(|n| n.path.clone()).collect();
+        let offered: Vec<SharedString> = matching_people(&paths, text, MATCHES).into_iter().map(SharedString::from).collect();
         ui.global::<PeopleBridge>().set_name_matches(ModelRc::new(VecModel::from(offered)));
     }
 

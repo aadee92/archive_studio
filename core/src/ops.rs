@@ -10,6 +10,9 @@
 //! - Tags: [`add_tag`] for what a user typed (see [`parse_tag`]), [`Catalog::add_tag_path`],
 //!   [`Catalog::remove_tag_path`]; people:
 //!   [`Catalog::name_faces`] and the rest of [`catalog::people`](crate::catalog::people).
+//! - Faces on one picture: [`add_face`] for one the detector missed (boxed by the user);
+//!   [`Catalog::not_person`], [`Catalog::ignore_faces`] and [`Catalog::delete_faces`] for the
+//!   ones there.
 //! - [`properties`]: everything known about the asset, for a properties dialog.
 
 use std::path::PathBuf;
@@ -17,14 +20,15 @@ use std::time::SystemTime;
 
 use image::{ImageDecoder, ImageReader};
 
+use crate::catalog::faces::{self as catalog_faces, FaceId};
 use crate::catalog::people::FaceBox;
 use crate::catalog::runs::{RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
 use crate::catalog::people::PEOPLE;
-use crate::catalog::{AppliedTag, AssetId, Catalog, TagId, TagKind};
+use crate::catalog::{AppliedTag, AssetId, Catalog, Region, TagId, TagKind};
 use crate::exif::{self, Exif};
 use crate::media::{classify, MediaKind};
-use crate::pipeline::{self, ORIENT};
+use crate::pipeline::{self, Models, ORIENT};
 
 /// Turns the asset's image `cw` degrees clockwise (90, 180 or 270), rewriting the file
 /// losslessly; see [`pipeline::rotate_file`].
@@ -77,6 +81,31 @@ fn add_parsed_tag(catalog: &Catalog, asset: AssetId, parsed: (TagKind, String)) 
         }
         (kind, path) => catalog.add_tag_path(asset, &path, kind),
     }
+}
+
+/// The user boxed a face the detector missed at `region` of the asset's image (fractions of
+/// the image as displayed): it becomes a manual face with its crop and, with `models` (an
+/// engine's [`face_models`](crate::pipeline::Engine::face_models), else [`face_models`]), an
+/// embedding, so suggestions and clusters take it in. Decodes the file: call it on a worker.
+/// Returns the new face, unnamed.
+pub fn add_face(catalog: &mut Catalog, asset: AssetId, region: Region, models: Option<&faces::Faces>) -> Result<FaceId, String> {
+    let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
+    let result = catalog_faces::scan_region(models, &path, region).and_then(|face| catalog.add_face(asset, &face).map_err(|e| e.to_string()));
+    match &result {
+        Ok(face) => log::debug!("add_face on asset {} ({}): face {} (embedded {})", asset.0, path.display(), face.0, models.is_some()),
+        Err(e) => log::warn!("add_face on asset {} ({}) at {region:?}: {e}", asset.0, path.display()),
+    }
+    result
+}
+
+/// Loads the face models from the models directory ([`Models::locate`]), for a host without
+/// an engine to borrow them from. Takes a few seconds: call it on a worker, once.
+pub fn face_models() -> Result<faces::Faces, String> {
+    let dir = Models::locate().faces.ok_or("no face model (buffalo_l in the models directory)")?;
+    let started = std::time::Instant::now();
+    let models = faces::Faces::from_dir(&dir).map_err(|e| format!("face model: {e}"))?;
+    log::debug!("face models loaded from {} in {:?}", dir.display(), started.elapsed());
+    Ok(models)
 }
 
 /// How the asset's rotation stands, from the orient stage.
@@ -194,6 +223,29 @@ mod tests {
         add_tag(&cat, a, "event:Wedding").unwrap();
         let tags: Vec<_> = cat.tags_of(a).unwrap().into_iter().map(|t| (t.path, t.kind)).collect();
         assert_eq!(tags, [("People|Alice".to_owned(), TagKind::Person), ("Wedding".to_owned(), TagKind::Event)]);
+    }
+
+    #[test]
+    fn a_face_added_by_hand_follows_the_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        image::RgbImage::from_pixel(40, 20, image::Rgb([200, 150, 120])).save(root.join("a.png")).unwrap();
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let a = cat.asset(&root.join("a.png")).unwrap();
+        let face = add_face(&mut cat, a, Region { x: 0.5, y: 0.0, w: 0.25, h: 0.5 }, None).unwrap();
+        assert!(cat.face_crop(face).unwrap().is_some_and(|jpeg| !jpeg.is_empty()));
+        let boxes = cat.face_boxes(a).unwrap();
+        assert_eq!((boxes.len(), boxes[0].manual), (1, true));
+        cat.name_faces(&[face], "Alice").unwrap();
+
+        rotate(&cat, a, 90).unwrap();
+        let turned = Region { x: 0.5, y: 0.5, w: 0.5, h: 0.25 };
+        assert_eq!(cat.face_boxes(a).unwrap()[0].region, turned);
+        assert_eq!(cat.tags_of(a).unwrap()[0].region, Some(turned));
+
+        cat.delete_faces(&[face]).unwrap();
+        assert!(cat.face_boxes(a).unwrap().is_empty() && cat.tags_of(a).unwrap().is_empty());
+        assert!(add_face(&mut cat, a, Region { x: 2.0, y: 0.0, w: 0.1, h: 0.1 }, None).is_err());
     }
 
     #[test]

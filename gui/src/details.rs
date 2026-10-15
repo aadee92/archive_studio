@@ -27,6 +27,15 @@
 //! in on it: one at a time, at most [`FULL_PIXELS`]), and that part of it, no larger than it
 //! is shown, is drawn over the picture.
 //!
+//! Faces on the picture can be fixed up there, all through the core on a worker (one change
+//! at a time): a click on a box opens a popup next to it to name or rename the face (the
+//! people whose names match what is typed, as in People's name box: `matching_people`), say
+//! it is not who it is named or suggested as (`Catalog::not_person`), ignore it, or delete the
+//! box (`Catalog::delete_faces`); right-clicking a box offers the same as a menu. "Add face"
+//! draws a box around a face the detector missed: `ops::add_face` stores it with its crop and
+//! an embedding (with the engine's face models, else ones loaded here once), and its popup
+//! opens. Each change is reported with `pipeline::changed` (Review's tags) and to People.
+//!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
 //! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
 //! engine if it runs here, else the core directly). That can take a second (the file is
@@ -38,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::SystemTime;
 
@@ -47,12 +56,15 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::actions;
 use crate::nav::{self, Scope, Target};
-use crate::pipeline::Handle;
+use crate::pipeline::{self, Handle};
 use crate::thumbs::{self, Pixels};
 use crate::{AppWindow, DetailFace, DetailsBridge, FilmItem, SimilarItem};
-use archive_core::catalog::faces::{FaceId, FaceStatus};
+use archive_core::catalog::faces::{FaceId, FaceStatus, DEFAULT_MIN_SIMILARITY};
+use archive_core::catalog::people::matching_people;
 use archive_core::catalog::runs::RunStatus;
-use archive_core::catalog::Catalog;
+use archive_core::catalog::{Catalog, Region, TagId, TagKind};
+use archive_core::faces::Faces;
+use archive_core::ops;
 use archive_core::media::{classify, MediaKind};
 use archive_core::pipeline::ORIENT;
 
@@ -67,6 +79,8 @@ const FULL_PIXELS: u64 = 100_000_000;
 const SIMILAR: usize = 12;
 /// Items in the filmstrip on either side of the shown one (more than fit a 4K screen).
 const FILM: usize = 24;
+/// Names offered under the face popup's name box.
+const MATCHES: usize = 6;
 
 /// The item shown.
 #[derive(Default)]
@@ -149,11 +163,41 @@ enum Action {
 }
 
 /// A face as read for the page.
+#[derive(Clone)]
 struct FaceInfo {
     id: FaceId,
     face: DetailFace,
     ignored: bool,
+    /// Who it is, and (unnamed) who it is suggested as.
+    person: Option<(TagId, String)>,
+    suggestion: Option<(TagId, String)>,
 }
+
+/// A change to a face of the shown picture, made on a worker.
+#[derive(Debug)]
+enum FaceChange {
+    /// Named as the typed name (`Catalog::name_faces`), or as this person.
+    Name(FaceId, String),
+    Confirm(FaceId, TagId),
+    Not(FaceId),
+    Ignore(FaceId),
+    Delete(FaceId),
+    /// A box drawn around a face the detector missed.
+    Add(Region),
+}
+
+thread_local! {
+    /// The faces drawn over the shown picture, in the order of `DetailsBridge.faces`.
+    static FACES: RefCell<Vec<FaceInfo>> = const { RefCell::new(Vec::new()) };
+    /// Every person (tag path), for the face popup's matches; read when it opens.
+    static NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One face change at a time, in the order asked.
+static FACE_WRITES: Mutex<()> = Mutex::new(());
+/// Face models loaded here for "Add face" when no engine runs in this window (once; `None`
+/// if they can't be).
+static OWN_FACE_MODELS: OnceLock<Option<Arc<Faces>>> = OnceLock::new();
 
 pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     CONTEXT.set(Some(Context { root, pipeline }));
@@ -234,6 +278,67 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
             go_to(&ui, i);
         }
     });
+    details.on_face_at(|x, y| face_at(x, y).map_or(-1, |i| i as i32));
+    let weak = ui.as_weak();
+    details.on_edit_face(move |i| {
+        if let Some(ui) = weak.upgrade() {
+            edit_face(&ui, i);
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_edit_edited(move |text| {
+        if let Some(ui) = weak.upgrade() {
+            let offered: Vec<SharedString> =
+                NAMES.with_borrow(|names| matching_people(names, &text, MATCHES)).into_iter().map(SharedString::from).collect();
+            ui.global::<DetailsBridge>().set_edit_matches(ModelRc::new(VecModel::from(offered)));
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_edit_assign(move |text| {
+        if let Some(ui) = weak.upgrade() {
+            assign(&ui, text.trim());
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_edit_cancel(move || {
+        if let Some(ui) = weak.upgrade() {
+            edit_face(&ui, -1);
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_face_action(move |i, action| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(face) = face_info(i) else {
+            log::debug!("details: face action {action:?} on face #{i}: no such face - ignored");
+            return;
+        };
+        log::debug!("details: face action {action:?} on face #{i} (face {})", face.id.0);
+        match action.as_str() {
+            "name" => edit_face(&ui, i),
+            "not" => change_face(&ui, FaceChange::Not(face.id)),
+            "ignore" => change_face(&ui, FaceChange::Ignore(face.id)),
+            "delete" => change_face(&ui, FaceChange::Delete(face.id)),
+            other => log::warn!("details: unknown face action {other:?}"),
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_face_menu(move |i| {
+        let (Some(ui), Some(face)) = (weak.upgrade(), face_info(i)) else { return };
+        log::debug!("details: right-click on face #{i} (face {})", face.id.0);
+        let details = ui.global::<DetailsBridge>();
+        let who = face.person.as_ref().or(face.suggestion.as_ref()).map(|(_, name)| name.as_str()).unwrap_or_default();
+        details.set_menu_face(i);
+        details.set_menu_person(who.into());
+        details.set_menu_ignored(face.ignored);
+        details.set_face_menu_serial(details.get_face_menu_serial() + 1);
+    });
+    let weak = ui.as_weak();
+    details.on_add_face(move |x, y, w, h| {
+        log::debug!("details: face box drawn at {x:.3},{y:.3} {w:.3}x{h:.3}");
+        if let Some(ui) = weak.upgrade() {
+            change_face(&ui, FaceChange::Add(Region { x, y, w, h }));
+        }
+    });
     let weak = ui.as_weak();
     details.on_film_menu(move |i| {
         let target = SHOWN.with_borrow(|shown| {
@@ -286,6 +391,9 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_full_edge(0);
     detail(ui, None);
     details.set_faces(ModelRc::default());
+    FACES.with_borrow_mut(Vec::clear);
+    details.set_editing(-1);
+    details.set_adding(false);
     details.set_flash_face(-1);
     details.set_review_cw(0);
     details.set_message(SharedString::default());
@@ -461,6 +569,9 @@ fn clear(ui: &AppWindow) {
     details.set_image_ready(false);
     details.set_image(slint::Image::default());
     details.set_faces(ModelRc::default());
+    FACES.with_borrow_mut(Vec::clear);
+    details.set_editing(-1);
+    details.set_adding(false);
     details.set_other_side(SharedString::default());
     details.set_other_ready(false);
     details.set_similar(ModelRc::default());
@@ -660,12 +771,10 @@ fn load(ui: &AppWindow) {
                 }
             }
             // Ignored faces (not a face, a stranger) aren't drawn, unless that's the one asked for.
-            let faces: Vec<&FaceInfo> = faces.iter().filter(|f| !f.ignored || Some(f.id) == flash).collect();
-            let flash_at = flash.and_then(|id| faces.iter().position(|f| f.id == id));
+            let flash_at = show_faces(&ui, faces, flash);
             if let Some(id) = flash {
                 log::debug!("details: flash face {} -> box {flash_at:?}", id.0);
             }
-            details.set_faces(ModelRc::new(VecModel::from(faces.iter().map(|f| f.face.clone()).collect::<Vec<_>>())));
             if let Some(i) = flash_at {
                 details.set_flash_face(i as i32);
                 details.set_flash_serial(details.get_flash_serial() + 1);
@@ -1004,11 +1113,187 @@ fn read_faces(catalog: &Catalog, path: &Path) -> Vec<FaceInfo> {
     faces
         .into_iter()
         .map(|face| {
-            let name = face.person.map(|(_, name)| SharedString::from(name)).unwrap_or_default();
+            let name = face.person.as_ref().map(|(_, name)| SharedString::from(name.as_str())).unwrap_or_default();
+            let suggestion = face.suggestion.map(|(tag, name, _)| (tag, name));
+            let shown = suggestion.as_ref().map(|(_, name)| SharedString::from(name.as_str())).unwrap_or_default();
             let r = face.region;
-            FaceInfo { id: face.face, face: DetailFace { x: r.x, y: r.y, w: r.w, h: r.h, name }, ignored: face.status == FaceStatus::Ignored }
+            FaceInfo {
+                id: face.face,
+                face: DetailFace { x: r.x, y: r.y, w: r.w, h: r.h, name, suggestion: shown },
+                ignored: face.status == FaceStatus::Ignored,
+                person: face.person,
+                suggestion,
+            }
         })
         .collect()
+}
+
+/// Draws `faces` over the picture (but ignored ones, unless it is `keep`), closing a face's
+/// popup; returns where `keep` is among those drawn.
+fn show_faces(ui: &AppWindow, faces: Vec<FaceInfo>, keep: Option<FaceId>) -> Option<usize> {
+    let faces: Vec<FaceInfo> = faces.into_iter().filter(|f| !f.ignored || Some(f.id) == keep).collect();
+    let at = keep.and_then(|id| faces.iter().position(|f| f.id == id));
+    let details = ui.global::<DetailsBridge>();
+    details.set_editing(-1);
+    details.set_faces(ModelRc::new(VecModel::from(faces.iter().map(|f| f.face.clone()).collect::<Vec<_>>())));
+    FACES.set(faces);
+    at
+}
+
+/// Drawn face `i`.
+fn face_info(i: i32) -> Option<FaceInfo> {
+    FACES.with_borrow(|faces| faces.get(usize::try_from(i).ok()?).cloned())
+}
+
+/// The drawn face at (`x`, `y`) (fractions of the picture): the smallest box holding it.
+/// Called from the page's bindings: never waits for the list.
+fn face_at(x: f32, y: f32) -> Option<usize> {
+    let faces = FACES.try_with(|f| f.try_borrow().ok().map(|f| f.iter().map(|f| f.face.clone()).collect::<Vec<_>>())).ok()??;
+    faces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| (f.x..=f.x + f.w).contains(&x) && (f.y..=f.y + f.h).contains(&y))
+        .min_by(|a, b| (a.1.w * a.1.h).total_cmp(&(b.1.w * b.1.h)))
+        .map(|(i, _)| i)
+}
+
+/// Opens the popup for drawn face `i` (closes it for -1), starting with the name it has or
+/// is suggested as; reads the people's names for its matches on a worker.
+fn edit_face(ui: &AppWindow, i: i32) {
+    let details = ui.global::<DetailsBridge>();
+    let Some(face) = face_info(i) else {
+        if details.get_editing() >= 0 {
+            log::debug!("details: face popup closed");
+        }
+        details.set_editing(-1);
+        return;
+    };
+    let person = face.person.as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+    let suggestion = face.suggestion.as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+    log::debug!("details: face popup for face #{i} (face {}, person {person:?}, suggested {suggestion:?})", face.id.0);
+    details.set_edit_person(person.as_str().into());
+    details.set_edit_suggestion(suggestion.as_str().into());
+    details.set_edit_text(if person.is_empty() { suggestion } else { person }.into());
+    details.set_edit_matches(ModelRc::default());
+    details.set_editing(i);
+    details.set_edit_serial(details.get_edit_serial() + 1);
+    let Some(root) = root() else { return };
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let names = open_catalog(&root).and_then(|c| c.leaf_tags(TagKind::Person).ok()).unwrap_or_default();
+        let names: Vec<String> = names.into_iter().map(|(_, path)| path).collect();
+        let _ = weak.upgrade_in_event_loop(move |_| NAMES.set(names));
+    });
+}
+
+/// The popup's name, for the face it is open for: the person it was suggested as if that is
+/// the name (so a name shared by two people means that one), else whoever the name means.
+fn assign(ui: &AppWindow, text: &str) {
+    let details = ui.global::<DetailsBridge>();
+    let Some(face) = face_info(details.get_editing()) else { return };
+    if text.is_empty() {
+        log::debug!("details: assign an empty name - ignored");
+        return;
+    }
+    if face.person.as_ref().is_some_and(|(_, name)| name == text) {
+        log::debug!("details: face {} is {text:?} already", face.id.0);
+        edit_face(ui, -1);
+        return;
+    }
+    let change = match face.suggestion {
+        Some((tag, name)) if name == text => FaceChange::Confirm(face.id, tag),
+        _ => FaceChange::Name(face.id, text.to_owned()),
+    };
+    change_face(ui, change);
+}
+
+/// Makes `change` to the shown picture's faces on a worker, then draws its faces anew (with
+/// the popup open on a face just added), reports the picture changed and refreshes the
+/// suggestions. A failure is shown in the notice.
+fn change_face(ui: &AppWindow, change: FaceChange) {
+    let Some(path) = SHOWN.with_borrow(|shown| shown.path().map(Path::to_path_buf)) else { return };
+    let Some((root, pipeline)) = CONTEXT.with_borrow(|c| c.as_ref().map(|c| (c.root.clone(), c.pipeline.clone()))) else { return };
+    let details = ui.global::<DetailsBridge>();
+    details.set_editing(-1);
+    details.set_face_working(true);
+    let engine = pipeline.engine();
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let _one_at_a_time = FACE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let started = std::time::Instant::now();
+        let mut catalog = open_catalog(&root);
+        let result = match catalog.as_mut() {
+            Some(catalog) => apply(catalog, &path, &change, engine.as_deref()),
+            None => Err("can't open the catalog".to_owned()),
+        };
+        let faces = catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default();
+        match &result {
+            Ok(face) => log::info!("details: {change:?} on {} done in {:?} (face {})", path.display(), started.elapsed(), face.0),
+            Err(e) => log::warn!("details: {change:?} on {}: {e}", path.display()),
+        }
+        if result.is_ok() {
+            pipeline::changed(&path, false);
+        }
+        let added = matches!(change, FaceChange::Add(_));
+        let reply = result.clone();
+        let shown = path.clone();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.global::<DetailsBridge>().set_face_working(false);
+            if reply.is_ok() {
+                crate::people::faces_changed(&ui);
+            }
+            if SHOWN.with_borrow(|s| s.path() != Some(shown.as_path())) {
+                return;
+            }
+            match reply {
+                Ok(face) => {
+                    show_faces(&ui, faces, None);
+                    if added {
+                        if let Some(i) = FACES.with_borrow(|f| f.iter().position(|f| f.id == face)) {
+                            edit_face(&ui, i as i32);
+                        }
+                    }
+                    if matches!(change, FaceChange::Delete(_)) {
+                        actions::notify(&ui, "Face box deleted".to_owned(), false, None);
+                    }
+                }
+                Err(e) => actions::notify(&ui, format!("Can't change the face: {e}"), true, None),
+            }
+        });
+        // Faces like the ones just named are suggested as them (as People does).
+        if let (Ok(_), Some(catalog)) = (&result, catalog.as_mut()) {
+            match catalog.refresh_suggestions(DEFAULT_MIN_SIMILARITY) {
+                Ok(n) => log::debug!("details: suggestions refreshed: {n} faces suggested"),
+                Err(e) => log::warn!("details: suggestions: {e}"),
+            }
+        }
+    });
+}
+
+/// Makes `change` to the faces of the picture at `path`; returns the face it was made to.
+fn apply(catalog: &mut Catalog, path: &Path, change: &FaceChange, engine: Option<&archive_core::pipeline::Engine>) -> Result<FaceId, String> {
+    let err = |e: archive_core::catalog::Error| e.to_string();
+    match change {
+        FaceChange::Name(face, name) => catalog.name_faces(&[*face], name).map(|_| *face).map_err(err),
+        FaceChange::Confirm(face, person) => catalog.confirm_faces(&[*face], *person).map(|()| *face).map_err(err),
+        FaceChange::Not(face) => catalog.not_person(&[*face]).map(|()| *face).map_err(err),
+        FaceChange::Ignore(face) => catalog.ignore_faces(&[*face]).map(|()| *face).map_err(err),
+        FaceChange::Delete(face) => catalog.delete_faces(&[*face]).map(|()| *face).map_err(err),
+        FaceChange::Add(region) => {
+            let asset = catalog.asset(path).map_err(err)?;
+            let models = engine.and_then(|e| e.face_models()).or_else(own_face_models);
+            ops::add_face(catalog, asset, *region, models.as_deref())
+        }
+    }
+}
+
+/// Face models for "Add face" without an engine here: loaded on first use (on a worker).
+fn own_face_models() -> Option<Arc<Faces>> {
+    OWN_FACE_MODELS
+        .get_or_init(|| {
+            ops::face_models().map(Arc::new).map_err(|e| log::warn!("details: {e}; faces added without an embedding")).ok()
+        })
+        .clone()
 }
 
 /// Asks for `action` on the shown file, on a worker (the engine replies once the file is

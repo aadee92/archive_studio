@@ -266,6 +266,8 @@ pub struct Engine {
     send: mpsc::Sender<Msg>,
     thread: Option<JoinHandle<()>>,
     availability: Arc<Mutex<Option<Availability>>>,
+    /// The face models the workers loaded, shared with hosts ([`Engine::face_models`]).
+    face_models: Arc<Mutex<Option<Arc<faces::Faces>>>>,
 }
 
 type Reply = mpsc::Sender<Result<(), String>>;
@@ -307,6 +309,8 @@ impl Engine {
 
         let availability = Arc::new(Mutex::new(None));
         let shared = availability.clone();
+        let face_models = Arc::new(Mutex::new(None));
+        let shared_faces = face_models.clone();
         let done = send.clone();
         let thread = thread::Builder::new()
             .name("pipeline".into())
@@ -314,17 +318,25 @@ impl Engine {
                 let _keep = (lock, watcher);
                 let sink: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(sink);
                 let workers = Workers::start(&config, done, &sink);
+                *shared_faces.lock().unwrap() = workers.faces.clone();
                 *shared.lock().unwrap() = Some(workers.availability);
                 sink(Event::Ready(workers.availability));
                 Pipeline::new(catalog, workers, sink).run(receive);
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { send, thread: Some(thread), availability })
+        Ok(Self { send, thread: Some(thread), availability, face_models })
     }
 
     /// Which stages can run; `None` while the models are loading.
     pub fn availability(&self) -> Option<Availability> {
         *self.availability.lock().unwrap()
+    }
+
+    /// The face models the engine loaded (`None` while loading, or without them), for a host
+    /// to embed a face the user boxed ([`ops::add_face`](crate::ops::add_face)) without loading
+    /// them a second time.
+    pub fn face_models(&self) -> Option<Arc<faces::Faces>> {
+        self.face_models.lock().unwrap().clone()
     }
 
     /// Takes in a file known to be complete (e.g. a capture just saved) without waiting
@@ -435,7 +447,7 @@ enum Outcome {
 
 struct Loaded {
     orientation: Option<orientation::OrientationDetector>,
-    faces: Option<faces::Faces>,
+    faces: Option<Arc<faces::Faces>>,
     describer: Option<describe::Describer>,
 }
 
@@ -447,6 +459,7 @@ struct Workers {
     availability: Availability,
     /// The describe stage's model loaded.
     describe: bool,
+    faces: Option<Arc<faces::Faces>>,
 }
 
 impl Workers {
@@ -455,7 +468,7 @@ impl Workers {
         let orientation = config.models.orientation.as_ref().and_then(|path| {
             orientation::OrientationDetector::new(path).map_err(|e| warn("orientation", &e)).ok()
         });
-        let faces = config.models.faces.as_ref().and_then(|dir| faces::Faces::from_dir(dir).map_err(|e| warn("face", &e)).ok());
+        let faces = config.models.faces.as_ref().and_then(|dir| faces::Faces::from_dir(dir).map_err(|e| warn("face", &e)).ok()).map(Arc::new);
         let describer = config.models.describe.as_ref().and_then(|dir| {
             let started = Instant::now();
             let describer = describe::Describer::from_dir(dir).map_err(|e| warn("CLIP", &e)).ok();
@@ -464,7 +477,7 @@ impl Workers {
         });
         let availability = Availability { orient: orientation.is_some(), faces: faces.is_some() };
         let describe = describer.is_some();
-        let models = Arc::new(Loaded { orientation, faces, describer });
+        let models = Arc::new(Loaded { orientation, faces: faces.clone(), describer });
 
         let (jobs, receive) = mpsc::channel::<Job>();
         let receive = Arc::new(Mutex::new(receive));
@@ -483,7 +496,7 @@ impl Workers {
                 }
             });
         }
-        Self { jobs, active, threads, availability, describe }
+        Self { jobs, active, threads, availability, describe, faces }
     }
 }
 

@@ -38,6 +38,8 @@ pub struct FaceBox {
     pub person: Option<(TagId, String)>,
     /// For unreviewed faces: the suggested person, its display name and the similarity.
     pub suggestion: Option<(TagId, String, f32)>,
+    /// Boxed by the user ([`Catalog::add_face`]), not found by a scan.
+    pub manual: bool,
 }
 
 /// The person tag path a typed name means: `Alice` is `People|Alice`; a path already under
@@ -51,6 +53,33 @@ pub fn person_path(name: &str) -> Result<String> {
 /// The last segment of a tag path: `People|Family|Alice` → `Alice`.
 pub fn display_name(path: &str) -> &str {
     path.rsplit('|').next().unwrap_or(path).trim()
+}
+
+/// The names a name box offers for what was typed so far: the people (person tag paths, as
+/// [`Catalog::leaf_tags`] lists them) whose display name contains `text` ignoring case, those
+/// starting with it first, then alphabetically; at most `limit`. Each is offered by display
+/// name, or by path where two people share it, so that [`Catalog::person`] finds that one.
+pub fn matching_people<P: AsRef<str>>(paths: &[P], text: &str, limit: usize) -> Vec<String> {
+    let text = text.trim().to_lowercase();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut matches: Vec<(bool, String, &str)> = paths
+        .iter()
+        .filter_map(|p| {
+            let lower = display_name(p.as_ref()).to_lowercase();
+            lower.contains(&text).then(|| (!lower.starts_with(&text), lower, p.as_ref()))
+        })
+        .collect();
+    matches.sort();
+    matches
+        .iter()
+        .take(limit)
+        .map(|(_, lower, path)| {
+            let shared = matches.iter().filter(|(_, other, _)| other == lower).count() > 1;
+            if shared { (*path).to_owned() } else { display_name(path).to_owned() }
+        })
+        .collect()
 }
 
 impl Catalog {
@@ -197,7 +226,7 @@ impl Catalog {
     /// Ignored faces are included (status [`FaceStatus::Ignored`]); skip them to hide them.
     pub fn face_boxes(&self, asset: AssetId) -> Result<Vec<FaceBox>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT f.id, f.x, f.y, f.w, f.h, f.person, p.path, f.ignored, f.suggested, s.path, f.similarity
+            "SELECT f.id, f.x, f.y, f.w, f.h, f.person, p.path, f.ignored, f.suggested, s.path, f.similarity, f.manual
              FROM faces f LEFT JOIN tags p ON p.id = f.person LEFT JOIN tags s ON s.id = f.suggested
              WHERE f.asset_id = ?1 ORDER BY f.x, f.id",
         )?;
@@ -223,6 +252,7 @@ impl Catalog {
                 status,
                 person: person.map(|(id, path)| (TagId(id), display_name(&path).to_owned())),
                 suggestion,
+                manual: row.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -370,6 +400,15 @@ mod tests {
         lib.cat.remove_tag(a, alice).unwrap();
         assert!(lib.tags(a).is_empty());
         assert!(lib.cat.faces(FaceFilter::Confirmed(alice), FaceOrder::Asset).unwrap().is_empty());
+    }
+
+    #[test]
+    fn name_box_matches() {
+        let people = ["People|Alice", "People|Family|Alice", "People|Malice", "People|Bob", "People|alina"];
+        assert_eq!(matching_people(&people, " ALI", 10), ["People|Alice", "People|Family|Alice", "alina", "Malice"]);
+        assert_eq!(matching_people(&people, "ali", 2), ["People|Alice", "People|Family|Alice"]);
+        assert_eq!(matching_people(&people, "bo", 10), ["Bob"]);
+        assert!(matching_people(&people, "  ", 10).is_empty());
     }
 
     #[test]

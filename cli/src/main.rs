@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 use archive_core::catalog::runs::{RunCounts, RunStatus};
-use archive_core::catalog::{AssetId, Catalog, TagKind};
+use archive_core::catalog::faces::FaceId;
+use archive_core::catalog::{AssetId, Catalog, Region, TagKind};
 use archive_core::ops;
 use archive_core::pipeline::describe::TextSearch;
 use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, DESCRIBE, FACES, ORIENT, SIGNATURE};
@@ -27,6 +28,11 @@ retry                      run the failed stages again
 add PATH...                take in files now, without waiting for them to settle
 faces [PATH]               people and unknown faces, or the faces in one file
 name FACE_ID... NAME       name faces (ids from faces PATH); tags their files People|NAME
+not FACE_ID...             they aren't who they're named (or suggested) as: un-name, untag
+ignore FACE_ID...          faces not worth naming (strangers, not a face)
+delete-face FACE_ID...     remove face boxes altogether (false detections)
+add-face PATH X Y W H      box a face the detector missed (fractions of the picture: left,
+                           top, width, height); prints its id, to name it
 person rename NAME NEW     rename a person (onto an existing one: merge)
 person merge NAME INTO     NAME's faces and tags become INTO's
 person delete NAME         un-name their faces and drop their tag
@@ -163,7 +169,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     };
 
-    let mut shell = Shell { root: root.clone(), catalog, engine, search: None };
+    let mut shell = Shell { root: root.clone(), catalog, engine, search: None, faces: None };
     for command in &args.commands {
         if !shell.execute(command) {
             return Ok(());
@@ -251,6 +257,8 @@ struct Shell {
     engine: Option<Engine>,
     /// Loaded on the first `find`.
     search: Option<TextSearch>,
+    /// Loaded on the first `add-face` without an engine here.
+    faces: Option<Arc<archive_core::faces::Faces>>,
 }
 
 impl Shell {
@@ -280,6 +288,10 @@ impl Shell {
             "faces" if rest.is_empty() => self.faces(),
             "faces" => self.faces_in(rest),
             "name" => self.name(rest),
+            "not" => self.each_face(rest, "not", Catalog::not_person),
+            "ignore" => self.each_face(rest, "ignore", Catalog::ignore_faces),
+            "delete-face" => self.each_face(rest, "delete-face", Catalog::delete_faces),
+            "add-face" => self.add_face(rest),
             "person" => self.person(rest),
             "sync-people" => self.catalog.sync_person_tags().map(|n| println!("added {n} person tags")).map_err(|e| e.to_string()),
             "tags" => self.tags(rest),
@@ -456,7 +468,6 @@ impl Shell {
 
     /// `name FACE_ID... NAME WORDS`.
     fn name(&mut self, args: &[&str]) -> Result<(), String> {
-        use archive_core::catalog::faces::FaceId;
         let ids: Vec<FaceId> = args.iter().map_while(|a| a.parse().ok().map(FaceId)).collect();
         let name = args[ids.len()..].join(" ");
         if ids.is_empty() || name.is_empty() {
@@ -465,6 +476,43 @@ impl Shell {
         let person = self.catalog.name_faces(&ids, &name).map_err(err)?;
         let path = self.catalog.people_with_faces().map_err(err)?.into_iter().find(|p| p.tag == person).map(|p| p.path);
         println!("named {} faces {}", ids.len(), path.unwrap_or(name));
+        Ok(())
+    }
+
+    /// `COMMAND FACE_ID...`: `change` on those faces.
+    fn each_face(
+        &mut self,
+        args: &[&str],
+        command: &str,
+        change: impl FnOnce(&mut Catalog, &[FaceId]) -> archive_core::catalog::Result<()>,
+    ) -> Result<(), String> {
+        let ids: Vec<FaceId> = args.iter().map(|a| a.parse().map(FaceId)).collect::<Result<_, _>>().map_err(|_| format!("{command} FACE_ID..."))?;
+        if ids.is_empty() {
+            return Err(format!("{command} FACE_ID..."));
+        }
+        change(&mut self.catalog, &ids).map_err(err)?;
+        println!("{command}: {} faces", ids.len());
+        Ok(())
+    }
+
+    /// `add-face PATH X Y W H`.
+    fn add_face(&mut self, args: &[&str]) -> Result<(), String> {
+        let usage = || "add-face PATH X Y W H (fractions of the picture)".to_owned();
+        let [path, numbers @ ..] = args else { return Err(usage()) };
+        let numbers: Vec<f32> = numbers.iter().map(|n| n.parse()).collect::<Result<_, _>>().map_err(|_| usage())?;
+        let [x, y, w, h] = numbers[..] else { return Err(usage()) };
+        let asset = self.asset(path)?;
+        let models = match self.engine.as_ref().and_then(Engine::face_models) {
+            Some(models) => Some(models),
+            None => {
+                if self.faces.is_none() {
+                    self.faces = ops::face_models().map(Arc::new).map_err(|e| println!("{e}; the face is added without an embedding")).ok();
+                }
+                self.faces.clone()
+            }
+        };
+        let face = ops::add_face(&mut self.catalog, asset, Region { x, y, w, h }, models.as_deref())?;
+        println!("added face {} on {}", face.0, self.shown(asset));
         Ok(())
     }
 

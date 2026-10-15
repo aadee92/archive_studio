@@ -17,12 +17,12 @@ Archive Studio is a headless core with thin front ends.
 | Path | Crate | Role |
 |---|---|---|
 | `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag, properties). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces, find by description |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), find by description |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
-| `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings and clustering into people (lib; `examples/faces.rs` driver) |
+| `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings (also of a hand-drawn box) and clustering into people (lib; `examples/faces.rs` driver) |
 | `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
 | `utils/clip` | `clip` | TinyCLIP image and text embeddings, CLIP tokenizer, grouped zero-shot labels (lib; `examples/clip.rs` driver; `export_onnx.py` makes the model) |
 | `utils/*.py`, `utils/*.sh` | | Standalone scripts |
@@ -90,7 +90,17 @@ XMP sidecar sync.
   tags in step; a tag stays while any face on the asset is still that person. Taking the tag
   off an asset un-names that person's faces there. Schema 4 backfilled tags for faces named
   before this; `sync_person_tags` repairs. `face_boxes(asset)` gives boxes (0..1, displayed
-  image) with names for drawing.
+  image) with names for drawing. `matching_people` is what a name box offers for a typed name.
+- **Fixing faces on one picture** (`faces`): `not_person` (un-named and untagged as above,
+  and that person never suggested for it again), `ignore_faces`, `delete_faces` (the row,
+  its crop and rejections; the tag follows as for un-naming; a rescan may find a deleted
+  detection again). `add_face` stores a face the user boxed as *manual* (schema 6): rescans
+  keep it like a reviewed one. `faces::scan_region` (via `ops::add_face`) gives its crop and
+  embedding: `faces::Faces::embed_region` runs the detector again on that part of the image
+  and aligns on the landmarks of the best detection centred in the box, else on ArcFace's
+  template laid over the box. Without the models the embedding is empty and suggestions and
+  clusters skip the face. The models come from `Engine::face_models`, else
+  `ops::face_models` loads them.
 - **Front/back pairs** (`pairs`): `asset_pairs(front, back)`. Filled by naming when an asset
   is first seen (`X-back.*` / `X_back` / `X back` with `X-front.*` or `X.*` in the same
   directory, as the V850 / photo-duplex writes `photo-NNNN-front.png` / `-back.png`), or by

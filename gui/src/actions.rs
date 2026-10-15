@@ -234,7 +234,9 @@ fn undo(ui: &AppWindow) {
     });
 }
 
-fn notify(ui: &AppWindow, text: String, error: bool, undo: Option<AssetId>) {
+/// Shows `text` in the notice at the bottom of the window, with Undo restoring `undo` from
+/// the trash.
+pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: Option<AssetId>) {
     log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if undo.is_some() { " [Undo]" } else { "" });
     let menu = ui.global::<ItemMenu>();
     menu.set_notice(text.into());

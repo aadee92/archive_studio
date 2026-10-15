@@ -1,4 +1,4 @@
-import { Button, CheckBox } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
@@ -12,6 +12,8 @@ export struct DetailFace {
     w: float,
     h: float,
     name: string,
+    // Unnamed: who it is suggested as ("" if nobody).
+    suggestion: string,
 }
 
 // A highly similar item in the strip under the picture.
@@ -63,6 +65,27 @@ export global DetailsBridge {
     in property <int> flash-face: -1;
     in property <int> flash-serial;
 
+    // Editing the faces of the shown picture (not of the other side). The face (index in
+    // `faces`) whose naming popup is open, -1 if none; Rust sets it (`edit-face`).
+    in property <int> editing: -1;
+    // For the popup: who that face is ("" if unnamed), who it is suggested as, the text to
+    // start with, and the names matching what is typed (`edit-edited`). `edit-serial` is
+    // bumped for each face opened, to start over.
+    in property <string> edit-person;
+    in property <string> edit-suggestion;
+    in property <string> edit-text;
+    in property <int> edit-serial;
+    in property <[string]> edit-matches;
+    // A change to the faces is being saved.
+    in property <bool> face-working;
+    // "Add face": drawing a box on the picture adds a face there.
+    in-out property <bool> adding;
+    // The face box right-clicked, for its menu (shown when `face-menu-serial` changes).
+    in property <int> menu-face: -1;
+    in property <string> menu-person;
+    in property <bool> menu-ignored;
+    in property <int> face-menu-serial;
+
     // The view the item was opened from, and the items in it most like this one.
     in property <string> scope-label;
     in property <int> scope-count;
@@ -103,6 +126,23 @@ export global DetailsBridge {
     callback go-to(int);
     // Right-click on item i of the view in the filmstrip: its menu.
     callback film-menu(int);
+
+    // The face (index in `faces`) at a point of the picture (fractions), -1 if none; the
+    // smallest one if boxes overlap.
+    pure callback face-at(float, float) -> int;
+    // A click on face i (-1: elsewhere on the picture): open its popup (or close it).
+    callback edit-face(int);
+    callback edit-edited(string);
+    // Enter or a match picked in the popup: the face is that person.
+    callback edit-assign(string);
+    callback edit-cancel();
+    // On face i, from the popup or its menu: "name" (open the popup), "not" (not who it is
+    // named or suggested as), "ignore", "delete" (the box altogether).
+    callback face-action(int, string);
+    // Right-click on face i: its menu.
+    callback face-menu(int);
+    // "Add face": a box drawn on the picture (fractions: left, top, width, height).
+    callback add-face(float, float, float, float);
 }
 
 // A face's box over the picture, with the person's name under it.
@@ -115,8 +155,11 @@ component FaceBox inherits Rectangle {
     in property <bool> lit;
     // Room under the box before the picture's bottom edge; the label goes above if short.
     in property <length> room-below;
+    // Under the pointer, or its popup is open.
+    in property <bool> hovered;
+    in property <bool> selected;
 
-    property <bool> box-on: root.show-box || root.flashing;
+    property <bool> box-on: root.show-box || root.flashing || root.selected;
 
     // Dark outline, then the light (or highlighted) box inside it, legible on any picture.
     Rectangle {
@@ -132,8 +175,8 @@ component FaceBox inherits Rectangle {
             width: parent.width - 2px;
             height: parent.height - 2px;
             border-radius: 2px;
-            border-width: root.lit ? 3px : 1.5px;
-            border-color: root.lit ? #facc15 : root.flashing ? #fde68a : #ffffffe0;
+            border-width: root.lit ? 3px : root.selected || root.hovered ? 2.5px : 1.5px;
+            border-color: root.lit ? #facc15 : root.flashing ? #fde68a : root.selected ? #60a5fa : root.hovered ? #ffffff : #ffffffe0;
             animate border-color, border-width { duration: 120ms; }
         }
     }
@@ -203,6 +246,15 @@ component Picture inherits Rectangle {
     in property <float> tile-y;
     in property <float> tile-w;
     in property <float> tile-h;
+    // Its faces can be clicked (`face-clicked`) and right-clicked (`face-menu`); `adding`: a
+    // drag draws a box (`drawn`) instead of panning. `editing`: the face whose popup is
+    // open, whose box is `edit-x` … `edit-h` here.
+    in property <bool> editable;
+    in property <bool> adding;
+    in property <int> editing: -1;
+    callback face-clicked(int);
+    callback face-menu(int);
+    callback drawn(float, float, float, float);
     callback pressed();
     // Right-click; the pointer's window position is in `ItemMenu`.
     callback menu();
@@ -232,6 +284,11 @@ component Picture inherits Rectangle {
     out property <bool> fitted: Math.abs(root.zoom - 1) < 0.001;
     // Larger than the box: dragging (and the arrow keys) pan.
     out property <bool> pannable: self.shown-width > self.width + 0.5px || self.shown-height > self.height + 0.5px;
+
+    out property <length> edit-x: root.shown-x + root.faces[root.editing].x * root.shown-width;
+    out property <length> edit-y: root.shown-y + root.faces[root.editing].y * root.shown-height;
+    out property <length> edit-w: root.faces[root.editing].w * root.shown-width;
+    out property <length> edit-h: root.faces[root.editing].h * root.shown-height;
 
     // Where the picture is shown: centered on (`cx`, `cy`), but never leaving a gap at an edge
     // it could cover (centered if smaller than the box). Face boxes are placed in these
@@ -326,13 +383,47 @@ component Picture inherits Rectangle {
         show-name: DetailsBridge.show-names;
         flashing: i == root.flash-face && root.flash-step > 0;
         lit: i == root.flash-face && Math.mod(root.flash-step, 2) == 0 && root.flash-step > 0;
+        hovered: i == root.hover-face;
+        selected: i == root.editing;
     }
-    TouchArea {
+    // The box being drawn in "Add face".
+    if root.adding && ta.pressed: Rectangle {
+        x: Math.min(ta.pressed-x, ta.mouse-x);
+        y: Math.min(ta.pressed-y, ta.mouse-y);
+        width: Math.abs(ta.mouse-x - ta.pressed-x);
+        height: Math.abs(ta.mouse-y - ta.pressed-y);
+        border-width: 2px;
+        border-radius: 3px;
+        border-color: #60a5fa;
+        background: #60a5fa30;
+    }
+    // The face under the pointer, when they can be clicked.
+    property <int> hover-face: root.editable && !root.adding && ta.has-hover && !ta.pressed && DetailsBridge.show-boxes
+        ? DetailsBridge.face-at((ta.mouse-x - root.shown-x) / Math.max(1px, root.shown-width), (ta.mouse-y - root.shown-y) / Math.max(1px, root.shown-height))
+        : -1;
+    pure function face-under(x: length, y: length) -> int {
+        return root.editable && DetailsBridge.show-boxes
+            ? DetailsBridge.face-at((x - root.shown-x) / Math.max(1px, root.shown-width), (y - root.shown-y) / Math.max(1px, root.shown-height))
+            : -1;
+    }
+    ta := TouchArea {
         // Where the picture was when the drag began.
         property <length> drag-x;
         property <length> drag-y;
-        mouse-cursor: !root.pannable ? default : self.pressed ? grabbing : grab;
+        mouse-cursor: root.adding ? crosshair : root.hover-face >= 0 ? pointer : !root.pannable ? default : self.pressed ? grabbing : grab;
+        clicked => {
+            // A click, not the end of a drag: a face's popup, or none.
+            if (root.editable && !root.adding && Math.abs(self.mouse-x - self.pressed-x) < 4px && Math.abs(self.mouse-y - self.pressed-y) < 4px) {
+                root.face-clicked(root.face-under(self.mouse-x, self.mouse-y));
+            }
+        }
         double-clicked => {
+            if (root.adding) {
+                return;
+            }
+            if (root.editable) {
+                root.face-clicked(-1);
+            }
             if (!root.double-click-zooms) {
                 root.open();
             } else if (root.fitted) {
@@ -349,14 +440,29 @@ component Picture inherits Rectangle {
                 self.drag-x = root.shown-x;
                 self.drag-y = root.shown-y;
             }
+            // The box drawn, in fractions of the picture (kept within it).
+            if (root.adding && event.button == PointerEventButton.left && event.kind == PointerEventKind.up
+                && Math.abs(self.mouse-x - self.pressed-x) >= 6px && Math.abs(self.mouse-y - self.pressed-y) >= 6px) {
+                let x1 = Math.max(0, Math.min(1, (Math.min(self.pressed-x, self.mouse-x) - root.shown-x) / Math.max(1px, root.shown-width)));
+                let y1 = Math.max(0, Math.min(1, (Math.min(self.pressed-y, self.mouse-y) - root.shown-y) / Math.max(1px, root.shown-height)));
+                let x2 = Math.max(0, Math.min(1, (Math.max(self.pressed-x, self.mouse-x) - root.shown-x) / Math.max(1px, root.shown-width)));
+                let y2 = Math.max(0, Math.min(1, (Math.max(self.pressed-y, self.mouse-y) - root.shown-y) / Math.max(1px, root.shown-height)));
+                if (x2 > x1 && y2 > y1) {
+                    root.drawn(x1, y1, x2 - x1, y2 - y1);
+                }
+            }
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
                 ItemMenu.x = self.absolute-position.x + self.mouse-x;
                 ItemMenu.y = self.absolute-position.y + self.mouse-y;
-                root.menu();
+                if (root.face-under(self.mouse-x, self.mouse-y) >= 0) {
+                    root.face-menu(root.face-under(self.mouse-x, self.mouse-y));
+                } else {
+                    root.menu();
+                }
             }
         }
         moved => {
-            if (self.pressed && root.pannable) {
+            if (self.pressed && root.pannable && !root.adding) {
                 root.pan-from(self.drag-x + self.mouse-x - self.pressed-x, self.drag-y + self.mouse-y - self.pressed-y);
             }
         }
@@ -385,6 +491,145 @@ component Picture inherits Rectangle {
         ear := TouchArea {
             mouse-cursor: pointer;
             clicked => { root.flip(); }
+        }
+    }
+}
+
+// A small text button, for the face popup.
+component LinkButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 24px;
+    width: label.preferred-width + 14px;
+    border-radius: 4px;
+    background: ta.has-hover && root.enabled ? Theme.hover : transparent;
+    label := Text {
+        text: root.text;
+        font-size: 12px;
+        color: !root.enabled ? Theme.placeholder : root.danger ? Theme.danger : Theme.accent;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Naming the face `DetailsBridge.editing`, next to its box: a name box with the people whose
+// names match under it (Enter or a click assigns, Esc closes), and the other things to say
+// about the face.
+component FacePopup inherits Rectangle {
+    // The match highlighted with Up / Down (-1: the typed text).
+    property <int> match-index: -1;
+    // Who it is or is suggested as: "Not …" says it isn't.
+    property <string> who: DetailsBridge.edit-person != "" ? DetailsBridge.edit-person : DetailsBridge.edit-suggestion;
+
+    width: 260px;
+    height: col.preferred-height;
+    background: Theme.surface;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000030;
+    drop-shadow-offset-y: 3px;
+
+    property <int> serial: DetailsBridge.edit-serial;
+    changed serial => { root.begin(); }
+    init => { root.begin(); }
+    // Another face (or the first): its name (or suggestion), selected so typing replaces it.
+    function begin() {
+        UiLog.debug("details.face-popup", "opened for face #\{DetailsBridge.editing} (\{DetailsBridge.edit-text})");
+        edit.text = DetailsBridge.edit-text;
+        root.match-index = -1;
+        DetailsBridge.edit-edited("");
+        edit.focus();
+        edit.select-all();
+    }
+    function assign() {
+        DetailsBridge.edit-assign(root.match-index >= 0 && root.match-index < DetailsBridge.edit-matches.length
+            ? DetailsBridge.edit-matches[root.match-index] : edit.text);
+    }
+
+    // Clicks stay in the popup.
+    TouchArea { }
+    col := VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        Text {
+            text: DetailsBridge.edit-person != "" ? "Rename \{DetailsBridge.edit-person}"
+                : DetailsBridge.edit-suggestion != "" ? "Who is this? Suggested: \{DetailsBridge.edit-suggestion}" : "Who is this?";
+            font-size: 11px;
+            font-weight: 600;
+            color: Theme.text-muted;
+            overflow: elide;
+        }
+        edit := LineEdit {
+            placeholder-text: "Name";
+            enabled: !DetailsBridge.face-working;
+            edited(text) => {
+                root.match-index = -1;
+                DetailsBridge.edit-edited(text);
+            }
+            accepted => { root.assign(); }
+            key-pressed(event) => {
+                if (event.text == Key.DownArrow) {
+                    root.match-index = Math.min(root.match-index + 1, DetailsBridge.edit-matches.length - 1);
+                    return accept;
+                }
+                if (event.text == Key.UpArrow) {
+                    root.match-index = Math.max(root.match-index - 1, -1);
+                    return accept;
+                }
+                if (event.text == Key.Escape) {
+                    UiLog.debug("details.face-popup", "Esc: close");
+                    DetailsBridge.edit-cancel();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+        for name[i] in DetailsBridge.edit-matches: Rectangle {
+            height: 24px;
+            border-radius: 4px;
+            background: i == root.match-index ? Theme.accent-soft : match-ta.has-hover ? Theme.hover : transparent;
+            Text {
+                x: 8px;
+                width: parent.width - 16px;
+                text: name;
+                font-size: 12px;
+                color: i == root.match-index ? Theme.accent : Theme.text;
+                overflow: elide;
+            }
+            match-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.match-index = i;
+                    root.assign();
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 2px;
+            alignment: start;
+            if root.who != "": LinkButton {
+                text: "Not \{root.who}";
+                enabled: !DetailsBridge.face-working;
+                clicked => { DetailsBridge.face-action(DetailsBridge.editing, "not"); }
+            }
+            LinkButton {
+                text: "Ignore";
+                enabled: !DetailsBridge.face-working;
+                clicked => { DetailsBridge.face-action(DetailsBridge.editing, "ignore"); }
+            }
+            LinkButton {
+                text: "Delete box";
+                danger: true;
+                enabled: !DetailsBridge.face-working;
+                clicked => { DetailsBridge.face-action(DetailsBridge.editing, "delete"); }
+            }
         }
     }
 }
@@ -538,13 +783,17 @@ export component DetailsPage inherits Rectangle {
     background: Theme.bg;
 
     // Take the keyboard when shown, so Esc reaches us (not a field on a hidden page). Left,
-    // it lets go of the zoom (and the sharper picture held for it).
+    // it lets go of the zoom (and the sharper picture held for it), "Add face" and a face's popup.
     changed visible => {
         UiLog.debug("details", "visible = \{self.visible ? "yes" : "no"}");
         if (self.visible) {
             keys.focus();
         } else {
             self.fit();
+            DetailsBridge.adding = false;
+            if (DetailsBridge.editing >= 0) {
+                DetailsBridge.edit-cancel();
+            }
         }
     }
 
@@ -566,6 +815,14 @@ export component DetailsPage inherits Rectangle {
     property <string> shown-path: DetailsBridge.path;
     changed shown-path => { self.fit(); }
 
+    // The face popup closed: the keys are the page's again.
+    property <int> editing: DetailsBridge.editing;
+    changed editing => {
+        if (self.editing < 0 && self.visible) {
+            keys.focus();
+        }
+    }
+
     // Flash: 6 half-pulses of 250 ms (3 pulses in 1.5 s) whenever Rust bumps the serial.
     property <int> flash-serial: DetailsBridge.flash-serial;
     property <int> flash-step: 0;
@@ -576,9 +833,50 @@ export component DetailsPage inherits Rectangle {
         triggered => { root.flash-step -= 1; }
     }
 
+    // A face box's menu, shown by Rust (`face-menu-serial`) where it was right-clicked. Never
+    // opened by its own right-clicks, and behind everything, like the item menu.
+    face-menu-area := ContextMenuArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        enabled: false;
+        Menu {
+            MenuItem {
+                title: DetailsBridge.menu-person != "" ? "Rename…" : "Name…";
+                activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "name"); }
+            }
+            MenuItem {
+                title: DetailsBridge.menu-person != "" ? "Not \{DetailsBridge.menu-person}" : "Not this person";
+                enabled: DetailsBridge.menu-person != "";
+                activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "not"); }
+            }
+            MenuItem {
+                title: "Ignore";
+                enabled: !DetailsBridge.menu-ignored;
+                activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "ignore"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Delete face box";
+                activated => { DetailsBridge.face-action(DetailsBridge.menu-face, "delete"); }
+            }
+        }
+    }
     keys := FocusScope {
         changed has-focus => { UiLog.debug("details", "keyboard focus \{self.has-focus ? "taken" : "lost"} (page visible \{root.visible ? "yes" : "no"})"); }
         key-pressed(event) => {
+            // Esc ends "Add face", or closes a face's popup, before it goes back.
+            if (event.text == Key.Escape && DetailsBridge.adding) {
+                UiLog.debug("details", "Esc: stop adding a face");
+                DetailsBridge.adding = false;
+                return accept;
+            }
+            if (event.text == Key.Escape && DetailsBridge.editing >= 0) {
+                UiLog.debug("details", "Esc: close the face popup");
+                DetailsBridge.edit-cancel();
+                return accept;
+            }
             if (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
                 UiLog.debug("details", "\{event.text == Key.Escape ? "Esc" : "Alt+Left"} → back (page visible \{root.visible ? "yes" : "no"}, has item \{DetailsBridge.has-item ? "yes" : "no"})");
                 NavBridge.back();
@@ -714,6 +1012,15 @@ export component DetailsPage inherits Rectangle {
                     tile-w: DetailsBridge.tile-w;
                     tile-h: DetailsBridge.tile-h;
                     region(left, top, right, bottom, width) => { DetailsBridge.detail(left, top, right, bottom, width); }
+                    editable: DetailsBridge.is-image;
+                    adding: DetailsBridge.adding;
+                    editing: DetailsBridge.editing;
+                    face-clicked(i) => { DetailsBridge.edit-face(i); }
+                    face-menu(i) => { DetailsBridge.face-menu(i); }
+                    drawn(x, y, w, h) => {
+                        DetailsBridge.adding = false;
+                        DetailsBridge.add-face(x, y, w, h);
+                    }
                     pressed => { keys.focus(); }
                     menu => { DetailsBridge.context-menu(0); }
                     flip => { DetailsBridge.flip(); }
@@ -758,6 +1065,7 @@ export component DetailsPage inherits Rectangle {
                     vertical-alignment: center;
                     // The request in flight, else why the last one failed, else orient's detail.
                     text: DetailsBridge.working ? "Working…"
+                        : DetailsBridge.adding ? "Draw a box around the face · Esc to cancel"
                         : DetailsBridge.message != "" ? DetailsBridge.message
                         : DetailsBridge.review-cw != 0 ? DetailsBridge.review-detail : "";
                     color: !DetailsBridge.working && DetailsBridge.message != "" ? Theme.danger : Theme.text-muted;
@@ -803,6 +1111,19 @@ export component DetailsPage inherits Rectangle {
                     checked <=> DetailsBridge.side-by-side;
                     toggled => { DetailsBridge.side-by-side-changed(); }
                 }
+                // Draw a box around a face the detector missed.
+                if DetailsBridge.is-image: Button {
+                    text: DetailsBridge.adding ? "Cancel" : "Add face";
+                    enabled: DetailsBridge.image-ready && !DetailsBridge.face-working;
+                    clicked => {
+                        DetailsBridge.adding = !DetailsBridge.adding;
+                        if (DetailsBridge.adding) {
+                            DetailsBridge.show-boxes = true;
+                            DetailsBridge.edit-cancel();
+                        }
+                        keys.focus();
+                    }
+                }
                 if DetailsBridge.is-image: CheckBox {
                     text: "Face boxes";
                     enabled: DetailsBridge.faces.length > 0;
@@ -815,5 +1136,26 @@ export component DetailsPage inherits Rectangle {
                 }
             }
         }
+
+        // The popup for the face being named, under its box (above if there's no room), kept
+        // in the picture's frame; it follows zoom and pan.
+        if DetailsBridge.editing >= 0 && DetailsBridge.image-ready: FacePopup {
+            property <length> box-x: pic.absolute-position.x - keys.absolute-position.x + pic.edit-x;
+            property <length> box-y: pic.absolute-position.y - keys.absolute-position.y + pic.edit-y;
+            property <length> top: stage.absolute-position.y - keys.absolute-position.y;
+            property <length> bottom: self.top + stage.height;
+            property <length> below: self.box-y + pic.edit-h + 8px;
+            property <length> above: self.box-y - self.height - 8px;
+            x: Math.max(8px, Math.min(keys.width - self.width - 8px, self.box-x + pic.edit-w / 2 - self.width / 2));
+            y: self.below + self.height <= self.bottom ? self.below
+                : self.above >= self.top ? self.above
+                : Math.max(self.top, self.bottom - self.height);
+        }
+    }
+
+    property <int> face-menu-serial: DetailsBridge.face-menu-serial;
+    changed face-menu-serial => {
+        UiLog.debug("details", "face menu for face #\{DetailsBridge.menu-face} at \{ItemMenu.x / 1px},\{ItemMenu.y / 1px}");
+        face-menu-area.show({ x: ItemMenu.x - root.absolute-position.x, y: ItemMenu.y - root.absolute-position.y });
     }
 }
