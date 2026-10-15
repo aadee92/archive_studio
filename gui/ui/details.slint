@@ -22,6 +22,12 @@ export struct SimilarItem {
     score: int,
 }
 
+// An item of the view the shown one was opened from, in the filmstrip above the picture.
+export struct FilmItem {
+    thumb: image,
+    name: string,
+}
+
 export global DetailsBridge {
     in property <bool> has-item;
     in property <string> name;
@@ -52,6 +58,11 @@ export global DetailsBridge {
     in property <string> scope-label;
     in property <int> scope-count;
     in property <[SimilarItem]> similar;
+    // The shown item's position in that view (-1 if it isn't one of its items), and the
+    // filmstrip: the items around it, `film[0]` being item `film-start`.
+    in property <int> scope-index: -1;
+    in property <[FilmItem]> film;
+    in property <int> film-start;
 
     // The other side of a two-sided photo (its back, or its front if this is the back),
     // "" if none; shown next to this one when `side-by-side` is on (kept across items).
@@ -74,6 +85,12 @@ export global DetailsBridge {
     // The similar item at an index: double-click opens it, right-click its menu.
     callback open-similar(int);
     callback similar-menu(int);
+    // Show another item of the view, in place of this one (no history): `step` by an offset
+    // (Left / Right), `go-to` item i of the view (Home / End, a click in the filmstrip).
+    callback step(int);
+    callback go-to(int);
+    // Right-click on item i of the view in the filmstrip: its menu.
+    callback film-menu(int);
 }
 
 // A face's box over the picture, with the person's name under it.
@@ -220,6 +237,83 @@ component Picture inherits Rectangle {
     }
 }
 
+// The items of the view this one was opened from, around it: the shown item is the
+// highlighted one in the middle. A click shows another.
+component FilmStrip inherits VerticalLayout {
+    property <length> tile: 56px;
+    property <length> gap: 6px;
+    property <length> step: self.tile + self.gap;
+    // Where item `DetailsBridge.scope-index` starts: the strip is centered on it.
+    property <int> center: DetailsBridge.scope-index >= 0 ? DetailsBridge.scope-index : DetailsBridge.film-start;
+    property <length> origin: (strip.width - self.tile) / 2 - (root.center - DetailsBridge.film-start) * root.step;
+    property <int> hover: ta.has-hover ? root.index-at(ta.mouse-x) : -1;
+    // The item of the view (not of `film`) at `x`, or -1.
+    pure function index-at(x: length) -> int {
+        return x < root.origin || Math.mod((x - root.origin) / 1px, root.step / 1px) > root.tile / 1px
+            || Math.floor((x - root.origin) / root.step) >= DetailsBridge.film.length
+            ? -1 : DetailsBridge.film-start + Math.floor((x - root.origin) / root.step);
+    }
+
+    // The item under the pointer, for the line above: copied, not bound, since `hover`
+    // depends on the strip's width and the line's on its text.
+    property <int> named: -1;
+    changed hover => { self.named = self.hover; }
+
+    spacing: 6px;
+    Text {
+        text: root.named >= DetailsBridge.film-start && root.named >= 0 && root.named - DetailsBridge.film-start < DetailsBridge.film.length
+            ? DetailsBridge.film[root.named - DetailsBridge.film-start].name
+            : DetailsBridge.scope-index >= 0
+            ? "\{DetailsBridge.scope-index + 1} of \{DetailsBridge.scope-count} in \{DetailsBridge.scope-label}  ·  ← → to step"
+            : "\{DetailsBridge.scope-count} in \{DetailsBridge.scope-label}";
+        color: Theme.text-muted;
+        font-size: 12px;
+        overflow: elide;
+    }
+    strip := Rectangle {
+        height: root.tile;
+        clip: true;
+        for item[i] in DetailsBridge.film: Rectangle {
+            property <bool> current: DetailsBridge.film-start + i == DetailsBridge.scope-index;
+            x: root.origin + i * root.step;
+            width: root.tile;
+            height: root.tile;
+            border-radius: 6px;
+            background: Theme.well;
+            clip: true;
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: item.thumb;
+                image-fit: cover;
+                opacity: parent.current || DetailsBridge.film-start + i == root.hover ? 1.0 : 0.75;
+            }
+            Rectangle {
+                border-radius: 6px;
+                border-width: parent.current ? 3px : DetailsBridge.film-start + i == root.hover ? 2px : 1px;
+                border-color: parent.current || DetailsBridge.film-start + i == root.hover ? Theme.accent : Theme.border;
+            }
+        }
+        // One TouchArea over the strip: its model changes with every step.
+        ta := TouchArea {
+            mouse-cursor: root.hover >= 0 ? pointer : default;
+            clicked => {
+                if (root.index-at(self.mouse-x) >= 0) {
+                    DetailsBridge.go-to(root.index-at(self.mouse-x));
+                }
+            }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down
+                    && root.index-at(self.mouse-x) >= 0) {
+                    ItemMenu.x = self.absolute-position.x + self.mouse-x;
+                    ItemMenu.y = self.absolute-position.y + self.mouse-y;
+                    DetailsBridge.film-menu(root.index-at(self.mouse-x));
+                }
+            }
+        }
+    }
+}
+
 // The items most like this one in the view it was opened from, best first.
 component SimilarStrip inherits VerticalLayout {
     property <length> tile: 76px;
@@ -317,6 +411,17 @@ export component DetailsPage inherits Rectangle {
                 NavBridge.back();
                 return accept;
             }
+            // Another item of the view it was opened from.
+            if (!event.modifiers.alt && !event.modifiers.control && DetailsBridge.scope-count > 1) {
+                if (event.text == Key.LeftArrow || event.text == Key.RightArrow) {
+                    DetailsBridge.step(event.text == Key.LeftArrow ? -1 : 1);
+                    return accept;
+                }
+                if (event.text == Key.Home || event.text == Key.End) {
+                    DetailsBridge.go-to(event.text == Key.Home ? 0 : DetailsBridge.scope-count - 1);
+                    return accept;
+                }
+            }
             reject
         }
 
@@ -368,6 +473,9 @@ export component DetailsPage inherits Rectangle {
                     }
                 }
             }
+
+            // The items of the view this one was opened from, around it.
+            if DetailsBridge.has-item && DetailsBridge.scope-count > 1: FilmStrip { }
 
             stage := Rectangle {
                 vertical-stretch: 1;

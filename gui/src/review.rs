@@ -460,8 +460,9 @@ struct GridModel {
     ready: Arc<Mailbox<Ready>>,
     available_tags: RefCell<BTreeSet<String>>,
     /// A scroll position to return to (Back) once the refilter in flight lands: the first
-    /// tile that was in view, and how far its row was scrolled past.
-    restore: RefCell<Option<(Option<PathBuf>, f32)>>,
+    /// tile that was in view, how far its row was scrolled past, and a tile to keep in view
+    /// (the item last shown on Details).
+    restore: RefCell<Option<ScrollBack>>,
     /// Tests: a drain left work for the next event-loop turn.
     #[cfg(test)]
     redrain_due: Cell<bool>,
@@ -547,6 +548,10 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     spawn_indexer(root, ui.as_weak());
 }
 
+/// Where [`GridModel::apply_restore`] scrolls: the first tile that was in view, how far its
+/// row was scrolled past, and a tile to keep in view.
+type ScrollBack = (Option<PathBuf>, f32, Option<PathBuf>);
+
 /// The Review view as it was left, for Back (see `nav`): the filter controls, the selection
 /// and the scroll position.
 pub(crate) struct Snapshot {
@@ -561,19 +566,34 @@ pub(crate) struct Snapshot {
     /// rather than pixels, so it holds if the column count changed meanwhile.
     anchor: Option<PathBuf>,
     offset: f32,
+    /// The selection was moved to the item last shown on Details ([`follow`](Self::follow)):
+    /// scroll to it if it is out of view.
+    followed: bool,
+}
+
+impl Snapshot {
+    /// Selects `path` instead, the item last shown on Details (Left / Right there step
+    /// through the view's items without adding to the history).
+    pub(crate) fn follow(&mut self, path: PathBuf) {
+        if self.selected.as_ref() != Some(&path) {
+            self.selected = Some(path);
+            self.followed = true;
+        }
+    }
 }
 
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, selected {:?}, scroll anchor {:?} +{:.0}px }}",
+            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, selected {:?}{}, scroll anchor {:?} +{:.0}px }}",
             self.search.as_str(),
             self.tag.as_str(),
             self.selected_tag.as_str(),
             self.kind,
             self.sort,
             self.selected,
+            if self.followed { " (followed from Details)" } else { "" },
             self.anchor,
             self.offset
         )
@@ -597,6 +617,7 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
             selected: g.selected.get().and_then(path_of),
             anchor,
             offset: bridge.get_scroll_offset(),
+            followed: false,
         })
     })
 }
@@ -1179,8 +1200,9 @@ impl GridModel {
         bridge.set_selected_tag(s.selected_tag);
         bridge.set_kind_filter(s.kind);
         bridge.set_sort_index(s.sort);
+        let reveal = s.selected.clone().filter(|_| s.followed);
         self.set_selected(s.selected.and_then(|path| self.id_of(&path)));
-        *self.restore.borrow_mut() = Some((s.anchor, s.offset));
+        *self.restore.borrow_mut() = Some((s.anchor, s.offset, reveal));
         if refilter {
             self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)));
         }
@@ -1193,21 +1215,34 @@ impl GridModel {
         if self.pending.get() {
             return;
         }
-        let Some((anchor, offset)) = self.restore.take() else { return };
-        let Some(slot) = anchor
-            .as_ref()
-            .and_then(|path| self.id_of(path))
-            .and_then(|id| self.slot_of.borrow().get(id as usize).copied())
-            .filter(|&slot| slot != HIDDEN)
-        else {
-            log::debug!("review restore: scroll anchor {anchor:?} not shown - scroll left as is");
-            return;
+        let Some((anchor, offset, reveal)) = self.restore.take() else { return };
+        let columns = self.columns.get();
+        let row_of = |path: &PathBuf| {
+            let id = self.id_of(path)?;
+            let slot = self.slot_of.borrow().get(id as usize).copied().filter(|&slot| slot != HIDDEN)?;
+            Some(slot as usize / columns)
         };
-        log::debug!("review restore: scroll to row {} +{offset:.0}px", slot as usize / self.columns.get());
+        let mut to = anchor.as_ref().and_then(row_of).map(|row| (row, offset));
+        if to.is_none() {
+            log::debug!("review restore: scroll anchor {anchor:?} not shown - scroll left as is");
+        }
+        // Details stepped away from the tile opened: keep the last one shown in view.
+        if let Some(row) = reveal.as_ref().and_then(row_of) {
+            let (first, last) = self.viewport.get();
+            let screen = last - first + 1;
+            let top = to.map_or(first, |(row, _)| row);
+            // The bottom row may be cut off.
+            if row < top || row >= top + screen.saturating_sub(1).max(1) {
+                log::debug!("review restore: the item last shown on Details (row {row}) is out of view - centering it");
+                to = Some((row.saturating_sub(screen / 2), 0.0));
+            }
+        }
+        let Some((row, offset)) = to else { return };
+        log::debug!("review restore: scroll to row {row} +{offset:.0}px");
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<ReviewBridge>();
         let serial = bridge.get_restore().serial + 1;
-        bridge.set_restore(ScrollRestore { serial, row: (slot as usize / self.columns.get()) as i32, offset });
+        bridge.set_restore(ScrollRestore { serial, row: row as i32, offset });
     }
 
     /// Applies the thumbnails that arrived since the last drain (in arrival order, within

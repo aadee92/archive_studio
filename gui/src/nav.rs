@@ -10,9 +10,10 @@
 //! changing the column count, the file being rotated and re-indexed under a new id, another
 //! person picked in People and back again).
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use slint::ComponentHandle;
 
@@ -59,23 +60,26 @@ impl std::fmt::Debug for Target {
 }
 
 /// The items a view showed when something was opened from it, as filtered and ordered there:
-/// what the "similar in your filter" strip on the Details page draws from. Listing them is
-/// deferred ([`paths`](Self::paths)) since a Review filter can match hundreds of thousands
-/// of files; the view's state is captured when the scope is made, so it doesn't change
-/// with the view afterwards. Catalog asset ids are `Catalog::find_asset` of the paths.
+/// what the Details page steps through (Left / Right, its filmstrip) and what its "similar
+/// in your filter" strip draws from. Listing them is deferred ([`paths`](Self::paths))
+/// since a Review filter can match hundreds of thousands of files, and done once per scope
+/// (clones share the list); the view's state is captured when the scope is made, so it
+/// doesn't change with the view afterwards. Catalog asset ids are `Catalog::find_asset` of
+/// the paths.
 #[derive(Clone)]
 pub struct Scope {
     /// Where it comes from, e.g. `Review · “beach” · Images`.
     pub label: String,
     pub len: usize,
-    /// The opened item's position among them, if it is one of them.
+    /// The shown item's position among them, if it is one of them.
     pub current: Option<usize>,
     items: Rc<dyn Fn() -> Vec<PathBuf>>,
+    listed: Rc<OnceCell<Arc<[PathBuf]>>>,
 }
 
 impl Scope {
     pub fn new(label: String, len: usize, current: Option<usize>, items: impl Fn() -> Vec<PathBuf> + 'static) -> Self {
-        Self { label, len, current, items: Rc::new(items) }
+        Self { label, len, current, items: Rc::new(items), listed: Rc::default() }
     }
 
     /// A fixed list.
@@ -84,9 +88,15 @@ impl Scope {
         Self::new(label, len, current, move || paths.clone())
     }
 
-    /// The items, in the view's order.
-    pub fn paths(&self) -> Vec<PathBuf> {
-        (self.items)()
+    /// The items, in the view's order (listed on first use).
+    pub fn paths(&self) -> Arc<[PathBuf]> {
+        self.listed.get_or_init(|| (self.items)().into()).clone()
+    }
+
+    /// The same scope at item `i`: its path, and the scope with `i` as the current item.
+    pub fn at(&self, i: usize) -> Option<(PathBuf, Scope)> {
+        let path = self.paths().get(i)?.clone();
+        Some((path, Scope { current: Some(i), ..self.clone() }))
     }
 }
 
@@ -145,12 +155,18 @@ pub fn go(ui: &AppWindow, page: i32) {
     }
 }
 
-/// Back to the view left last, as it was.
+/// Back to the view left last, as it was; from Details, Review's selection follows the item
+/// shown last (stepping through items there doesn't add to the history).
 pub fn back(ui: &AppWindow) {
-    let Some(view) = HISTORY_STACK.with_borrow_mut(Vec::pop) else {
+    let Some(mut view) = HISTORY_STACK.with_borrow_mut(Vec::pop) else {
         log::debug!("back: history empty, nothing to do (page {})", ui.get_page());
         return;
     };
+    if let (DETAILS, View::Review(snapshot)) = (ui.get_page(), &mut view) {
+        if let Some(target) = details::snapshot() {
+            snapshot.follow(target.path);
+        }
+    }
     log::debug!("back from page {} to {view:?} (history now {})", ui.get_page(), depth());
     publish(ui);
     match view {
@@ -211,4 +227,28 @@ fn depth() -> usize {
 fn publish(ui: &AppWindow) {
     let can = HISTORY_STACK.with_borrow(|history| !history.is_empty());
     ui.global::<NavBridge>().set_can_go_back(can);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn scope_lists_once_and_steps() {
+        let calls = Rc::new(Cell::new(0));
+        let counted = calls.clone();
+        let scope = Scope::new("Review".into(), 3, Some(0), move || {
+            counted.set(counted.get() + 1);
+            ["a", "b", "c"].map(PathBuf::from).to_vec()
+        });
+        let copy = scope.clone();
+        assert_eq!(scope.paths().len(), 3);
+        assert_eq!(copy.paths()[2], PathBuf::from("c"));
+        let (path, at) = copy.at(1).unwrap();
+        assert_eq!((path, at.current, at.len), (PathBuf::from("b"), Some(1), 3));
+        assert_eq!(at.paths().len(), 3);
+        assert!(scope.at(3).is_none());
+        assert_eq!(calls.get(), 1, "clones share the listing");
+    }
 }

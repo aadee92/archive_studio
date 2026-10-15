@@ -446,14 +446,27 @@ pub fn store_for_new_file(path: &Path, image: &DynamicImage) -> bool {
 /// A small-tier thumbnail of the image at `path`, for a capture backend's strip of recent
 /// captures: from the disk cache when it's there, else decoded (and not stored).
 pub fn small_for_file(path: &Path) -> Option<RgbImage> {
+    let mut image = None;
+    small_for_files(std::slice::from_ref(&path), |_, small| {
+        image = small;
+        false
+    });
+    image
+}
+
+/// [`small_for_file`] for a run of images, with one disk cache connection: calls `each`
+/// with every path's index and thumbnail in turn, until it returns false.
+pub fn small_for_files<P: AsRef<Path>>(paths: &[P], mut each: impl FnMut(usize, Option<RgbImage>) -> bool) {
     let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
-    if let (Some(fingerprint), Some(disk)) = (Fingerprint::of(path), &disk) {
-        let mut loader = Loader::new(Some(disk), Arc::new(Mutex::new(Lru::new(1 << 20))));
-        if let Some((image, _)) = loader.cached(fingerprint, Tier::Small) {
-            return Some(image);
+    let mut loader = disk.as_ref().map(|disk| Loader::new(Some(disk), Arc::new(Mutex::new(Lru::new(1 << 20)))));
+    for (i, path) in paths.iter().enumerate() {
+        let path = path.as_ref();
+        let cached = loader.as_mut().zip(Fingerprint::of(path)).and_then(|(loader, fingerprint)| loader.cached(fingerprint, Tier::Small));
+        let image = cached.map(|(image, _)| image).or_else(|| decode::decode(path, MediaKind::Image, Tier::Small.edge()));
+        if !each(i, image) {
+            return;
         }
     }
-    decode::decode(path, MediaKind::Image, Tier::Small.edge())
 }
 
 fn store_in(disk: &DiskCache, path: &Path, image: &DynamicImage) -> bool {

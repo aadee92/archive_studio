@@ -14,6 +14,13 @@
 //! (its [`Scope`]): `Catalog::similar` over their assets, on a worker. Opening one keeps
 //! that scope, so the strip stays "similar in your filter".
 //!
+//! Left / Right (Home / End) step through that scope in its order, and a filmstrip above
+//! the picture shows the items around the shown one (small thumbnails from the cache, on a
+//! worker); a click shows another. Stepping replaces the item in place, without history, so
+//! Back returns to the view it was opened from (whose selection follows: see `nav::back`).
+//! The pictures of the next items are decoded ahead on a prefetch thread, so a step shows
+//! the new one at once (else its thumbnail until it is decoded).
+//!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
 //! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
 //! engine if it runs here, else the core directly). That can take a second (the file is
@@ -21,8 +28,13 @@
 //! relay and is reloaded here (faces too: their regions are turned with the file).
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
+use std::time::SystemTime;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
@@ -30,7 +42,7 @@ use crate::actions;
 use crate::nav::{self, Scope, Target};
 use crate::pipeline::Handle;
 use crate::thumbs::{self, Pixels};
-use crate::{AppWindow, DetailFace, DetailsBridge, SimilarItem};
+use crate::{AppWindow, DetailFace, DetailsBridge, FilmItem, SimilarItem};
 use archive_core::catalog::faces::{FaceId, FaceStatus};
 use archive_core::catalog::runs::RunStatus;
 use archive_core::catalog::Catalog;
@@ -43,6 +55,8 @@ const EDGE: u32 = 4096;
 const OTHER_EDGE: u32 = 2048;
 /// Items in the similar strip.
 const SIMILAR: usize = 12;
+/// Items in the filmstrip on either side of the shown one (more than fit a 4K screen).
+const FILM: usize = 24;
 
 /// The item shown.
 #[derive(Default)]
@@ -61,6 +75,14 @@ struct Shown {
     /// The items in the similar strip.
     similar: Vec<PathBuf>,
     similar_generation: u64,
+    /// The picture shown is the decoded one already (prefetched), not a placeholder.
+    decoded: bool,
+    /// The last step went forward: prefetch ahead in that direction.
+    forward: bool,
+    /// The filmstrip: the items in it, and their thumbnails as far as loaded.
+    film: Rc<VecModel<FilmItem>>,
+    film_paths: Vec<PathBuf>,
+    film_thumbs: HashMap<PathBuf, slint::Image>,
 }
 
 impl Shown {
@@ -78,6 +100,12 @@ thread_local! {
     static SHOWN: RefCell<Shown> = RefCell::default();
     static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
 }
+
+/// The latest load (`Shown::generation`), for its worker: a superseded one (stepped past)
+/// doesn't decode.
+static LOADING: AtomicU64 = AtomicU64::new(0);
+/// Retires filmstrip thumbnail workers of earlier items.
+static FILM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// What the engine is asked to do with the shown file.
 #[derive(Clone, Copy, Debug)]
@@ -152,11 +180,36 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
             nav::context_menu(&ui, target);
         }
     });
+    details.set_film(SHOWN.with_borrow(|shown| ModelRc::from(shown.film.clone())));
+    let weak = ui.as_weak();
+    details.on_step(move |delta| {
+        if let Some(ui) = weak.upgrade() {
+            step(&ui, delta);
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_go_to(move |i| {
+        log::debug!("details: go to #{i} of the scope");
+        if let (Some(ui), Ok(i)) = (weak.upgrade(), usize::try_from(i)) {
+            go_to(&ui, i);
+        }
+    });
+    let weak = ui.as_weak();
+    details.on_film_menu(move |i| {
+        let target = SHOWN.with_borrow(|shown| {
+            let (path, scope) = shown.target.as_ref()?.scope.at(usize::try_from(i).ok()?)?;
+            Some(Target::new(path, scope))
+        });
+        if let (Some(ui), Some(target)) = (weak.upgrade(), target) {
+            nav::context_menu(&ui, target);
+        }
+    });
 }
 
 /// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
 /// TODO: zoom, metadata editing.
-pub fn show(ui: &AppWindow, target: Target) {
+pub fn show(ui: &AppWindow, mut target: Target) {
+    locate(&mut target);
     log::debug!("details: show {target:?}");
     let path = target.path.clone();
     let kind = classify(&path);
@@ -172,6 +225,8 @@ pub fn show(ui: &AppWindow, target: Target) {
     let details = ui.global::<DetailsBridge>();
     details.set_scope_label(target.scope.label.as_str().into());
     details.set_scope_count(target.scope.len as i32);
+    details.set_scope_index(target.scope.current.map_or(-1, |i| i as i32));
+    let neighbours = neighbours(&target);
     SHOWN.with_borrow_mut(|shown| {
         shown.flash = target.face;
         shown.target = Some(target);
@@ -180,11 +235,12 @@ pub fn show(ui: &AppWindow, target: Target) {
         shown.other = None;
         shown.other_generation += 1;
         shown.similar.clear();
+        shown.decoded = false;
     });
     details.set_has_item(true);
     details.set_name(name);
     details.set_path(path.display().to_string().into());
-    details.set_info(info.into());
+    details.set_info(info.as_str().into());
     details.set_image(slint::Image::default());
     details.set_image_ready(false);
     details.set_faces(ModelRc::default());
@@ -198,8 +254,151 @@ pub fn show(ui: &AppWindow, target: Target) {
     details.set_other_ready(false);
     details.set_other_faces(ModelRc::default());
     details.set_similar(ModelRc::default());
+    // Up at once if prefetched, else its thumbnail until decoded.
+    if kind.is_some() {
+        if let Some(pixels) = prefetched(&path) {
+            details.set_info(format!("{info} · {} × {}", pixels.width(), pixels.height()).into());
+            details.set_image(slint::Image::from_rgb8(pixels));
+            details.set_image_ready(true);
+            SHOWN.with_borrow_mut(|shown| shown.decoded = true);
+        } else if let Some(thumb) = SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()).filter(|t| t.size().width > 0) {
+            details.set_image(thumb);
+            details.set_image_ready(true);
+        }
+    }
+    prefetch(&path, neighbours);
     load(ui);
     load_similar(ui);
+    load_film(ui);
+}
+
+/// Points the scope at `target` if it is one of its items but not the one it says (opened
+/// from the similar strip); one that isn't (the back of a photo in it) keeps the position.
+fn locate(target: &mut Target) {
+    if target.scope.len < 2 {
+        return;
+    }
+    let paths = target.scope.paths();
+    if target.scope.current.and_then(|i| paths.get(i)) != Some(&target.path) {
+        if let Some(i) = paths.iter().position(|p| *p == target.path) {
+            target.scope.current = Some(i);
+        }
+    }
+}
+
+/// Shows the item `delta` items on in the scope, skipping files gone meanwhile; nothing at
+/// either end.
+fn step(ui: &AppWindow, delta: i32) {
+    let Some(scope) = SHOWN.with_borrow(|shown| shown.target.as_ref().map(|t| t.scope.clone())) else { return };
+    let paths = scope.paths();
+    let n = paths.len() as i64;
+    let mut i = match scope.current {
+        Some(i) => i as i64 + i64::from(delta),
+        None if delta > 0 => 0,
+        None => n - 1,
+    };
+    while (0..n).contains(&i) && !paths[i as usize].exists() {
+        i += i64::from(delta.signum());
+    }
+    if !(0..n).contains(&i) {
+        log::debug!("details: step {delta:+} from {:?}: at the end of {n} items", scope.current);
+        return;
+    }
+    go_to(ui, i as usize);
+}
+
+/// Shows item `i` of the scope in place of the shown one (no history).
+fn go_to(ui: &AppWindow, i: usize) {
+    let Some((target, forward)) = SHOWN.with_borrow(|shown| {
+        let scope = &shown.target.as_ref()?.scope;
+        let (path, scope) = scope.at(i)?;
+        let forward = scope.current >= shown.target.as_ref()?.scope.current;
+        Some((Target::new(path, scope), forward))
+    }) else {
+        return;
+    };
+    SHOWN.with_borrow_mut(|shown| shown.forward = forward);
+    show(ui, target);
+}
+
+/// The items of `target`'s scope to decode ahead, likeliest next first.
+fn neighbours(target: &Target) -> Vec<PathBuf> {
+    let Some(i) = target.scope.current.filter(|_| target.scope.len > 1) else { return Vec::new() };
+    let paths = target.scope.paths();
+    let forward = SHOWN.with_borrow(|shown| shown.forward);
+    let at = |offset: i64| usize::try_from(i as i64 + offset).ok().and_then(|j| paths.get(j));
+    let order: [i64; 3] = if forward { [1, 2, -1] } else { [-1, -2, 1] };
+    order.into_iter().filter_map(at).filter(|p| classify(p) == Some(MediaKind::Image)).cloned().collect()
+}
+
+/// Fills the filmstrip with the items around the shown one, and loads the thumbnails it
+/// doesn't have yet on a worker, nearest first.
+fn load_film(ui: &AppWindow) {
+    let Some((scope, model)) = SHOWN.with_borrow(|shown| Some((shown.target.as_ref()?.scope.clone(), shown.film.clone()))) else { return };
+    let details = ui.global::<DetailsBridge>();
+    if scope.len < 2 {
+        SHOWN.with_borrow_mut(|shown| {
+            shown.film_paths.clear();
+            shown.film_thumbs.clear();
+        });
+        model.set_vec(Vec::new());
+        return;
+    }
+    let paths = scope.paths();
+    let center = scope.current.unwrap_or(0).min(paths.len().saturating_sub(1));
+    let start = center.saturating_sub(FILM);
+    let window: Vec<PathBuf> = paths[start..(center + FILM + 1).min(paths.len())].to_vec();
+    let missing: Vec<PathBuf> = SHOWN.with_borrow_mut(|shown| {
+        let keep: HashSet<&PathBuf> = window.iter().collect();
+        shown.film_thumbs.retain(|p, _| keep.contains(p));
+        let items: Vec<FilmItem> = window
+            .iter()
+            .map(|p| FilmItem {
+                thumb: shown.film_thumbs.get(p).cloned().unwrap_or_default(),
+                name: p.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into()),
+            })
+            .collect();
+        model.set_vec(items);
+        let mut missing: Vec<(usize, PathBuf)> = (start..)
+            .zip(&window)
+            .filter(|(_, p)| !shown.film_thumbs.contains_key(*p))
+            .map(|(j, p)| (j.abs_diff(center), p.clone()))
+            .collect();
+        missing.sort_by_key(|(distance, _)| *distance);
+        shown.film_paths = window;
+        missing.into_iter().map(|(_, p)| p).collect()
+    });
+    details.set_film_start(start as i32);
+    let generation = FILM_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    if missing.is_empty() {
+        return;
+    }
+    log::trace!("details: filmstrip #{generation}: {} thumbnails to load around #{center}", missing.len());
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        thumbs::small_for_files(&missing, |i, small| {
+            if FILM_GENERATION.load(Ordering::Relaxed) != generation {
+                return false;
+            }
+            let path = missing[i].clone();
+            let pixels = small.map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+            let _ = weak.upgrade_in_event_loop(move |_| film_thumb(path, pixels));
+            true
+        });
+    });
+}
+
+/// A filmstrip thumbnail came in (none: the file has none; not asked for again).
+fn film_thumb(path: PathBuf, pixels: Option<Pixels>) {
+    SHOWN.with_borrow_mut(|shown| {
+        let Some(i) = shown.film_paths.iter().position(|p| *p == path) else { return };
+        let thumb = pixels.map(slint::Image::from_rgb8).unwrap_or_default();
+        if let Some(mut item) = shown.film.row_data(i) {
+            item.thumb = thumb.clone();
+            shown.film.set_row_data(i, item);
+        }
+        shown.film_thumbs.insert(path, thumb);
+    });
 }
 
 /// Shows nothing (the item shown is gone and there is nowhere to go back to).
@@ -287,7 +486,9 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
     if this || other || similar {
         log::debug!("details: {} changed (shown {this}, other side {other}, similar {similar})", path.display());
     }
+    forget(path);
     if this {
+        SHOWN.with_borrow_mut(|shown| shown.decoded = false);
         load(ui);
     } else if other && ui.global::<DetailsBridge>().get_side_by_side() {
         load_other(ui);
@@ -362,6 +563,7 @@ fn load(ui: &AppWindow) {
     let root = root();
     let weak = ui.as_weak();
     log::debug!("details: load #{generation} {}", path.display());
+    LOADING.store(generation, Ordering::Relaxed);
     thread::spawn(move || {
         let started = std::time::Instant::now();
         let catalog = root.filter(|_| kind == MediaKind::Image).and_then(|root| open_catalog(&root));
@@ -369,7 +571,11 @@ fn load(ui: &AppWindow) {
         let faces = catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default();
         let other = if kind == MediaKind::Image { read_other_side(catalog.as_ref(), &path) } else { None };
         drop(catalog);
-        let pixels = thumbs::decode(&path, kind, EDGE).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+        if LOADING.load(Ordering::Relaxed) != generation {
+            log::debug!("details: load #{generation} superseded before decoding - dropped");
+            return;
+        }
+        let pixels = decode(&path, kind);
         log::debug!(
             "details: load #{generation} read in {:?}: decoded {}, {} faces, review {:?}, other side {:?}",
             started.elapsed(),
@@ -379,8 +585,11 @@ fn load(ui: &AppWindow) {
             other
         );
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let Some((info, flash)) = SHOWN.with_borrow_mut(|shown| {
-                (shown.generation == generation).then(|| (shown.info.clone(), if pixels.is_some() { shown.flash.take() } else { None }))
+            let Some((info, flash, decoded)) = SHOWN.with_borrow_mut(|shown| {
+                (shown.generation == generation).then(|| {
+                    let flash = if pixels.is_some() { shown.flash.take() } else { None };
+                    (shown.info.clone(), flash, std::mem::replace(&mut shown.decoded, pixels.is_some()))
+                })
             }) else {
                 log::debug!("details: load #{generation} superseded - dropped");
                 return;
@@ -393,7 +602,10 @@ fn load(ui: &AppWindow) {
             match pixels {
                 Some(pixels) => {
                     details.set_info(format!("{info} · {} × {}", pixels.width(), pixels.height()).into());
-                    details.set_image(slint::Image::from_rgb8(pixels));
+                    // Already up if it was prefetched.
+                    if !decoded {
+                        details.set_image(slint::Image::from_rgb8(pixels));
+                    }
                     details.set_image_ready(true);
                 }
                 None => {
@@ -424,6 +636,127 @@ fn load(ui: &AppWindow) {
             }
         });
     });
+}
+
+/// When a file was decoded: a prefetched picture of an older version isn't used.
+type Stamp = Option<(u64, SystemTime)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Pictures decoded ahead for the items next to the shown one ([`prefetch`]), shared by the
+/// prefetch thread and the loads (which wait for a prefetch in flight rather than decode
+/// the same file twice).
+struct Prefetch {
+    /// To decode, likeliest next first.
+    wanted: Vec<PathBuf>,
+    /// What may be kept decoded: the shown item and `wanted`.
+    keep: Vec<PathBuf>,
+    pending: Vec<PathBuf>,
+    ready: Vec<(PathBuf, Stamp, Pixels)>,
+    started: bool,
+}
+
+static PREFETCH: Mutex<Prefetch> = Mutex::new(Prefetch { wanted: Vec::new(), keep: Vec::new(), pending: Vec::new(), ready: Vec::new(), started: false });
+/// Signalled whenever `PREFETCH` changes.
+static PREFETCH_CHANGED: Condvar = Condvar::new();
+
+impl Prefetch {
+    fn ready(&self, path: &Path, stamp: Stamp) -> Option<Pixels> {
+        let (_, _, pixels) = self.ready.iter().find(|(p, s, _)| p == path && stamp.is_some() && *s == stamp)?;
+        Some(pixels.clone())
+    }
+
+    /// Keeps `pixels` for `path` if it is still wanted.
+    fn put(&mut self, path: &Path, stamp: Stamp, pixels: &Pixels) {
+        if self.keep.iter().any(|p| p == path) && self.ready(path, stamp).is_none() {
+            self.ready.retain(|(p, _, _)| p != path);
+            self.ready.push((path.to_path_buf(), stamp, pixels.clone()));
+        }
+    }
+}
+
+fn decode_now(path: &Path, kind: MediaKind) -> Option<Pixels> {
+    thumbs::decode(path, kind, EDGE).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()))
+}
+
+/// The picture of `path` for the page: prefetched, or decoded now (on a worker).
+fn decode(path: &Path, kind: MediaKind) -> Option<Pixels> {
+    let stamp = stamp(path);
+    let mut prefetch = PREFETCH.lock().unwrap();
+    loop {
+        if let Some(pixels) = prefetch.ready(path, stamp) {
+            log::trace!("details: {} was prefetched", path.display());
+            return Some(pixels);
+        }
+        if !prefetch.pending.iter().any(|p| p == path) {
+            break;
+        }
+        prefetch = PREFETCH_CHANGED.wait(prefetch).unwrap();
+    }
+    drop(prefetch);
+    let pixels = decode_now(path, kind)?;
+    // Kept for stepping back to it.
+    PREFETCH.lock().unwrap().put(path, stamp, &pixels);
+    Some(pixels)
+}
+
+/// The picture of `path`, if prefetched (on the UI thread: doesn't wait).
+fn prefetched(path: &Path) -> Option<Pixels> {
+    PREFETCH.lock().unwrap().ready(path, stamp(path))
+}
+
+/// Decodes `next` ahead on the prefetch thread (started on first use), dropping what was
+/// decoded for items other than `shown` and those.
+fn prefetch(shown: &Path, next: Vec<PathBuf>) {
+    let mut prefetch = PREFETCH.lock().unwrap();
+    prefetch.keep = next.iter().cloned().chain([shown.to_path_buf()]).collect();
+    let keep = std::mem::take(&mut prefetch.keep);
+    prefetch.ready.retain(|(p, _, _)| keep.contains(p));
+    prefetch.keep = keep;
+    prefetch.wanted = next;
+    if !prefetch.started {
+        prefetch.started = true;
+        let _ = thread::Builder::new().name("details-prefetch".into()).spawn(prefetch_thread);
+    }
+    PREFETCH_CHANGED.notify_all();
+}
+
+/// Drops a prefetched picture of `path` (the file changed).
+fn forget(path: &Path) {
+    PREFETCH.lock().unwrap().ready.retain(|(p, _, _)| p != path);
+}
+
+fn prefetch_thread() {
+    loop {
+        let path = {
+            let mut prefetch = PREFETCH.lock().unwrap();
+            loop {
+                let p = &*prefetch;
+                let next = p.wanted.iter().find(|w| !p.pending.contains(w) && !p.ready.iter().any(|(r, _, _)| r == *w)).cloned();
+                if let Some(next) = next {
+                    prefetch.pending.push(next.clone());
+                    break next;
+                }
+                prefetch = PREFETCH_CHANGED.wait(prefetch).unwrap();
+            }
+        };
+        let started = std::time::Instant::now();
+        let stamp = stamp(&path);
+        let pixels = decode_now(&path, MediaKind::Image);
+        log::trace!("details: prefetched {} in {:?} ({})", path.display(), started.elapsed(), if pixels.is_some() { "ok" } else { "failed" });
+        let mut prefetch = PREFETCH.lock().unwrap();
+        prefetch.pending.retain(|p| *p != path);
+        // Not tried again if it failed.
+        prefetch.wanted.retain(|p| *p != path);
+        if let Some(pixels) = &pixels {
+            prefetch.put(&path, stamp, pixels);
+        }
+        drop(prefetch);
+        PREFETCH_CHANGED.notify_all();
+    }
 }
 
 /// Decodes the other side of the photo and reads its faces, for the side-by-side view.
@@ -467,7 +800,7 @@ fn load_similar(ui: &AppWindow) {
         return;
     };
     let Some(root) = root() else { return };
-    // Listed here: a scope may only be read on the UI thread.
+    // Listed here (once per scope): a scope may only be read on the UI thread.
     let candidates = scope.paths();
     let weak = ui.as_weak();
     thread::spawn(move || {
@@ -602,6 +935,34 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locate_points_the_scope_at_the_item() {
+        let paths: Vec<PathBuf> = ["a", "b", "c"].map(PathBuf::from).to_vec();
+        let mut target = Target::new("c".into(), Scope::of("Review".into(), paths.clone(), Some(0)));
+        locate(&mut target);
+        assert_eq!(target.scope.current, Some(2));
+        // Not one of them (the back of a photo in it): stays where it was.
+        let mut target = Target::new("c-back".into(), Scope::of("Review".into(), paths, Some(1)));
+        locate(&mut target);
+        assert_eq!(target.scope.current, Some(1));
+    }
+
+    #[test]
+    fn prefetched_pictures_are_kept_while_wanted_and_current() {
+        let mut prefetch = Prefetch { wanted: Vec::new(), keep: vec!["a".into()], pending: Vec::new(), ready: Vec::new(), started: false };
+        let pixels = Pixels::new(2, 2);
+        let stamp = Some((1, SystemTime::UNIX_EPOCH));
+        prefetch.put(Path::new("b"), stamp, &pixels);
+        assert!(prefetch.ready.is_empty(), "not wanted");
+        prefetch.put(Path::new("a"), stamp, &pixels);
+        assert!(prefetch.ready(Path::new("a"), stamp).is_some());
+        let changed = Some((2, SystemTime::UNIX_EPOCH));
+        assert!(prefetch.ready(Path::new("a"), changed).is_none(), "file changed since");
+        assert!(prefetch.ready(Path::new("a"), None).is_none(), "file gone");
+        prefetch.put(Path::new("a"), changed, &pixels);
+        assert_eq!(prefetch.ready.len(), 1, "replaced");
+    }
 
     #[test]
     fn other_side_by_file_name() {
