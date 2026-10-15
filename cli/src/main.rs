@@ -38,8 +38,8 @@ person merge NAME INTO     NAME's faces and tags become INTO's
 person delete NAME         un-name their faces and drop their tag
 sync-people                put missing People| tags on files with named faces
 tags PATH                  the file's tags
-tag PATH [KIND:]TAG        add a tag (KIND: keyword, scene, object, person, place, event;
-                           People|NAME is a person)
+tag PATH... [KIND:]TAG     add a tag to one or more files (KIND: keyword, scene, object,
+                           person, place, event; People|NAME is a person)
 untag PATH [KIND:]TAG      remove a tag (a bare NAME can be a person; a person tag also
                            un-names their faces there)
 props PATH                 everything known about a file
@@ -51,9 +51,9 @@ unpair PATH                take the file out of its front/back pair
 swap-sides PATH            the file's pair the other way round (front <-> back)
 similar PATH [N]           files from the same scene or event
 find WORDS...              files that fit a description (\"dog on a beach\")
-delete PATH                move the file (and its back) to the library's trash
+delete PATH...             move the files (and their backs) to the library's trash
 trash                      what is in the trash
-restore PATH               put a trashed file back (its original path)
+restore PATH...            put trashed files back (their original paths)
 empty-trash [DAYS]         delete for good what was trashed DAYS (default 0) ago
 pause | resume | background   stop starting work / full speed / one thread
 help | quit";
@@ -584,12 +584,19 @@ impl Shell {
         Ok(())
     }
 
-    /// `tag PATH [KIND:]TAG WORDS`.
-    fn tag(&self, args: &[&str]) -> Result<(), String> {
-        let Some((path, words)) = args.split_first().filter(|(_, w)| !w.is_empty()) else {
-            return Err("tag PATH [KIND:]TAG".into());
-        };
-        ops::add_tag(&self.catalog, self.asset(path)?, &words.join(" ")).map_err(err)?;
+    /// `tag PATH... [KIND:]TAG WORDS`: the leading words naming files are the files (at
+    /// least one), the rest is the tag; several files are tagged in one transaction.
+    fn tag(&mut self, args: &[&str]) -> Result<(), String> {
+        let files = args.iter().take(args.len().saturating_sub(1)).take_while(|a| self.resolve(a).exists()).count().max(1);
+        let (paths, words) = args.split_at(files.min(args.len()));
+        if paths.is_empty() || words.is_empty() {
+            return Err("tag PATH... [KIND:]TAG".into());
+        }
+        let assets = paths.iter().map(|p| self.asset(p)).collect::<Result<Vec<_>, _>>()?;
+        ops::add_tag_all(&mut self.catalog, &assets, &words.join(" ")).map_err(err)?;
+        if assets.len() > 1 {
+            println!("tagged {} files", assets.len());
+        }
         Ok(())
     }
 
@@ -746,10 +753,22 @@ impl Shell {
     }
 
     fn delete(&mut self, args: &[&str]) -> Result<(), String> {
-        let [path] = args else { return Err("delete PATH".into()) };
-        let asset = self.asset(path)?;
-        for item in ops::delete(&mut self.catalog, asset).map_err(err)? {
-            println!("trashed {}", show(&self.root, &item.original));
+        if args.is_empty() {
+            return Err("delete PATH...".into());
+        }
+        let assets = args.iter().map(|p| self.asset(p)).collect::<Result<Vec<_>, _>>()?;
+        let mut failed = 0;
+        for (asset, result) in ops::delete_all(&mut self.catalog, &assets) {
+            match result {
+                Ok(items) => items.iter().for_each(|item| println!("trashed {}", show(&self.root, &item.original))),
+                Err(e) => {
+                    failed += 1;
+                    println!("can't delete {}: {e}", self.shown(asset));
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(format!("{failed} of {} not deleted", assets.len()));
         }
         Ok(())
     }
@@ -766,12 +785,28 @@ impl Shell {
     }
 
     fn restore(&mut self, args: &[&str]) -> Result<(), String> {
-        let [path] = args else { return Err("restore PATH".into()) };
-        let path = self.resolve(path);
-        let item = self.catalog.trashed().map_err(err)?.into_iter().find(|t| t.original == path || t.in_trash == path);
-        let item = item.ok_or_else(|| format!("{} is not in the trash", show(&self.root, &path)))?;
-        for restored in self.catalog.restore(item.asset).map_err(err)? {
-            println!("restored {}", show(&self.root, &restored));
+        if args.is_empty() {
+            return Err("restore PATH...".into());
+        }
+        let trashed = self.catalog.trashed().map_err(err)?;
+        let mut assets = Vec::new();
+        for arg in args {
+            let path = self.resolve(arg);
+            let item = trashed.iter().find(|t| t.original == path || t.in_trash == path);
+            assets.push(item.ok_or_else(|| format!("{} is not in the trash", show(&self.root, &path)))?.asset);
+        }
+        let mut failed = 0;
+        for (_, result) in ops::restore_all(&mut self.catalog, &assets) {
+            match result {
+                Ok(paths) => paths.iter().for_each(|p| println!("restored {}", show(&self.root, p))),
+                Err(e) => {
+                    failed += 1;
+                    println!("{e}");
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(format!("{failed} of {} not restored", assets.len()));
         }
         Ok(())
     }

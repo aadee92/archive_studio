@@ -19,6 +19,15 @@
 //!   callback, which re-reads each affected row once. `row_data` only reads what has arrived.
 //! - Files the pipeline adds, changes or loses are merged in, replaced or taken out
 //!   ([`update_files`]) the same way, without re-walking.
+//!
+//! Selection: a set of entry ids (no per-tile state; `row_data` asks the set), with a focus
+//! (the keyboard cursor, also the item clicked last) and an anchor for Shift ranges. Click,
+//! Shift-click (range from the anchor), Ctrl-click (toggle), rubber-band drag (Shift / Ctrl
+//! add to the selection), Ctrl+A, Esc; the arrow keys, Page Up / Down, Home / End move the
+//! focus and select it (Shift extends). It follows an item that is replaced (a new entry for
+//! a changed file); items that leave the grid, whether deleted or filtered out, drop out of
+//! it, so an action on the selection only ever touches what is shown. Back snapshots keep
+//! it by path. Right-clicking an item of a multi-selection gives the menu for all of them.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -37,6 +46,7 @@ use archive_core::catalog::query::{self, Expr};
 use archive_core::catalog::{Catalog, TagKind};
 use archive_core::media::{classify, MediaKind};
 
+use crate::actions;
 use crate::nav::{self, Scope, Target};
 use crate::{AppWindow, MediaRow, MediaTile, ReviewBridge, ScrollRestore, TagItem};
 
@@ -449,7 +459,14 @@ struct GridModel {
     pending: Cell<bool>,
     filter: FilterWorker,
     sync_limit: usize,
-    selected: Cell<Option<u32>>,
+    /// Selected entry ids; only shown ones (see the module docs).
+    selection: RefCell<HashSet<u32>>,
+    /// The keyboard cursor: the entry clicked or moved to last.
+    focus: Cell<Option<u32>>,
+    /// Where a Shift range starts.
+    anchor: Cell<Option<u32>>,
+    /// Entries the rubber band added to the selection so far (not those selected before).
+    band: RefCell<Vec<u32>>,
     indexing: Cell<bool>,
     /// Entry id of each path ([`path_hash`]), for [`update_files`](Self::update_files).
     by_path: RefCell<HashMap<u64, u32>>,
@@ -508,12 +525,27 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     bridge.set_root_path(root.display().to_string().into());
     bridge.on_columns_changed(|n| with_grid(|g| g.set_columns(n.max(1) as usize)));
     bridge.on_viewport_changed(|first, last| with_grid(|g| g.set_viewport(first, last)));
-    bridge.on_click(|row, col| {
+    bridge.on_click(|row, col, extend, toggle| {
         with_grid(|g| {
-            if let Some(id) = g.id_at(row, col) {
-                g.select(id)
-            }
+            let id = g.id_at(row, col);
+            log::debug!("review click at row {row} col {col} -> entry {id:?} (shift {extend}, ctrl {toggle})");
+            g.click(id, extend, toggle)
         })
+    });
+    bridge.on_drag_begin(|keep| {
+        log::debug!("review drag begins (keep selection {keep})");
+        with_grid(|g| g.drag_begin(keep))
+    });
+    bridge.on_drag_to(|r0, r1, c0, c1| {
+        log::trace!("review drag rows {r0}..={r1} cols {c0}..={c1}");
+        with_grid(|g| g.drag_to(r0, r1, c0, c1))
+    });
+    bridge.on_clear_selection(|| {
+        log::debug!("review: clear selection");
+        with_grid(|g| g.set_selection(HashSet::new()))
+    });
+    bridge.on_key(|key, shift, ctrl| {
+        GRID.with_borrow(|grid| grid.as_ref().is_some_and(|g| g.key(&key.to_lowercase(), shift, ctrl)))
     });
     bridge.on_open(|row, col| {
         with_grid(|g| match g.id_at(row, col) {
@@ -526,10 +558,18 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
     });
     bridge.on_context_menu(|row, col| {
         with_grid(|g| {
-            if let (Some(ui), Some(target)) = (g.ui.upgrade(), g.id_at(row, col).and_then(|id| g.target(id))) {
-                nav::context_menu(&ui, target);
-            } else {
+            let Some((ui, id)) = g.ui.upgrade().zip(g.id_at(row, col)) else {
                 log::debug!("review right-click at row {row} col {col}: no tile there - no menu");
+                return;
+            };
+            // Outside the selection: the menu is for that item, which is selected instead.
+            if !g.selection.borrow().contains(&id) {
+                g.select_only(id);
+            }
+            g.focus_on(id);
+            let items = if g.selection.borrow().len() > 1 { g.selected_paths() } else { Vec::new() };
+            if let Some(target) = g.target(id) {
+                nav::context_menu_for(&ui, target, items);
             }
         })
     });
@@ -560,23 +600,28 @@ pub(crate) struct Snapshot {
     selected_tag: SharedString,
     kind: i32,
     sort: i32,
-    /// Entries are kept by path: one replaced meanwhile (e.g. rotated) has a new id.
-    selected: Option<PathBuf>,
+    /// Entries are kept by path ([`path_hash`]): one replaced meanwhile (e.g. rotated) has
+    /// a new id.
+    selected: Vec<u64>,
+    /// The keyboard cursor.
+    focus: Option<PathBuf>,
     /// The first tile in view, and how far its row was scrolled past: restored by tile
     /// rather than pixels, so it holds if the column count changed meanwhile.
     anchor: Option<PathBuf>,
     offset: f32,
-    /// The selection was moved to the item last shown on Details ([`follow`](Self::follow)):
+    /// The selection (and focus) was moved to the item last shown on Details ([`follow`](Self::follow)):
     /// scroll to it if it is out of view.
     followed: bool,
 }
 
 impl Snapshot {
     /// Selects `path` instead, the item last shown on Details (Left / Right there step
-    /// through the view's items without adding to the history).
+    /// through the view's items without adding to the history). Left as it was if that is
+    /// the item opened (a multi-selection stays).
     pub(crate) fn follow(&mut self, path: PathBuf) {
-        if self.selected.as_ref() != Some(&path) {
-            self.selected = Some(path);
+        if self.focus.as_ref() != Some(&path) {
+            self.selected = vec![path_hash(&path)];
+            self.focus = Some(path);
             self.followed = true;
         }
     }
@@ -586,13 +631,14 @@ impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, selected {:?}{}, scroll anchor {:?} +{:.0}px }}",
+            "Review {{ search {:?}, tags {:?} (picked {:?}), kind {}, sort {}, {} selected, focus {:?}{}, scroll anchor {:?} +{:.0}px }}",
             self.search.as_str(),
             self.tag.as_str(),
             self.selected_tag.as_str(),
             self.kind,
             self.sort,
-            self.selected,
+            self.selected.len(),
+            self.focus,
             if self.followed { " (followed from Details)" } else { "" },
             self.anchor,
             self.offset
@@ -614,7 +660,8 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
             selected_tag: bridge.get_selected_tag(),
             kind: bridge.get_kind_filter(),
             sort: bridge.get_sort_index(),
-            selected: g.selected.get().and_then(path_of),
+            selected: g.selection.borrow().iter().filter_map(|&id| g.entries.borrow().get(id).map(|e| e.path_hash)).collect(),
+            focus: g.focus.get().and_then(path_of),
             anchor,
             offset: bridge.get_scroll_offset(),
             followed: false,
@@ -791,7 +838,10 @@ impl GridModel {
             pending: Cell::new(false),
             filter,
             sync_limit,
-            selected: Cell::new(None),
+            selection: RefCell::default(),
+            focus: Cell::new(None),
+            anchor: Cell::new(None),
+            band: RefCell::default(),
             indexing: Cell::new(true),
             by_path: RefCell::default(),
             deferred: RefCell::default(),
@@ -908,18 +958,35 @@ impl GridModel {
                 }
             }
         }
+        // The selection, focus and anchor follow a replaced file to its new entry.
+        let from = self.entries.borrow().len() as u32;
+        {
+            let mut selection = self.selection.borrow_mut();
+            for &(old, i) in &replaced {
+                let new = from + i as u32;
+                if selection.remove(&old) {
+                    selection.insert(new);
+                }
+                for cell in [&self.focus, &self.anchor] {
+                    if cell.get() == Some(old) {
+                        cell.set(Some(new));
+                    }
+                }
+            }
+        }
         self.retire(&retired);
         if !fresh.is_empty() {
-            let from = self.entries.borrow().len() as u32;
-            if let Some(&(_, i)) = replaced.iter().find(|(old, _)| self.selected.get() == Some(*old)) {
-                self.selected.set(Some(from + i as u32));
-            }
             self.append(fresh.into(), true);
+        }
+        if !self.pending.get() {
+            // A replaced file the filter no longer shows leaves the selection.
+            self.prune_selection();
         }
         if tags_changed {
             self.recompute_tags();
         }
         self.publish_status();
+        self.publish_selection();
     }
 
     /// Retires entries: they leave the grid (the rows from the first one on are re-read) and
@@ -929,15 +996,37 @@ impl GridModel {
             return;
         }
         Arc::make_mut(&mut self.entries.borrow_mut().gone).extend(ids);
-        for &id in ids {
-            self.thumbs.invalidate(id);
+        {
+            let mut selection = self.selection.borrow_mut();
+            for &id in ids {
+                self.thumbs.invalidate(id);
+                selection.remove(&id);
+            }
         }
+        if self.anchor.get().is_some_and(|id| ids.contains(&id)) {
+            self.anchor.set(None);
+        }
+        // The focus moves on to the next item that stays, else the one before (deleting
+        // with the keyboard).
+        let next = self.focus.get().filter(|id| ids.contains(id)).map(|id| {
+            self.focus.set(None);
+            let (going, visible) = (ids.iter().collect::<HashSet<_>>(), self.visible.borrow());
+            let at = self.slot(id)?;
+            visible[at..].iter().chain(visible[..at].iter().rev()).find(|id| !going.contains(id)).copied()
+        });
         if self.pending.get() {
             // The refilter in flight leaves them out when it lands.
             return;
         }
         let old_rows = self.row_count();
         let Some(first) = self.hide(ids.iter().copied()) else { return };
+        if let Some(Some(next)) = next {
+            self.focus.set(Some(next));
+            self.anchor.set(Some(next));
+            if self.selection.borrow().is_empty() {
+                self.selection.borrow_mut().insert(next);
+            }
+        }
         let (first_row, new_rows) = (first / self.columns.get(), self.row_count());
         for row in first_row..new_rows {
             self.notify.row_changed(row);
@@ -1056,9 +1145,12 @@ impl GridModel {
         } else {
             self.merge_from(result.upto);
         }
+        // Items the new filter hides leave the selection.
+        self.prune_selection();
         self.notify.reset();
         self.reschedule();
         self.publish_status();
+        self.publish_selection();
         self.apply_restore();
         true
     }
@@ -1117,17 +1209,208 @@ impl GridModel {
         self.thumbs.schedule(ids.map(|&id| (id, tier)), |id| entries.get(id).map(|e| (e.path.clone(), e.kind)));
     }
 
-    fn select(&self, id: u32) {
-        self.set_selected(Some(id));
+    /// Selects `id` alone, focused, as the anchor of a Shift range.
+    fn select_only(&self, id: u32) {
+        self.focus_on(id);
+        self.anchor.set(Some(id));
+        self.set_selection(HashSet::from([id]));
     }
 
-    fn set_selected(&self, id: Option<u32>) {
-        let previous = self.selected.replace(id);
-        if previous != id {
-            for id in previous.into_iter().chain(id) {
-                self.refresh_entry(id);
+    /// Moves the keyboard cursor to `id`, redrawing both tiles.
+    fn focus_on(&self, id: u32) {
+        if let Some(old) = self.focus.replace(Some(id)) {
+            self.refresh_entry(old);
+        }
+        self.refresh_entry(id);
+    }
+
+    /// Replaces the selection, redrawing the rows whose tiles changed.
+    fn set_selection(&self, selection: HashSet<u32>) {
+        let before = self.selection.replace(selection);
+        let changed: Vec<u32> = before.symmetric_difference(&self.selection.borrow()).copied().collect();
+        self.refresh_entries(changed);
+        self.publish_selection();
+    }
+
+    /// Drops what isn't shown from the selection (a refilter hid it), and the focus and
+    /// anchor if they aren't shown.
+    fn prune_selection(&self) {
+        let shown = |id: &u32| self.slot(*id).is_some();
+        self.selection.borrow_mut().retain(shown);
+        for cell in [&self.focus, &self.anchor] {
+            if cell.get().is_some_and(|id| !shown(&id)) {
+                cell.set(None);
             }
         }
+    }
+
+    /// A click on entry `id` (`None`: between tiles). `extend` (Shift) selects the range
+    /// from the anchor, `toggle` (Ctrl) adds or removes one item (Ctrl+Shift adds the range).
+    fn click(&self, id: Option<u32>, extend: bool, toggle: bool) {
+        let Some(id) = id else {
+            if !extend && !toggle {
+                self.set_selection(HashSet::new());
+            }
+            return;
+        };
+        match self.anchor.get().and_then(|anchor| self.slot(anchor)).zip(self.slot(id)) {
+            Some((from, to)) if extend => {
+                let mut selection = if toggle { self.selection.borrow().clone() } else { HashSet::new() };
+                selection.extend(self.visible.borrow()[from.min(to)..=from.max(to)].iter().copied());
+                self.focus_on(id);
+                self.set_selection(selection);
+            }
+            _ if toggle || extend => {
+                let mut selection = self.selection.borrow().clone();
+                if !selection.remove(&id) {
+                    selection.insert(id);
+                }
+                self.focus_on(id);
+                self.anchor.set(Some(id));
+                self.set_selection(selection);
+            }
+            _ => self.select_only(id),
+        }
+    }
+
+    /// A rubber band starts: `keep` adds to the selection instead of replacing it.
+    fn drag_begin(&self, keep: bool) {
+        self.band.borrow_mut().clear();
+        if !keep {
+            self.set_selection(HashSet::new());
+        }
+    }
+
+    /// The rubber band covers rows `r0..=r1`, columns `c0..=c1` (not clamped to the grid):
+    /// those tiles are selected, with what was selected when it started.
+    fn drag_to(&self, r0: i32, r1: i32, c0: i32, c1: i32) {
+        let (columns, n) = (self.columns.get(), self.visible.borrow().len());
+        let (r1, c1) = (r1.min(self.row_count() as i32 - 1), c1.min(columns as i32 - 1));
+        let mut covered = HashSet::new();
+        if r1 >= 0 && c1 >= 0 && r0 <= r1 && c0 <= c1 {
+            let visible = self.visible.borrow();
+            for row in r0.max(0) as usize..=r1 as usize {
+                covered.extend((c0.max(0) as usize..=c1 as usize).map(|c| row * columns + c).filter(|&i| i < n).map(|i| visible[i]));
+            }
+        }
+        let mut changed = Vec::new();
+        {
+            let (mut selection, mut band) = (self.selection.borrow_mut(), self.band.borrow_mut());
+            band.retain(|id| {
+                let stays = covered.contains(id);
+                if !stays {
+                    selection.remove(id);
+                    changed.push(*id);
+                }
+                stays
+            });
+            for id in covered {
+                if selection.insert(id) {
+                    band.push(id);
+                    changed.push(id);
+                }
+            }
+        }
+        self.refresh_entries(changed);
+        self.publish_selection();
+    }
+
+    /// A key on the grid (lowercase: `left`, `pageup`, `a`, …); returns whether it was used.
+    fn key(&self, key: &str, shift: bool, ctrl: bool) -> bool {
+        let len = self.visible.borrow().len();
+        let columns = self.columns.get();
+        let (first, last) = self.viewport.get();
+        let page = (last - first).max(1) * columns;
+        let at = self.focus.get().and_then(|id| self.slot(id));
+        let step = |delta: isize| match at {
+            Some(at) => Some(at.saturating_add_signed(delta).min(len.saturating_sub(1))),
+            // Nothing focused yet: the first tile in view.
+            None => Some((first * columns).min(len.saturating_sub(1))),
+        };
+        let to = match key {
+            "left" => step(-1),
+            "right" => step(1),
+            // Within the column; down from the row above a shorter last row goes to its end.
+            "up" => at.map_or(step(0), |at| Some(if at >= columns { at - columns } else { at })),
+            "down" => at.map_or(step(0), |at| Some(if at / columns + 1 < self.row_count() { (at + columns).min(len - 1) } else { at })),
+            "pageup" => step(-(page as isize)),
+            "pagedown" => step(page as isize),
+            "home" => Some(0),
+            "end" => Some(len.saturating_sub(1)),
+            "a" if ctrl => {
+                log::debug!("review: select all ({len})");
+                self.set_selection(self.visible.borrow().iter().copied().collect());
+                return true;
+            }
+            "escape" if !self.selection.borrow().is_empty() => {
+                log::debug!("review: Esc clears the selection");
+                self.set_selection(HashSet::new());
+                return true;
+            }
+            "enter" => {
+                let Some(id) = self.focus.get().filter(|id| self.slot(*id).is_some()) else { return false };
+                log::debug!("review: Enter opens entry {id}");
+                self.open(id);
+                return true;
+            }
+            "delete" if !ctrl => return self.act("delete"),
+            "t" if !ctrl => return self.act("tag"),
+            "r" if !ctrl => return self.act(if shift { "rotate-left" } else { "rotate-right" }),
+            _ => return false,
+        };
+        let Some(slot) = to.filter(|_| len > 0) else { return false };
+        let id = self.visible.borrow()[slot];
+        log::trace!("review key {key} (shift {shift}): focus slot {slot}, entry {id}");
+        match self.anchor.get().and_then(|a| self.slot(a)).filter(|_| shift) {
+            Some(from) => {
+                let range = self.visible.borrow()[from.min(slot)..=from.max(slot)].iter().copied().collect();
+                self.focus_on(id);
+                self.set_selection(range);
+            }
+            None => self.select_only(id),
+        }
+        self.reveal(slot);
+        true
+    }
+
+    /// Does `action` (an item menu action) to the selection, from a key.
+    fn act(&self, action: &str) -> bool {
+        let Some(ui) = self.ui.upgrade() else { return false };
+        let focus = self.focus.get().filter(|id| self.selection.borrow().contains(id));
+        let Some(id) = focus.or_else(|| self.selection.borrow().iter().copied().min_by_key(|&id| self.slot(id))) else {
+            return false;
+        };
+        let Some(target) = self.target(id) else { return false };
+        let items = if self.selection.borrow().len() > 1 { self.selected_paths() } else { Vec::new() };
+        log::debug!("review key: {action} on {} items", items.len().max(1));
+        actions::act_on(&ui, action, target, items);
+        true
+    }
+
+    /// The selected files, in the grid's order.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let mut slots: Vec<(usize, u32)> = self.selection.borrow().iter().filter_map(|&id| Some((self.slot(id)?, id))).collect();
+        slots.sort_unstable();
+        let index = self.entries.borrow();
+        slots.into_iter().filter_map(|(_, id)| index.get(id).map(|e| e.path.clone())).collect()
+    }
+
+    /// Scrolls just enough for the tile at `slot` to be in view.
+    fn reveal(&self, slot: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let bridge = ui.global::<ReviewBridge>();
+        let serial = bridge.get_reveal().serial + 1;
+        bridge.set_reveal(ScrollRestore { serial, row: (slot / self.columns.get()) as i32, offset: 0.0 });
+    }
+
+    /// Where entry `id` is shown, if it is.
+    fn slot(&self, id: u32) -> Option<usize> {
+        self.slot_of.borrow().get(id as usize).copied().filter(|&slot| slot != HIDDEN).map(|slot| slot as usize)
+    }
+
+    fn publish_selection(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        ui.global::<ReviewBridge>().set_selection_count(self.selection.borrow().len() as i32);
     }
 
     /// The entry shown at grid `row`, `column`.
@@ -1137,6 +1420,12 @@ impl GridModel {
             return None;
         }
         self.visible.borrow().get(row as usize * columns + column as usize).copied()
+    }
+
+    /// The live entry of the path with [`path_hash`] `hash`.
+    fn id_of_hash(&self, hash: u64) -> Option<u32> {
+        let id = *self.by_path.borrow().get(&hash)?;
+        (!self.entries.borrow().gone.contains(&id)).then_some(id)
     }
 
     /// The live entry of `path`.
@@ -1150,7 +1439,9 @@ impl GridModel {
     fn open(&self, id: u32) {
         let Some(ui) = self.ui.upgrade() else { return };
         let Some(target) = self.target(id) else { return };
-        self.select(id);
+        if !self.selection.borrow().contains(&id) || self.focus.get() != Some(id) {
+            self.select_only(id);
+        }
         nav::open(&ui, target);
     }
 
@@ -1200,8 +1491,14 @@ impl GridModel {
         bridge.set_selected_tag(s.selected_tag);
         bridge.set_kind_filter(s.kind);
         bridge.set_sort_index(s.sort);
-        let reveal = s.selected.clone().filter(|_| s.followed);
-        self.set_selected(s.selected.and_then(|path| self.id_of(&path)));
+        let reveal = s.focus.clone().filter(|_| s.followed);
+        let focus = s.focus.and_then(|path| self.id_of(&path));
+        if let Some(old) = self.focus.replace(focus) {
+            self.refresh_entry(old);
+        }
+        self.anchor.set(focus);
+        let ids = s.selected.iter().filter_map(|&hash| self.id_of_hash(hash)).collect();
+        self.set_selection(ids);
         *self.restore.borrow_mut() = Some((s.anchor, s.offset, reveal));
         if refilter {
             self.set_query(Query::new(s.search.into(), s.tag.into(), s.kind, Sort::from_index(s.sort)));
@@ -1283,6 +1580,17 @@ impl GridModel {
         self.redrain_due.set(true);
     }
 
+    /// Re-delivers each row holding one of `ids` that is shown, once.
+    fn refresh_entries(&self, ids: Vec<u32>) {
+        let columns = self.columns.get();
+        let mut rows: Vec<usize> = ids.into_iter().filter_map(|id| self.slot(id)).map(|slot| slot / columns).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for row in rows {
+            self.notify.row_changed(row);
+        }
+    }
+
     /// Re-delivers the row holding entry `id`, if that entry is currently shown.
     fn refresh_entry(&self, id: u32) {
         let slot = self.slot_of.borrow().get(id as usize).copied().unwrap_or(HIDDEN);
@@ -1302,7 +1610,8 @@ impl GridModel {
             thumb_ready: thumb.is_some(),
             thumb: thumb.unwrap_or_default(),
             color,
-            selected: self.selected.get() == Some(id),
+            selected: self.selection.borrow().contains(&id),
+            focused: self.focus.get() == Some(id),
         }
     }
 
@@ -1711,19 +2020,93 @@ mod tests {
         // Reported while the indexer is still walking (which finds b itself).
         g.update_files(vec![present(&b, false), present(&a, true)]);
         assert_eq!(g.entries.borrow().len(), 1, "deferred");
-        g.select(0);
+        g.select_only(0);
         g.append(vec![b.clone()].into(), true);
         let index = g.entries.borrow();
         assert_eq!(index.len(), 3, "a replaced (it changed), b not duplicated");
         assert_eq!(index.gone.iter().copied().collect::<Vec<_>>(), vec![0]);
         let names: Vec<String> = g.visible.borrow().iter().map(|&id| index.get(id).unwrap().name.to_string()).collect();
         assert_eq!(names, ["a.png", "b.png"]);
-        assert_eq!(g.selected.get(), Some(2), "the selection follows the file to its new entry");
+        assert_eq!(*g.selection.borrow(), HashSet::from([2]), "the selection follows the file to its new entry");
+        assert_eq!((g.focus.get(), g.anchor.get()), (Some(2), Some(2)));
         drop(index);
 
         g.update_files(vec![FileUpdate::Gone("/x/b.png".into()), FileUpdate::Gone("/x/unknown.png".into())]);
         assert_eq!(g.visible.borrow().len(), 1);
         assert_eq!(g.entries.borrow().live(), 1);
+    }
+
+    /// Click, Shift / Ctrl, rubber band and keys select by entry; the selection survives
+    /// replacements, drops what is filtered out or deleted, and the focus moves on.
+    #[test]
+    fn multi_selection() {
+        let g = grid(usize::MAX, 4, |_| {});
+        let files: Vec<Entry> = (0..10)
+            .map(|i| Entry::new(format!("/x/{i}.png").into(), format!("{i}.png"), MediaKind::Image, i, SystemTime::UNIX_EPOCH))
+            .collect();
+        g.append(files.clone().into(), true);
+        let selected = |g: &GridModel| {
+            let mut ids: Vec<u32> = g.selection.borrow().iter().copied().collect();
+            ids.sort();
+            ids
+        };
+        let tiles = |g: &GridModel| (0..g.row_count()).flat_map(|r| g.row_data(r).unwrap().tiles.iter().collect::<Vec<_>>()).collect::<Vec<_>>();
+
+        g.click(Some(1), false, false);
+        g.click(Some(6), true, false);
+        assert_eq!(selected(&g), [1, 2, 3, 4, 5, 6], "shift: the range from the anchor");
+        g.click(Some(3), false, true);
+        assert_eq!(selected(&g), [1, 2, 4, 5, 6], "ctrl toggles");
+        g.click(Some(8), true, true);
+        assert_eq!(selected(&g), [1, 2, 3, 4, 5, 6, 7, 8], "ctrl+shift adds the range from the new anchor");
+        let t = tiles(&g);
+        assert!(t[8].selected && t[8].focused && !t[0].selected && !t[9].focused, "row_data reads the set");
+        g.click(None, false, false);
+        assert!(selected(&g).is_empty());
+
+        // Rubber band over rows 0..=1, columns 1..=2, keeping 9.
+        g.click(Some(9), false, false);
+        g.drag_begin(true);
+        g.drag_to(0, 1, 1, 2);
+        assert_eq!(selected(&g), [1, 2, 5, 6, 9]);
+        g.drag_to(0, 0, 1, 2);
+        assert_eq!(selected(&g), [1, 2, 9], "shrinking the band gives back what it took");
+        g.drag_begin(false);
+        g.drag_to(2, 5, 0, 9);
+        assert_eq!(selected(&g), [8, 9], "clamped to the grid");
+
+        // Keys: 4 columns, ids = slots.
+        g.click(Some(5), false, false);
+        assert!(g.key("right", false, false) && g.focus.get() == Some(6));
+        assert!(g.key("down", true, false));
+        assert_eq!((g.focus.get(), selected(&g)), (Some(9), vec![6, 7, 8, 9]), "shift extends from the anchor");
+        assert!(g.key("down", false, false) && g.focus.get() == Some(9), "no row below");
+        assert!(g.key("up", false, false) && g.focus.get() == Some(5));
+        assert!(g.key("home", false, false) && selected(&g) == [0]);
+        assert!(g.key("up", false, false) && g.focus.get() == Some(0));
+        assert!(g.key("end", true, false) && selected(&g).len() == 10);
+        assert!(g.key("escape", false, false) && selected(&g).is_empty());
+        assert!(!g.key("escape", false, false), "Esc with nothing selected is someone else's");
+        assert!(g.key("a", false, true) && selected(&g).len() == 10);
+        assert!(!g.key("x", false, false));
+
+        // A changed file: the selection follows it to its new entry.
+        g.update_files(vec![present(&Entry::new("/x/3.png".into(), "3.png".into(), MediaKind::Image, 99, SystemTime::UNIX_EPOCH), false)]);
+        assert!(selected(&g).contains(&10) && !selected(&g).contains(&3));
+        assert_eq!(g.selected_paths().len(), 10);
+        assert_eq!(g.selected_paths()[3], PathBuf::from("/x/3.png"), "in the grid's order");
+
+        // Filtered out: dropped.
+        g.set_query(Query::new("1".into(), String::new(), 0, Sort::Name));
+        assert_eq!(selected(&g), [1]);
+        g.set_query(Query::default());
+        assert_eq!(selected(&g), [1], "and not back when shown again");
+
+        // Deleted: gone from the selection; the focus moves to the next item.
+        g.click(Some(4), false, false);
+        g.click(Some(5), false, true);
+        g.update_files(vec![FileUpdate::Gone("/x/4.png".into()), FileUpdate::Gone("/x/5.png".into())]);
+        assert_eq!((g.focus.get(), selected(&g)), (Some(6), vec![6]), "next item selected once nothing is");
     }
 
     /// Naming someone in People (or adding a tag) reaches the grid as a file update: the

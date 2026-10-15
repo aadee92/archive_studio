@@ -1540,10 +1540,10 @@ fn change_face(ui: &AppWindow, change: FaceChange) {
                         }
                     }
                     if matches!(change, FaceChange::Delete(_)) {
-                        actions::notify(&ui, "Face box deleted".to_owned(), false, None);
+                        actions::notify(&ui, "Face box deleted".to_owned(), false, Vec::new());
                     }
                 }
-                Err(e) => actions::notify(&ui, format!("Can't change the face: {e}"), true, None),
+                Err(e) => actions::notify(&ui, format!("Can't change the face: {e}"), true, Vec::new()),
             }
         });
         // Faces like the ones just named are suggested as them (as People does).

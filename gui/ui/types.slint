@@ -31,6 +31,7 @@ export struct MediaTile {
     color: color,      // average color of the thumbnail, transparent until known
 
     selected: bool,
+    focused: bool,     // the keyboard cursor (Review)
 }
 
 // The review grid is a ListView of rows; each row carries `columns` tiles.

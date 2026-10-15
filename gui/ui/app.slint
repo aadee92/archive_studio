@@ -49,42 +49,46 @@ export component AppWindow inherits Window {
             }
             MenuSeparator { }
             MenuItem {
-                title: "Add tag…";
+                title: ItemMenu.count > 1 ? "Add tag to \{ItemMenu.count} items…" : "Add tag…";
                 activated => { ItemMenu.action("tag"); }
             }
             Menu {
                 title: "Front & back";
                 MenuItem {
                     title: "Pair as back of previous item";
-                    enabled: ItemMenu.can-pair-prev;
+                    enabled: ItemMenu.can-pair-prev && ItemMenu.count <= 1;
                     activated => { ItemMenu.action("pair-prev"); }
                 }
                 MenuItem {
                     title: "Pair as back of next item";
-                    enabled: ItemMenu.can-pair-next;
+                    enabled: ItemMenu.can-pair-next && ItemMenu.count <= 1;
                     activated => { ItemMenu.action("pair-next"); }
                 }
                 MenuSeparator { }
                 MenuItem {
                     title: "Swap front & back";
+                    enabled: ItemMenu.count <= 1;
                     activated => { ItemMenu.action("swap-sides"); }
                 }
                 MenuItem {
                     title: "Unpair";
+                    enabled: ItemMenu.count <= 1;
                     activated => { ItemMenu.action("unpair"); }
                 }
             }
             MenuItem {
                 title: "Show in folder";
+                enabled: ItemMenu.count <= 1;
                 activated => { ItemMenu.action("show-in-folder"); }
             }
             MenuItem {
                 title: "Properties";
+                enabled: ItemMenu.count <= 1;
                 activated => { ItemMenu.action("properties"); }
             }
             MenuSeparator { }
             MenuItem {
-                title: "Delete";
+                title: ItemMenu.count > 1 ? "Delete \{ItemMenu.count} items" : "Delete";
                 activated => { ItemMenu.action("delete"); }
             }
         }

@@ -21,6 +21,9 @@ export global ItemMenu {
     // Bumped by Rust to show the menu at (x, y) for the item it resolved.
     in property <int> serial;
     in property <bool> can-rotate;
+    // How many items it acts on: more than one when right-clicked in a multi-selection
+    // (Review), which disables what is for one item (pairing, Show in folder, Properties).
+    in property <int> count: 1;
     // The view it was right-clicked in has an item before / after it, to pair it with.
     in property <bool> can-pair-prev;
     in property <bool> can-pair-next;

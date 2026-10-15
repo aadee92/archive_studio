@@ -19,6 +19,9 @@
 //!   [`Catalog::not_person`], [`Catalog::ignore_faces`] and [`Catalog::delete_faces`] for the
 //!   ones there.
 //! - [`properties`]: everything known about the asset, for a properties dialog.
+//! - Many at once (a multi-selection): [`delete_all`] / [`restore_all`] (one Undo for all
+//!   of them), [`add_tag_all`]. Each returns what happened to every asset, or is all or
+//!   nothing, as documented.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -53,6 +56,32 @@ pub fn delete(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<V
     catalog.trash(asset)
 }
 
+/// What a bulk operation did to each asset it was given, in the order given.
+pub type Each<T> = Vec<(AssetId, crate::catalog::Result<T>)>;
+
+/// Moves each of `assets` to the trash as [`delete`] does: one failing (e.g. its file can't
+/// be moved) doesn't stop the others. An asset already in the trash (a back trashed with
+/// its front earlier in the list) gives an empty list. Undo with [`restore_all`] of the
+/// assets that trashed something.
+pub fn delete_all(catalog: &mut Catalog, assets: &[AssetId]) -> Each<Vec<Trashed>> {
+    let done: Each<Vec<Trashed>> = assets.iter().map(|&asset| (asset, catalog.trash(asset))).collect();
+    let failed = done.iter().filter(|(_, r)| r.is_err()).count();
+    let files: usize = done.iter().filter_map(|(_, r)| r.as_ref().ok()).map(Vec::len).sum();
+    log::debug!("delete_all {} assets: {files} files to the trash, {failed} failed", assets.len());
+    done
+}
+
+/// Puts each of `assets` back from the trash as [`Catalog::restore`] does (with its back);
+/// one failing (something else is at its old path now) doesn't stop the others. An asset
+/// that isn't in the trash (any more) gives an empty list.
+pub fn restore_all(catalog: &mut Catalog, assets: &[AssetId]) -> Each<Vec<PathBuf>> {
+    let done: Each<Vec<PathBuf>> = assets.iter().map(|&asset| (asset, catalog.restore(asset))).collect();
+    let failed = done.iter().filter(|(_, r)| r.is_err()).count();
+    let files: usize = done.iter().filter_map(|(_, r)| r.as_ref().ok()).map(Vec::len).sum();
+    log::debug!("restore_all {} assets: {files} files restored, {failed} failed", assets.len());
+    done
+}
+
 /// What a typed tag means: `kind:path` picks the kind (`place:Home|Kitchen`); a path under
 /// `People|` is a person; anything else is a keyword. The path is returned trimmed.
 pub fn parse_tag(text: &str) -> (TagKind, String) {
@@ -73,6 +102,22 @@ pub fn add_tag(catalog: &Catalog, asset: AssetId, text: &str) -> crate::catalog:
     match &result {
         Ok(tag) => log::debug!("add_tag {text:?} ({:?} {:?}) to asset {}: tag {}", parsed.0, parsed.1, asset.0, tag.0),
         Err(e) => log::warn!("add_tag {text:?} to asset {}: {e}", asset.0),
+    }
+    result
+}
+
+/// The user puts the tag they typed (see [`parse_tag`]) on every one of `assets`, in one
+/// transaction: all of them, or none on an error. Returns the tag.
+pub fn add_tag_all(catalog: &mut Catalog, assets: &[AssetId], text: &str) -> crate::catalog::Result<TagId> {
+    let parsed = parse_tag(text);
+    let result = match &parsed {
+        (TagKind::Person, path) => catalog.person(path),
+        (kind, path) => catalog.tag(path, *kind),
+    }
+    .and_then(|tag| catalog.add_tag_to_all(assets, tag).map(|()| tag));
+    match &result {
+        Ok(tag) => log::debug!("add_tag_all {text:?} ({:?} {:?}) to {} assets: tag {}", parsed.0, parsed.1, assets.len(), tag.0),
+        Err(e) => log::warn!("add_tag_all {text:?} to {} assets: {e}", assets.len()),
     }
     result
 }
@@ -393,6 +438,44 @@ mod tests {
 
         delete(&mut cat, x).unwrap();
         assert!(pair(&mut cat, x, b1).is_err(), "in the trash");
+    }
+
+    #[test]
+    fn many_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["photo-0001-front.png", "photo-0001-back.png", "x.png", "y.png"] {
+            image::RgbImage::new(4, 4).save(root.join(name)).unwrap();
+        }
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let [front, back, x, y] = ["photo-0001-front.png", "photo-0001-back.png", "x.png", "y.png"].map(|n| cat.asset(&root.join(n)).unwrap());
+
+        // Tags: all or nothing.
+        let tag = add_tag_all(&mut cat, &[x, y, front], "Holidays|1998").unwrap();
+        for a in [x, y, front] {
+            assert_eq!(cat.tags_of(a).unwrap().iter().map(|t| t.tag).collect::<Vec<_>>(), [tag]);
+        }
+        assert!(add_tag_all(&mut cat, &[back, AssetId(9999)], "place:Home").is_err());
+        assert!(cat.tags_of(back).unwrap().is_empty(), "rolled back");
+        let alice = add_tag_all(&mut cat, &[x, y], "People|Alice").unwrap();
+        assert_eq!(cat.person("Alice").unwrap(), alice);
+
+        // Delete: each on its own; the back goes with its front, once.
+        let done = delete_all(&mut cat, &[front, x, AssetId(9999), back]);
+        let counts: Vec<Option<usize>> = done.iter().map(|(_, r)| r.as_ref().ok().map(Vec::len)).collect();
+        assert_eq!(counts, [Some(2), Some(1), None, Some(0)]);
+        assert!(!root.join("x.png").exists() && !root.join("photo-0001-back.png").exists());
+        assert!(root.join("y.png").exists());
+
+        // One undo for everything that went.
+        let trashed: Vec<AssetId> = done.iter().filter(|(_, r)| r.as_ref().is_ok_and(|t| !t.is_empty())).map(|(a, _)| *a).collect();
+        let restored = restore_all(&mut cat, &trashed);
+        assert_eq!(restored.iter().map(|(_, r)| r.as_ref().unwrap().len()).sum::<usize>(), 3);
+        assert!(root.join("x.png").exists() && root.join("photo-0001-back.png").exists());
+        assert!(!cat.is_trashed(back).unwrap() && !cat.is_trashed(x).unwrap());
+        assert_eq!(cat.back_of(front).unwrap(), Some(back), "still a pair");
+        let again = restore_all(&mut cat, &[x]);
+        assert!(again[0].1.as_ref().unwrap().is_empty(), "not in the trash any more");
     }
 
     #[test]

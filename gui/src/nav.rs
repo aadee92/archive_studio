@@ -194,6 +194,13 @@ pub fn context_menu(ui: &AppWindow, target: Target) {
     actions::show_menu(ui, target);
 }
 
+/// The item context menu for `target`, acting on all of `items` (a multi-selection it is
+/// part of) if there are more than one.
+pub fn context_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
+    log::debug!("context menu for {target:?} with {} items selected (page {})", items.len(), ui.get_page());
+    actions::show_menu_for(ui, target, items);
+}
+
 /// Whether there is a view to go back to.
 pub fn can_go_back(_ui: &AppWindow) -> bool {
     HISTORY_STACK.with_borrow(|history| !history.is_empty())

@@ -33,6 +33,11 @@ export global ReviewBridge {
     in-out property <length> scroll-offset;
     // Set by Rust to scroll somewhere (Back).
     in property <ScrollRestore> restore;
+    // Set by Rust to scroll just enough for `row` to be in view (the keyboard cursor moved;
+    // `offset` is unused).
+    in property <ScrollRestore> reveal;
+    // How many items are selected.
+    in property <int> selection-count;
 
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
@@ -40,7 +45,17 @@ export global ReviewBridge {
     // query, tag, kind (0 all, 1 images, 2 video, 3 audio), sort (0 name, 1 date, 2 size, 3 type)
     callback filter-changed(string, string, int, int);
     // Pointer input on the grid, by (row, column); -1 for neither when it missed every tile.
-    callback click(int, int);
+    // A click with Shift (range from the anchor) / Ctrl (toggle).
+    callback click(int, int, /* shift */ bool, /* ctrl */ bool);
+    // A rubber band starts: `keep` (Shift / Ctrl held) adds to the selection.
+    callback drag-begin(bool);
+    // The tiles in rows `r0..=r1`, columns `c0..=c1` (unclamped), plus what drag-begin kept.
+    callback drag-to(int, int, int, int);
+    callback clear-selection();
+    // A key while the grid has the keyboard focus: "left", "right", "up", "down", "pageup",
+    // "pagedown", "home", "end", "enter", "delete", "escape", or the key's text; returns
+    // whether Rust used it.
+    callback key(string, /* shift */ bool, /* ctrl */ bool) -> bool;
     // Double-click: opens the tile on the Details page.
     callback open(int, int);
     // Right-click. Shows the item context menu (`ItemMenu`).
@@ -117,8 +132,18 @@ component MediaCell inherits Rectangle {
         width: root.size;
         height: root.size;
         border-radius: 6px;
-        border-width: root.tile.selected ? 2px : root.hover ? 1px : 0px;
-        border-color: root.tile.selected ? Theme.accent : Theme.border;
+        border-width: root.tile.selected ? (root.tile.focused ? 3px : 2px) : root.tile.focused ? 2px : root.hover ? 1px : 0px;
+        border-color: root.tile.selected ? Theme.accent : root.tile.focused ? Theme.accent-soft : Theme.border;
+    }
+    // Selected: a check mark in the corner, so a multi-selection reads at a glance.
+    if root.tile.selected: Rectangle {
+        x: root.size - self.width - 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.accent;
+        Text { text: "✓"; color: white; font-size: 11px; font-weight: 700; }
     }
 
     Text {
@@ -153,6 +178,16 @@ export component ReviewPage inherits Rectangle {
     property <int> hover-row: -1;
     property <int> hover-col: -1;
 
+    // Rubber band, in content coordinates (scrolling moves the grid, not the band's anchor).
+    property <bool> dragging;
+    property <length> press-x;
+    property <length> press-y;
+    property <bool> press-keep;
+
+    // The size slider's value; Ctrl+wheel over the grid changes it too.
+    property <float> tile-value: 160;
+    changed tile-value => { ReviewBridge.tile-size = self.tile-value * 1px; }
+
     // Tile size also picks the thumbnail resolution tier on the Rust side.
     property <length> tile-size: ReviewBridge.tile-size;
     changed columns => { ReviewBridge.columns-changed(self.columns); }
@@ -179,6 +214,22 @@ export component ReviewPage inherits Rectangle {
         list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
             Math.min(0px, -(self.restore.row * root.row-height + self.restore.offset)));
     }
+    property <ScrollRestore> reveal: ReviewBridge.reveal;
+    changed reveal => {
+        if (self.reveal.row * root.row-height < -list.content-y) {
+            list.content-y = -self.reveal.row * root.row-height;
+        } else if ((self.reveal.row + 1) * root.row-height > -list.content-y + list.visible-height) {
+            list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
+                list.visible-height - (self.reveal.row + 1) * root.row-height);
+        }
+    }
+
+    // The grid takes the keyboard when the page is shown (not the search boxes).
+    changed visible => {
+        if (self.visible) {
+            keys.focus();
+        }
+    }
 
     // Grid geometry: the row / column of the tile at a point in content coordinates
     // (-1: between tiles).
@@ -191,11 +242,33 @@ export component ReviewPage inherits Rectangle {
             ? -1 : Math.floor((x - root.gap) / root.pitch);
     }
 
+    function scroll-by(dy: length) {
+        list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height), Math.min(0px, list.content-y + dy));
+    }
+
+    function drag-update() {
+        // Pointer in content coordinates.
+        ReviewBridge.drag-to(
+            Math.floor(Math.min(root.press-y, overlay.mouse-y - list.content-y) / root.row-height),
+            Math.floor((Math.max(root.press-y, overlay.mouse-y - list.content-y) - root.gap) / root.row-height),
+            Math.ceil((Math.min(root.press-x, overlay.mouse-x) - root.gap - ReviewBridge.tile-size) / root.pitch),
+            Math.floor((Math.max(root.press-x, overlay.mouse-x) - root.gap) / root.pitch));
+    }
+
+    pure function key-name(text: string) -> string {
+        return text == Key.LeftArrow ? "left" : text == Key.RightArrow ? "right"
+            : text == Key.UpArrow ? "up" : text == Key.DownArrow ? "down"
+            : text == Key.PageUp ? "pageup" : text == Key.PageDown ? "pagedown"
+            : text == Key.Home ? "home" : text == Key.End ? "end"
+            : text == Key.Return ? "enter" : text == Key.Delete ? "delete" : text == Key.Escape ? "escape"
+            : text;
+    }
+
     function track() {
-        if (overlay.has-hover) {
+        if (overlay.has-hover && !overlay.pressed) {
             root.hover-row = root.row-at(overlay.mouse-y - list.content-y);
             root.hover-col = root.col-at(overlay.mouse-x);
-        } else {
+        } else if (!overlay.has-hover) {
             root.hover-row = -1;
             root.hover-col = -1;
         }
@@ -428,7 +501,21 @@ export component ReviewPage inherits Rectangle {
                         }
                     }
 
-                    // All pointer input over the tiles (not the scroll bar). It can't live in
+                    // The grid's keys (arrows, Enter, Delete, T, R, Ctrl+A, Esc); focused on a
+                    // click on the grid and when the page is shown, so the search boxes keep
+                    // theirs while they are being typed in.
+                    keys := FocusScope {
+                        focus-on-click: false;
+                        key-pressed(event) => {
+                            if (ReviewBridge.key(root.key-name(event.text), event.modifiers.shift, event.modifiers.control)) {
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
+                    // All pointer input over the tiles (not the scroll bar): click, Shift-click
+                    // for a range, Ctrl-click to toggle, drag for a rubber band. It can't live in
                     // the tiles: a row is re-delivered (a new tiles model) whenever a thumbnail
                     // arrives or the selection changes, which recreates its cells, and a
                     // TouchArea recreated between two clicks never sees a double-click.
@@ -444,9 +531,6 @@ export component ReviewPage inherits Rectangle {
                         changed mouse-y => { root.track(); }
                         changed has-hover => { root.track(); }
 
-                        clicked => {
-                            ReviewBridge.click(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
-                        }
                         double-clicked => {
                             ReviewBridge.open(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                         }
@@ -456,12 +540,69 @@ export component ReviewPage inherits Rectangle {
                                 ItemMenu.y = self.absolute-position.y + self.mouse-y;
                                 ReviewBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                             }
+                            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                keys.focus();
+                                root.press-x = self.mouse-x;
+                                root.press-y = self.mouse-y - list.content-y;
+                                root.press-keep = event.modifiers.shift || event.modifiers.control;
+                                root.dragging = false;
+                            }
+                            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                                if (root.dragging) {
+                                    root.dragging = false;
+                                } else {
+                                    ReviewBridge.click(
+                                        root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x),
+                                        event.modifiers.shift, event.modifiers.control);
+                                }
+                            }
+                        }
+                        moved => {
+                            if (self.pressed && !root.dragging
+                                && Math.abs(self.mouse-x - root.press-x) + Math.abs(self.mouse-y - list.content-y - root.press-y) > 6px) {
+                                root.dragging = true;
+                                ReviewBridge.drag-begin(root.press-keep);
+                            }
+                            if (root.dragging) {
+                                root.drag-update();
+                            }
                         }
                         scroll-event(event) => {
-                            list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
-                                Math.min(0px, list.content-y + event.delta-y));
+                            // Ctrl+wheel: tile size, as the slider.
+                            if (event.modifiers.control) {
+                                if (event.delta-y != 0) {
+                                    root.tile-value = Math.clamp(root.tile-value + (event.delta-y > 0 ? 16 : -16), 96, 320);
+                                }
+                                return accept;
+                            }
+                            root.scroll-by(event.delta-y);
+                            if (root.dragging) {
+                                root.drag-update();
+                            }
                             accept
                         }
+                    }
+
+                    // Dragging past the top or bottom edge scrolls.
+                    Timer {
+                        interval: 30ms;
+                        running: root.dragging && (overlay.mouse-y < 0 || overlay.mouse-y > overlay.height);
+                        triggered => {
+                            root.scroll-by(overlay.mouse-y < 0
+                                ? Math.min(40px, -overlay.mouse-y / 2)
+                                : -Math.min(40px, (overlay.mouse-y - overlay.height) / 2));
+                            root.drag-update();
+                        }
+                    }
+
+                    if root.dragging: Rectangle {
+                        x: overlay.x + Math.min(root.press-x, overlay.mouse-x);
+                        y: overlay.y + Math.max(0px, Math.min(root.press-y + list.content-y, overlay.mouse-y));
+                        width: Math.abs(overlay.mouse-x - root.press-x);
+                        height: Math.min(overlay.height, Math.max(root.press-y + list.content-y, overlay.mouse-y)) - self.y + overlay.y;
+                        background: #2563eb1f;
+                        border-width: 1px;
+                        border-color: Theme.accent;
                     }
 
                     if ReviewBridge.empty: Text {
@@ -481,14 +622,45 @@ export component ReviewPage inherits Rectangle {
                         font-size: 12px;
                         overflow: elide;
                     }
+                    // The selection, with a button to clear it.
+                    if ReviewBridge.selection-count > 0: Rectangle {
+                        height: 24px;
+                        width: sel-row.preferred-width;
+                        border-radius: 12px;
+                        background: Theme.accent-soft;
+                        sel-row := HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            Text {
+                                text: "\{ReviewBridge.selection-count} selected";
+                                color: Theme.accent;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle {
+                                width: 18px;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: clear-ta.has-hover ? Theme.hover : transparent;
+                                    Text { text: "×"; color: Theme.accent; font-size: 14px; }
+                                }
+                                clear-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { ReviewBridge.clear-selection(); }
+                                }
+                            }
+                        }
+                    }
                     Rectangle { width: 8px; }
                     Text { text: "Size"; color: Theme.text-muted; font-size: 12px; vertical-alignment: center; }
                     Slider {
                         width: 110px;
                         minimum: 96;
                         maximum: 320;
-                        value: 160;
-                        changed(v) => { ReviewBridge.tile-size = v * 1px; }
+                        value <=> root.tile-value;
                     }
                 }
             }

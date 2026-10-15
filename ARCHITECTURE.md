@@ -16,8 +16,8 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag), front/back (pair, unpair, swap-sides), find by description |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), and bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag; `tag` and `delete` / `restore` take several files), front/back (pair, unpair, swap-sides), find by description |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -111,6 +111,10 @@ XMP sidecar sync.
   tags (ignoring case; `kind:path` restricts the kind; a bare name can be a person). A
   person tag taken off un-names that person's faces on the asset rather than being refused:
   the tag is what says they are in the picture (`Catalog::remove_tag`).
+- **Many at once** (`ops::delete_all`, `ops::restore_all`, `ops::add_tag_all`): deleting
+  and restoring go asset by asset (files move; one failing doesn't stop the others) and
+  return each asset's result, so a front end can undo exactly what went; tagging is one
+  transaction (`Catalog::add_tag_to_all`), all or nothing.
 - **Trash** (`trash`): deleting moves the file and sidecar to
   `.archive-studio/trash/<when>-<id>/<path>` and the asset row with it (kept, marked
   trashed and missing, out of searches). `restore` undoes it; `empty_trash` deletes for good.

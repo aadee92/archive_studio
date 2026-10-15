@@ -474,6 +474,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// The user puts `tag` on every one of `assets`, in one transaction: all of them or,
+    /// on an error (e.g. an asset that doesn't exist), none.
+    pub fn add_tag_to_all(&mut self, assets: &[AssetId], tag: TagId) -> Result<()> {
+        let result = (|| {
+            let tx = self.conn.transaction()?;
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO asset_tags (asset_id, tag_id, source, hidden) VALUES (?1, ?2, 'user', 0)
+                     ON CONFLICT DO UPDATE SET hidden = 0",
+                )?;
+                for asset in assets {
+                    insert.execute([asset.0, tag.0])?;
+                }
+            }
+            tx.commit()?;
+            Ok(assets.len())
+        })();
+        logged(format_args!("add_tag_to_all tag {} on {} assets", tag.0, assets.len()), result).map(|_| ())
+    }
+
     /// The user takes `tag` off `asset`. If a detector proposed it, that is remembered as a
     /// rejection, so the detector can't put it back.
     ///

@@ -6,6 +6,12 @@
 //! menu itself is a `ContextMenuArea` in `app.slint`, shown where the pointer was. Details'
 //! keyboard shortcuts (Delete, T) go through [`act`] too.
 //!
+//! Right-clicked in a multi-selection (Review), the menu acts on all of its items
+//! ([`show_menu_for`], [`act_on`]): rotating turns each in turn, Add tag tags them all in one
+//! transaction ([`ops::add_tag_all`]), Delete trashes them all ([`ops::delete_all`]) with
+//! one notice whose Undo restores every one ([`ops::restore_all`]). Pairing, Show in folder
+//! and Properties are for one item and disabled then.
+//!
 //! Every action is an [`archive_core::ops`] call, run on a worker: rotating goes to the
 //! pipeline's engine if it runs in this window (else straight to the core), deleting moves
 //! to the library's trash (undoable from the notice), tagging takes what the user typed
@@ -41,12 +47,14 @@ struct State {
     pipeline: Handle,
     /// The item the menu was opened for.
     target: Option<Target>,
-    /// The item the tag dialog adds to.
-    tagging: Option<PathBuf>,
+    /// The items it acts on when it was opened on a multi-selection (empty otherwise).
+    items: Vec<PathBuf>,
+    /// The items the tag dialog adds to.
+    tagging: Vec<PathBuf>,
     /// Every tag in the catalog, for the tag dialog's matches.
     tags: Vec<String>,
     /// What the notice's Undo restores from the trash.
-    undo: Option<AssetId>,
+    undo: Vec<AssetId>,
     notice_timer: Timer,
     /// Retires the reply for a properties dialog closed meanwhile.
     props_generation: u64,
@@ -65,20 +73,21 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         root,
         pipeline,
         target: None,
-        tagging: None,
+        items: Vec::new(),
+        tagging: Vec::new(),
         tags: Vec::new(),
-        undo: None,
+        undo: Vec::new(),
         notice_timer: Timer::default(),
         props_generation: 0,
     }));
     let menu = ui.global::<ItemMenu>();
     let weak = ui.as_weak();
     menu.on_action(move |action| {
-        let target = with_state(|s| s.target.clone()).flatten();
+        let (target, items) = with_state(|s| (s.target.clone(), s.items.clone())).unwrap_or_default();
         match (weak.upgrade(), target) {
             (Some(ui), Some(target)) => {
-                log::debug!("context menu action {action:?} on {target:?}");
-                act(&ui, &action, target);
+                log::debug!("context menu action {action:?} on {target:?}{}", if items.len() > 1 { format!(" and the {} items selected with it", items.len()) } else { String::new() });
+                act_on(&ui, &action, target, items);
             }
             (_, None) => log::warn!("context menu action {action:?} with no item - ignored"),
             (None, _) => {}
@@ -102,7 +111,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         log::debug!("tag dialog: cancel (closing)");
         if let Some(ui) = weak.upgrade() {
             ui.global::<ItemMenu>().set_tag_open(false);
-            with_state(|s| s.tagging = None);
+            with_state(|s| s.tagging.clear());
         }
     });
     let weak = ui.as_weak();
@@ -124,15 +133,32 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 
 /// Shows the menu for `target` where the page saw the right-click (`ItemMenu.x` / `y`).
 pub fn show_menu(ui: &AppWindow, target: Target) {
-    let rotatable = classify(&target.path) == Some(MediaKind::Image) && archive_core::pipeline::rotate::can_rotate(&target.path);
+    show_menu_for(ui, target, Vec::new());
+}
+
+/// Shows the menu for `target`, acting on all of `items` (the multi-selection it was
+/// right-clicked in, `target` among them) if there are more than one.
+pub fn show_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
+    let many = items.len() > 1;
+    let rotatable = if many { items.iter().any(|p| rotatable(p)) } else { rotatable(&target.path) };
     // Whether the view has an item before / after it; checked again when picked.
     let (at, len) = (target.scope.current, target.scope.len);
-    with_state(|s| s.target = Some(target));
+    let count = if many { items.len() } else { 1 };
+    with_state(|s| {
+        s.target = Some(target);
+        s.items = if many { items } else { Vec::new() };
+    });
     let menu = ui.global::<ItemMenu>();
+    menu.set_count(count as i32);
     menu.set_can_rotate(rotatable);
     menu.set_can_pair_prev(at.is_some_and(|i| i > 0));
     menu.set_can_pair_next(at.is_some_and(|i| i + 1 < len));
     menu.set_serial(menu.get_serial() + 1);
+}
+
+/// An image whose file can be turned losslessly.
+fn rotatable(path: &Path) -> bool {
+    classify(path) == Some(MediaKind::Image) && archive_core::pipeline::rotate::can_rotate(path)
 }
 
 /// Turns the image at `path` `cw` degrees clockwise: by the engine if it runs in this
@@ -165,11 +191,28 @@ fn file_name(path: &Path) -> String {
 
 /// Does `action` (an `ItemMenu.action` name) to `target`; also how Details' keys reach them.
 pub(crate) fn act(ui: &AppWindow, action: &str, target: Target) {
+    act_on(ui, action, target, Vec::new());
+}
+
+/// Does `action` to all of `items` if there are more than one (a multi-selection, with
+/// `target` the item right-clicked or focused), else to `target`; also how Review's keys
+/// reach them.
+pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<PathBuf>) {
+    if items.len() > 1 {
+        match action {
+            "rotate-left" => rotate_items(ui, items, 270),
+            "rotate-right" => rotate_items(ui, items, 90),
+            "delete" => delete(ui, items),
+            "tag" => open_tag_dialog(ui, items),
+            other => log::warn!("context menu: {other:?} is for one item, not {} - ignored", items.len()),
+        }
+        return;
+    }
     match action {
         "rotate-left" => rotate_item(ui, target.path, 270),
         "rotate-right" => rotate_item(ui, target.path, 90),
-        "delete" => delete(ui, target.path),
-        "tag" => open_tag_dialog(ui, target.path),
+        "delete" => delete(ui, vec![target.path]),
+        "tag" => open_tag_dialog(ui, vec![target.path]),
         "properties" => properties(ui, target.path),
         "show-in-folder" => show_in_folder(ui, target.path),
         "open-external" => open_externally(ui, target.path),
@@ -193,8 +236,36 @@ fn rotate_item(ui: &AppWindow, path: PathBuf, cw: u16) {
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if let Err(e) = result {
                 log::warn!("rotate {}: {e}", path.display());
-                notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, None);
+                notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, Vec::new());
             }
+        });
+    });
+}
+
+/// Turns each of `paths` that can be turned, one after the other on a worker; one notice
+/// at the end.
+fn rotate_items(ui: &AppWindow, paths: Vec<PathBuf>, cw: u16) {
+    let Some((root, pipeline)) = context() else { return };
+    let weak = ui.as_weak();
+    log::debug!("rotate {} items {cw}°", paths.len());
+    thread::spawn(move || {
+        let (mut done, mut failed, mut first_error) = (0, 0, None);
+        for path in &paths {
+            let result = if rotatable(path) { rotate(&root, &pipeline, path, cw) } else { Err("can't be rotated losslessly".to_owned()) };
+            match result {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    log::warn!("rotate {}: {e}", path.display());
+                    failed += 1;
+                    first_error.get_or_insert_with(|| format!("{}: {e}", file_name(path)));
+                }
+            }
+        }
+        log::info!("rotated {done} of {} items {cw}° ({failed} failed)", paths.len());
+        pipeline.recount();
+        let _ = weak.upgrade_in_event_loop(move |ui| match first_error {
+            None => notify(&ui, format!("Rotated {} items", done), false, Vec::new()),
+            Some(e) => notify(&ui, format!("Rotated {done} of {} items; can't rotate {failed} ({e})", done + failed), done == 0, Vec::new()),
         });
     });
 }
@@ -216,7 +287,7 @@ fn pair_with_neighbour(ui: &AppWindow, target: Target, delta: isize) {
     let at = target.scope.current.filter(|&i| paths.get(i) == Some(&target.path));
     let Some(front) = at.and_then(|i| i.checked_add_signed(delta)).and_then(|i| paths.get(i)).cloned() else {
         log::debug!("pair with item {delta:+}: {:?} has no such neighbour in its view", target.path);
-        notify(ui, format!("{} has no {} item in this view", file_name(&target.path), if delta < 0 { "previous" } else { "next" }), true, None);
+        notify(ui, format!("{} has no {} item in this view", file_name(&target.path), if delta < 0 { "previous" } else { "next" }), true, Vec::new());
         return;
     };
     change_pair(ui, target.path, PairChange::BackOf(front));
@@ -259,8 +330,8 @@ fn change_pair(ui: &AppWindow, path: PathBuf, change: PairChange) {
             Err(e) => log::warn!("{change:?} on {}: {e}", path.display()),
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(done) => notify(&ui, done, false, None),
-            Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, None),
+            Ok(done) => notify(&ui, done, false, Vec::new()),
+            Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, Vec::new()),
         });
     });
 }
@@ -273,7 +344,7 @@ fn show_in_folder(ui: &AppWindow, path: PathBuf) {
         let result = desktop::show_in_folder(&path);
         log::debug!("show in folder {}: {result:?}", path.display());
         if let Err(e) = result {
-            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, None));
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, Vec::new()));
         }
     });
 }
@@ -283,74 +354,130 @@ fn open_externally(ui: &AppWindow, path: PathBuf) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         if let Err(e) = desktop::open(&path) {
-            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't open {}: {e}", file_name(&path)), true, None));
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't open {}: {e}", file_name(&path)), true, Vec::new()));
         }
     });
 }
 
-/// Moves the item (and its back, if it is a front) to the library's trash.
-fn delete(ui: &AppWindow, path: PathBuf) {
+/// Moves the items (and their backs, if they are fronts) to the library's trash; one notice
+/// whose Undo restores all of them.
+fn delete(ui: &AppWindow, paths: Vec<PathBuf>) {
     let Some((root, pipeline)) = context() else { return };
     let weak = ui.as_weak();
     thread::spawn(move || {
-        let result = open(&root).and_then(|mut catalog| {
-            let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
-            let trashed = ops::delete(&mut catalog, asset).map_err(|e| e.to_string())?;
-            for t in &trashed {
-                pipeline::changed(&t.original, false);
+        let result = open(&root).map(|mut catalog| {
+            let (mut assets, mut errors) = (Vec::new(), Vec::new());
+            for path in &paths {
+                match catalog.asset(path) {
+                    Ok(asset) => assets.push(asset),
+                    Err(e) => errors.push(format!("{}: {e}", file_name(path))),
+                }
             }
-            Ok((asset, trashed.len()))
+            let (mut trashed, mut files) = (Vec::new(), 0);
+            for (asset, result) in ops::delete_all(&mut catalog, &assets) {
+                match result {
+                    Ok(items) => {
+                        for t in &items {
+                            pipeline::changed(&t.original, false);
+                        }
+                        if !items.is_empty() {
+                            trashed.push(asset);
+                            files += items.len();
+                        }
+                    }
+                    Err(e) => errors.push(format!("{}: {e}", catalog.asset_path(asset).map(|p| file_name(&p)).unwrap_or_default())),
+                }
+            }
+            (trashed, files, errors)
         });
         pipeline.recount();
         match &result {
-            Ok((asset, n)) => log::info!("deleted {} (asset {}, {n} files to the trash)", path.display(), asset.0),
-            Err(e) => log::warn!("delete {}: {e}", path.display()),
-        }
-        let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok((asset, n)) => {
-                let what = if n > 1 { format!("{} and its back", file_name(&path)) } else { file_name(&path) };
-                notify(&ui, format!("Moved {what} to the trash"), false, Some(asset));
+            Ok((trashed, files, errors)) => {
+                log::info!("deleted {} of {} items ({files} files to the trash){}", trashed.len(), paths.len(), if errors.is_empty() { String::new() } else { format!("; failed: {errors:?}") })
             }
-            Err(e) => notify(&ui, format!("Can't delete {}: {e}", file_name(&path)), true, None),
+            Err(e) => log::warn!("delete {} items: {e}", paths.len()),
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let (trashed, files, errors) = match result {
+                Ok(done) => done,
+                Err(e) => return notify(&ui, format!("Can't delete: {e}"), true, Vec::new()),
+            };
+            let what = match (paths.as_slice(), trashed.len()) {
+                ([path], _) if files > 1 => format!("{} and its back", file_name(path)),
+                ([path], _) => file_name(path),
+                (_, n) if files > n => format!("{n} items (and {} backs)", files - n),
+                (_, n) => format!("{n} items"),
+            };
+            match errors.first() {
+                None => notify(&ui, format!("Moved {what} to the trash"), false, trashed),
+                Some(e) if trashed.is_empty() => notify(&ui, format!("Can't delete {e}"), true, Vec::new()),
+                Some(e) => notify(&ui, format!("Moved {what} to the trash; {} not ({e})", errors.len()), false, trashed),
+            }
         });
     });
 }
 
 /// Restores what the notice's Undo refers to.
 fn undo(ui: &AppWindow) {
-    let Some((Some(asset), (root, _))) = with_state(|s| s.undo.take()).zip(context()) else { return };
+    let Some((assets, (root, _))) = with_state(|s| std::mem::take(&mut s.undo)).zip(context()) else { return };
+    if assets.is_empty() {
+        return;
+    }
     hide_notice(ui);
     let weak = ui.as_weak();
     thread::spawn(move || {
-        let result = open(&root).and_then(|mut catalog| catalog.restore(asset).map_err(|e| e.to_string()));
+        let result = open(&root).map(|mut catalog| {
+            let (mut restored, mut errors) = (Vec::new(), Vec::new());
+            for (asset, result) in ops::restore_all(&mut catalog, &assets) {
+                match result {
+                    Ok(paths) => restored.extend(paths),
+                    Err(e) => {
+                        log::warn!("undo: restore asset {}: {e}", asset.0);
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+            (restored, errors)
+        });
         match &result {
-            Ok(paths) => log::info!("undo: restored asset {} ({paths:?})", asset.0),
-            Err(e) => log::warn!("undo: restore asset {}: {e}", asset.0),
+            Ok((paths, errors)) => log::info!("undo: restored {} assets ({} files), {} failed", assets.len() - errors.len(), paths.len(), errors.len()),
+            Err(e) => log::warn!("undo: restore {} assets: {e}", assets.len()),
         }
-        if let Ok(paths) = &result {
+        if let Ok((paths, _)) = &result {
             for path in paths {
                 pipeline::changed(path, false);
             }
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(paths) => notify(&ui, format!("Restored {}", paths.first().map(|p| file_name(p)).unwrap_or_default()), false, None),
-            Err(e) => notify(&ui, format!("Can't restore: {e}"), true, None),
+            Ok((paths, errors)) => {
+                let what = match assets.len() - errors.len() {
+                    1 => paths.first().map(|p| file_name(p)).unwrap_or_default(),
+                    n => format!("{n} items"),
+                };
+                match errors.first() {
+                    None => notify(&ui, format!("Restored {what}"), false, Vec::new()),
+                    Some(e) if paths.is_empty() => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
+                    Some(e) => notify(&ui, format!("Restored {what}; {} not ({e})", errors.len()), true, Vec::new()),
+                }
+            }
+            Err(e) => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
         });
     });
 }
 
-/// Shows `text` in the notice at the bottom of the window, with Undo restoring `undo` from
-/// the trash.
-pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: Option<AssetId>) {
-    log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if undo.is_some() { " [Undo]" } else { "" });
+/// Shows `text` in the notice at the bottom of the window, with Undo restoring `undo` (if
+/// any) from the trash.
+pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: Vec<AssetId>) {
+    log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if undo.is_empty() { String::new() } else { format!(" [Undo: {} assets]", undo.len()) });
     let menu = ui.global::<ItemMenu>();
     menu.set_notice(text.into());
     menu.set_notice_error(error);
-    menu.set_notice_action(if undo.is_some() { "Undo".into() } else { SharedString::default() });
+    menu.set_notice_action(if undo.is_empty() { SharedString::default() } else { "Undo".into() });
     let weak = ui.as_weak();
+    let stay = if undo.is_empty() { NOTICE_FOR } else { UNDO_FOR };
     with_state(|s| {
         s.undo = undo;
-        s.notice_timer.start(TimerMode::SingleShot, if undo.is_some() { UNDO_FOR } else { NOTICE_FOR }, move || {
+        s.notice_timer.start(TimerMode::SingleShot, stay, move || {
             if let Some(ui) = weak.upgrade() {
                 hide_notice(&ui);
             }
@@ -363,21 +490,26 @@ fn hide_notice(ui: &AppWindow) {
     menu.set_notice(SharedString::default());
     menu.set_notice_action(SharedString::default());
     with_state(|s| {
-        s.undo = None;
+        s.undo.clear();
         s.notice_timer.stop();
     });
 }
 
-fn open_tag_dialog(ui: &AppWindow, path: PathBuf) {
+/// Opens the Add tag dialog for `paths` (one item, or a multi-selection).
+fn open_tag_dialog(ui: &AppWindow, paths: Vec<PathBuf>) {
     let Some((root, _)) = context() else { return };
-    log::debug!("tag dialog: open for {}", path.display());
+    let shown = match paths.as_slice() {
+        [path] => file_name(path),
+        _ => format!("{} items", paths.len()),
+    };
+    log::debug!("tag dialog: open for {shown} ({:?}{})", paths.first(), if paths.len() > 1 { ", …" } else { "" });
     let menu = ui.global::<ItemMenu>();
-    menu.set_tag_for(file_name(&path).into());
+    menu.set_tag_for(shown.into());
     menu.set_tag_matches(ModelRc::default());
     menu.set_tag_error(SharedString::default());
     menu.set_tag_working(false);
     menu.set_tag_open(true);
-    with_state(|s| s.tagging = Some(path));
+    with_state(|s| s.tagging = paths);
     let weak = ui.as_weak();
     thread::spawn(move || {
         let tags = open(&root).and_then(|c| c.all_tags().map_err(|e| e.to_string())).unwrap_or_else(|e| {
@@ -418,10 +550,11 @@ fn offer_tags(ui: &AppWindow, text: &str) {
 }
 
 fn add_tag(ui: &AppWindow, text: &str) {
-    let Some((Some(path), (root, _))) = with_state(|s| s.tagging.clone()).zip(context()) else {
+    let Some((paths, (root, _))) = with_state(|s| s.tagging.clone()).zip(context()) else { return };
+    if paths.is_empty() {
         log::debug!("add tag {text:?}: no item being tagged - ignored");
         return;
-    };
+    }
     if text.is_empty() {
         log::debug!("add tag: empty - ignored");
         return;
@@ -430,16 +563,22 @@ fn add_tag(ui: &AppWindow, text: &str) {
     menu.set_tag_working(true);
     let (text, weak) = (text.to_owned(), ui.as_weak());
     thread::spawn(move || {
-        let result = open(&root).and_then(|catalog| {
-            let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
-            ops::add_tag(&catalog, asset, &text).map_err(|e| e.to_string())
+        let result = open(&root).and_then(|mut catalog| {
+            let assets = paths.iter().map(|p| catalog.asset(p)).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            match assets.as_slice() {
+                [asset] => ops::add_tag(&catalog, *asset, &text),
+                _ => ops::add_tag_all(&mut catalog, &assets, &text),
+            }
+            .map_err(|e| e.to_string())
         });
         match &result {
-            Ok(_) => log::info!("tagged {}: {text:?}", path.display()),
-            Err(e) => log::warn!("tag {} {text:?}: {e}", path.display()),
+            Ok(_) => log::info!("tagged {} items ({:?}…): {text:?}", paths.len(), paths[0]),
+            Err(e) => log::warn!("tag {} items ({:?}…) {text:?}: {e}", paths.len(), paths[0]),
         }
         if result.is_ok() {
-            pipeline::changed(&path, false);
+            for path in &paths {
+                pipeline::changed(path, false);
+            }
         }
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let menu = ui.global::<ItemMenu>();
@@ -447,9 +586,13 @@ fn add_tag(ui: &AppWindow, text: &str) {
             match result {
                 Ok(_) => {
                     menu.set_tag_open(false);
-                    with_state(|s| s.tagging = None);
+                    with_state(|s| s.tagging.clear());
                     let (_, shown) = ops::parse_tag(&text);
-                    notify(&ui, format!("Tagged {}: {}", file_name(&path), shown.replace('|', " / ")), false, None);
+                    let what = match paths.as_slice() {
+                        [path] => file_name(path),
+                        _ => format!("{} items", paths.len()),
+                    };
+                    notify(&ui, format!("Tagged {what}: {}", shown.replace('|', " / ")), false, Vec::new());
                 }
                 Err(e) => menu.set_tag_error(e.into()),
             }
