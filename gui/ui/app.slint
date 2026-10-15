@@ -18,6 +18,7 @@ export component AppWindow inherits Window {
     in-out property <int> page: 0;
 
     title: "Archive Studio";
+    full-screen <=> DetailsBridge.fullscreen;
     icon: @image-url("icons/app.svg");
     preferred-width: 1280px;
     preferred-height: 820px;
@@ -74,6 +75,10 @@ export component AppWindow inherits Window {
                 }
             }
             MenuItem {
+                title: "Show in folder";
+                activated => { ItemMenu.action("show-in-folder"); }
+            }
+            MenuItem {
                 title: "Properties";
                 activated => { ItemMenu.action("properties"); }
             }
@@ -120,12 +125,13 @@ export component AppWindow inherits Window {
                 reject
             }
 
+            // Full screen (Details), the page alone.
             HorizontalLayout {
-                Sidebar {
+                if !DetailsBridge.fullscreen: Sidebar {
                     active: root.page;
                     navigate(i) => { NavBridge.navigate(i); }
                 }
-                Rectangle { width: 1px; background: Theme.border; }
+                if !DetailsBridge.fullscreen: Rectangle { width: 1px; background: Theme.border; }
 
                 // Every page stays alive so device previews keep running and each grid keeps its
                 // scroll position, filters and selection while another page is shown.
@@ -138,15 +144,16 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if LogBridge.open: LogPanel { window-height: root.height; }
-        StatusBar { }
+        if LogBridge.open && !DetailsBridge.fullscreen: LogPanel { window-height: root.height; }
+        if !DetailsBridge.fullscreen: StatusBar { }
     }
 
     pure function key-name(text: string) -> string {
         return text == Key.Escape ? "Esc" : text == Key.Return ? "Enter" : text == Key.Tab ? "Tab"
             : text == Key.LeftArrow ? "Left" : text == Key.RightArrow ? "Right"
             : text == Key.UpArrow ? "Up" : text == Key.DownArrow ? "Down"
-            : text == Key.Backspace ? "Backspace" : text == Key.Delete ? "Delete" : "\"\{text}\"";
+            : text == Key.Backspace ? "Backspace" : text == Key.Delete ? "Delete" : text == Key.F11 ? "F11"
+            : text == Key.Space ? "Space" : "\"\{text}\"";
     }
 
     if ItemMenu.notice != "": Notice {

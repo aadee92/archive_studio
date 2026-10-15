@@ -43,6 +43,8 @@ tag PATH [KIND:]TAG        add a tag (KIND: keyword, scene, object, person, plac
 untag PATH [KIND:]TAG      remove a tag (a bare NAME can be a person; a person tag also
                            un-names their faces there)
 props PATH                 everything known about a file
+open PATH                  open the file in its default application
+reveal PATH                show the file in the file manager (its folder, file selected)
 pair PATH                  the file's front or back
 pair FRONT BACK            pair a back with its front by hand (replaces their old pairs)
 unpair PATH                take the file out of its front/back pair
@@ -301,6 +303,8 @@ impl Shell {
             "tag" => self.tag(rest),
             "untag" => self.untag(rest),
             "props" => self.props(rest),
+            "open" => self.open(rest),
+            "reveal" => self.reveal(rest),
             "pair" => self.pair(rest),
             "unpair" => self.unpair(rest),
             "swap-sides" => self.swap_sides(rest),
@@ -594,6 +598,20 @@ impl Shell {
         let asset = self.asset(path)?;
         if !ops::remove_tag(&mut self.catalog, asset, &words.join(" ")).map_err(err)? {
             return Err("the file has no such tag".into());
+        }
+        Ok(())
+    }
+
+    fn open(&self, args: &[&str]) -> Result<(), String> {
+        let [path] = args else { return Err("open PATH".into()) };
+        archive_core::desktop::open(&self.resolve(path))
+    }
+
+    fn reveal(&self, args: &[&str]) -> Result<(), String> {
+        let [path] = args else { return Err("reveal PATH".into()) };
+        match archive_core::desktop::show_in_folder(&self.resolve(path))? {
+            archive_core::desktop::Shown::Selected => {}
+            archive_core::desktop::Shown::Folder => println!("opened its folder (no file manager on D-Bus to select it)"),
         }
         Ok(())
     }

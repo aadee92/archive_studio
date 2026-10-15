@@ -45,6 +45,12 @@
 //! ([`data_changed`], from the pipeline relay), as is the other side of the photo, so a
 //! pairing made from the item menu shows at once.
 //!
+//! Keys on the page (see `details.slint`) reach the same actions as its buttons and the item
+//! menu: R / Shift+R (L) rotate, Enter accepts a proposed rotation, Delete and T go through
+//! [`actions::act`] for the shown item, F flips, B / N toggle boxes and names, Space runs a
+//! slideshow (the page's own timer stepping through the scope), F11 full screen. After the
+//! shown item is deleted, the next item of the scope is shown ([`files_gone`]).
+//!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
 //! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
 //! engine if it runs here, else the core directly). That can take a second (the file is
@@ -216,12 +222,13 @@ static OWN_FACE_MODELS: OnceLock<Option<Arc<Faces>>> = OnceLock::new();
 pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     CONTEXT.set(Some(Context { root, pipeline }));
     let details = ui.global::<DetailsBridge>();
-    details.on_open_external(|| {
-        SHOWN.with_borrow(|shown| {
-            if let Some(path) = shown.path() {
-                let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-            }
-        })
+    let weak = ui.as_weak();
+    details.on_item_action(move |action| {
+        let target = SHOWN.with_borrow(|shown| shown.target.clone()).map(|target| Target { face: None, ..target });
+        log::debug!("details: {action:?} on the item shown");
+        if let (Some(ui), Some(target)) = (weak.upgrade(), target) {
+            actions::act(&ui, &action, target);
+        }
     });
     let weak = ui.as_weak();
     details.on_accept(move || ask(&weak, Action::Accept));
@@ -484,9 +491,9 @@ fn locate(target: &mut Target) {
 }
 
 /// Shows the item `delta` items on in the scope, skipping files gone meanwhile; nothing at
-/// either end.
-fn step(ui: &AppWindow, delta: i32) {
-    let Some(scope) = SHOWN.with_borrow(|shown| shown.target.as_ref().map(|t| t.scope.clone())) else { return };
+/// either end (false).
+fn step(ui: &AppWindow, delta: i32) -> bool {
+    let Some(scope) = SHOWN.with_borrow(|shown| shown.target.as_ref().map(|t| t.scope.clone())) else { return false };
     let paths = scope.paths();
     let n = paths.len() as i64;
     let mut i = match scope.current {
@@ -499,9 +506,10 @@ fn step(ui: &AppWindow, delta: i32) {
     }
     if !(0..n).contains(&i) {
         log::debug!("details: step {delta:+} from {:?}: at the end of {n} items", scope.current);
-        return;
+        return false;
     }
     go_to(ui, i as usize);
+    true
 }
 
 /// Shows item `i` of the scope in place of the shown one (no history).
@@ -698,9 +706,10 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
     }
 }
 
-/// Files that left the library (e.g. to the trash): if it is the item shown, the page goes
-/// back to where it was opened from (or shows nothing); the other side and the similar
-/// strip drop it.
+/// Files that left the library (e.g. to the trash): if it is the item shown, the page shows
+/// the next item of its scope still there (the previous one at the end), else goes back to
+/// where it was opened from (or shows nothing); the other side and the similar strip drop
+/// it.
 pub fn files_gone(ui: &AppWindow, gone: &[PathBuf]) {
     if gone.is_empty() {
         return;
@@ -715,7 +724,9 @@ pub fn files_gone(ui: &AppWindow, gone: &[PathBuf]) {
     });
     if this {
         log::debug!("details: the item shown left the library (page {})", ui.get_page());
-        if ui.get_page() == nav::DETAILS && nav::can_go_back(ui) {
+        if ui.get_page() == nav::DETAILS && (step(ui, 1) || step(ui, -1)) {
+            log::debug!("details: showing the next item of the scope instead");
+        } else if ui.get_page() == nav::DETAILS && nav::can_go_back(ui) {
             nav::back(ui);
         } else {
             clear(ui);

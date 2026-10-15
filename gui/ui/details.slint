@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
@@ -133,7 +133,12 @@ export global DetailsBridge {
     callback info-tag-edited(string);
     callback info-tag-submit(string);
 
-    callback open-external();
+    // An item menu action on the item shown (`ItemMenu.action` names: "delete", "tag",
+    // "show-in-folder", "open-external"), for the buttons and keys here.
+    callback item-action(string);
+    // The window is full screen with only the page's own chrome (sidebar, status bar and
+    // the bottom bar hidden); F11 or the button toggles it, Esc or leaving the page ends it.
+    in-out property <bool> fullscreen;
     callback accept();
     callback keep();
     callback rotate(int);   // degrees clockwise
@@ -228,8 +233,12 @@ component FaceBox inherits Rectangle {
 
 component IconButton inherits Rectangle {
     in property <image> icon;
+    in property <string> label;
     callback clicked;
 
+    accessible-role: button;
+    accessible-label: self.label;
+    accessible-action-default => { self.clicked(); }
     width: 32px;
     height: 32px;
     border-radius: Theme.radius;
@@ -955,6 +964,8 @@ export component DetailsPage inherits Rectangle {
             keys.focus();
         } else {
             self.fit();
+            self.slideshow = false;
+            DetailsBridge.fullscreen = false;
             DetailsBridge.adding = false;
             if (DetailsBridge.editing >= 0) {
                 DetailsBridge.edit-cancel();
@@ -979,6 +990,41 @@ export component DetailsPage inherits Rectangle {
     changed zoom-now => { self.zoom-label = self.zoom-now; }
     property <string> shown-path: DetailsBridge.path;
     changed shown-path => { self.fit(); }
+
+    // Slideshow: the next item of the view every few seconds (after the last, the first);
+    // any key or click stops it. Stepping prefetches the next pictures as Right does.
+    property <bool> slideshow;
+    property <int> slideshow-seconds: 5;
+    function toggle-slideshow() {
+        self.slideshow = !self.slideshow && DetailsBridge.scope-count > 1;
+        UiLog.debug("details", "slideshow \{self.slideshow ? "started (every \{self.slideshow-seconds} s)" : "stopped"}");
+        if (self.slideshow) {
+            self.fit();
+        }
+    }
+    Timer {
+        interval: root.slideshow-seconds * 1s;
+        running: root.slideshow && root.visible && DetailsBridge.scope-count > 1;
+        triggered => {
+            if (DetailsBridge.scope-index >= 0 && DetailsBridge.scope-index + 1 < DetailsBridge.scope-count) {
+                DetailsBridge.step(1);
+            } else {
+                DetailsBridge.go-to(0);
+            }
+        }
+    }
+    function toggle-fullscreen() {
+        DetailsBridge.fullscreen = !DetailsBridge.fullscreen;
+        UiLog.debug("details", "full screen \{DetailsBridge.fullscreen ? "on" : "off"}");
+    }
+
+    // The tag dialog (T) closed: the keys are the page's again.
+    property <bool> tag-open: ItemMenu.tag-open;
+    changed tag-open => {
+        if (!self.tag-open && self.visible) {
+            keys.focus();
+        }
+    }
 
     // The face popup closed: the keys are the page's again.
     property <int> editing: DetailsBridge.editing;
@@ -1031,7 +1077,12 @@ export component DetailsPage inherits Rectangle {
     keys := FocusScope {
         changed has-focus => { UiLog.debug("details", "keyboard focus \{self.has-focus ? "taken" : "lost"} (page visible \{root.visible ? "yes" : "no"})"); }
         key-pressed(event) => {
-            // Esc ends "Add face", or closes a face's popup, before it goes back.
+            // Any key stops a slideshow, and does nothing else.
+            if (root.slideshow) {
+                root.toggle-slideshow();
+                return accept;
+            }
+            // Esc ends "Add face", closes a face's popup or leaves full screen before it goes back.
             if (event.text == Key.Escape && DetailsBridge.adding) {
                 UiLog.debug("details", "Esc: stop adding a face");
                 DetailsBridge.adding = false;
@@ -1040,6 +1091,15 @@ export component DetailsPage inherits Rectangle {
             if (event.text == Key.Escape && DetailsBridge.editing >= 0) {
                 UiLog.debug("details", "Esc: close the face popup");
                 DetailsBridge.edit-cancel();
+                return accept;
+            }
+            if (event.text == Key.Escape && DetailsBridge.fullscreen) {
+                UiLog.debug("details", "Esc: leave full screen");
+                DetailsBridge.fullscreen = false;
+                return accept;
+            }
+            if (event.text == Key.F11) {
+                root.toggle-fullscreen();
                 return accept;
             }
             if (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
@@ -1052,6 +1112,49 @@ export component DetailsPage inherits Rectangle {
                 DetailsBridge.info-open = !DetailsBridge.info-open;
                 DetailsBridge.info-toggled();
                 return accept;
+            }
+            // The item's actions, as the buttons and the item menu do them (not while a face
+            // is being named or drawn).
+            if (DetailsBridge.has-item && DetailsBridge.editing < 0 && !DetailsBridge.adding
+                && !event.modifiers.alt && !event.modifiers.control) {
+                // R turns right, Shift+R or L left.
+                if ((event.text == "r" || event.text == "R" || event.text == "l" || event.text == "L") && DetailsBridge.is-image) {
+                    if (!DetailsBridge.working) {
+                        DetailsBridge.rotate(event.text == "r" ? 90 : 270);
+                    }
+                    return accept;
+                }
+                // Enter accepts the rotation the pipeline proposes.
+                if (event.text == Key.Return && DetailsBridge.review-cw != 0 && PipelineBridge.running) {
+                    if (!DetailsBridge.working) {
+                        DetailsBridge.accept();
+                    }
+                    return accept;
+                }
+                if (event.text == Key.Delete) {
+                    DetailsBridge.item-action("delete");
+                    return accept;
+                }
+                if (event.text == "t" || event.text == "T") {
+                    DetailsBridge.item-action("tag");
+                    return accept;
+                }
+                if ((event.text == "f" || event.text == "F") && DetailsBridge.other-side != "") {
+                    DetailsBridge.flip();
+                    return accept;
+                }
+                if ((event.text == "b" || event.text == "B") && DetailsBridge.is-image) {
+                    DetailsBridge.show-boxes = !DetailsBridge.show-boxes;
+                    return accept;
+                }
+                if ((event.text == "n" || event.text == "N") && DetailsBridge.is-image) {
+                    DetailsBridge.show-names = !DetailsBridge.show-names;
+                    return accept;
+                }
+                if (event.text == Key.Space && DetailsBridge.scope-count > 1) {
+                    root.toggle-slideshow();
+                    return accept;
+                }
             }
             // Zoom: + / - around the center, 0 fits, 1 shows the file's pixels 1:1.
             if (DetailsBridge.image-ready && !event.modifiers.alt) {
@@ -1099,7 +1202,8 @@ export component DetailsPage inherits Rectangle {
 
         VerticalLayout {
             padding: 20px;
-            padding-bottom: 0px;
+            // The bottom bar's own height pads it, unless it is hidden (full screen).
+            padding-bottom: DetailsBridge.fullscreen ? 20px : 0px;
             spacing: 14px;
 
             HorizontalLayout {
@@ -1139,9 +1243,33 @@ export component DetailsPage inherits Rectangle {
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.rotate(90); }
                     }
+                    // A slideshow through the view, every 3, 5 or 10 s.
+                    if DetailsBridge.scope-count > 1: IconButton {
+                        icon: root.slideshow ? @image-url("icons/stop.svg") : @image-url("icons/play.svg");
+                        label: root.slideshow ? "Stop slideshow" : "Slideshow";
+                        clicked => { root.toggle-slideshow(); }
+                    }
+                    if DetailsBridge.scope-count > 1: ComboBox {
+                        width: 76px;
+                        model: ["3 s", "5 s", "10 s"];
+                        current-index: 1;
+                        selected => {
+                            root.slideshow-seconds = [3, 5, 10][self.current-index];
+                            keys.focus();
+                        }
+                    }
+                    IconButton {
+                        icon: DetailsBridge.fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                        label: DetailsBridge.fullscreen ? "Leave full screen" : "Full screen";
+                        clicked => { root.toggle-fullscreen(); }
+                    }
+                    Button {
+                        text: "Show in folder";
+                        clicked => { DetailsBridge.item-action("show-in-folder"); }
+                    }
                     Button {
                         text: "Open externally";
-                        clicked => { DetailsBridge.open-external(); }
+                        clicked => { DetailsBridge.item-action("open-external"); }
                     }
                 }
             }
@@ -1230,7 +1358,7 @@ export component DetailsPage inherits Rectangle {
             // Highly similar items among those of the view this one was opened from.
             if DetailsBridge.similar.length > 0: SimilarStrip { }
 
-            HorizontalLayout {
+            if !DetailsBridge.fullscreen: HorizontalLayout {
                 height: 34px;
                 spacing: 8px;
                 Text {
@@ -1334,6 +1462,15 @@ export component DetailsPage inherits Rectangle {
             y: self.below + self.height <= self.bottom ? self.below
                 : self.above >= self.top ? self.above
                 : Math.max(self.top, self.bottom - self.height);
+        }
+    }
+
+    // While a slideshow runs, a click anywhere stops it (and does nothing else).
+    if root.slideshow: TouchArea {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.toggle-slideshow();
+            }
         }
     }
 

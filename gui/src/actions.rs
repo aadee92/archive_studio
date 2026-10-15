@@ -1,17 +1,18 @@
 //! The item context menu: Rotate left / right, Add tag…, front and back (pair as the back of
-//! the previous / next item of the view, swap, unpair), Properties, Delete, for any item
-//! a page shows (a Review tile, a face in People, a recent capture in Acquire, the Details
-//! picture and its similar strip). Pages resolve the item under the pointer and call
-//! [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the menu
-//! itself is a `ContextMenuArea` in `app.slint`, shown where the pointer was.
+//! the previous / next item of the view, swap, unpair), Show in folder, Properties, Delete,
+//! for any item a page shows (a Review tile, a face in People, a recent capture in Acquire,
+//! the Details picture and its similar strip). Pages resolve the item under the pointer and
+//! call [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the
+//! menu itself is a `ContextMenuArea` in `app.slint`, shown where the pointer was. Details'
+//! keyboard shortcuts (Delete, T) go through [`act`] too.
 //!
 //! Every action is an [`archive_core::ops`] call, run on a worker: rotating goes to the
 //! pipeline's engine if it runs in this window (else straight to the core), deleting moves
 //! to the library's trash (undoable from the notice), tagging takes what the user typed
 //! ([`ops::add_tag`]), pairing goes through [`ops::pair`] / [`ops::swap_sides`] /
-//! [`ops::unpair`]. What changed is reported with [`pipeline::changed`], which refreshes
-//! every view showing it, as for the engine's own reports (Details' dog-ear and "Front &
-//! back" follow a pairing that way).
+//! [`ops::unpair`]; showing in the file manager is [`desktop::show_in_folder`]. What changed
+//! is reported with [`pipeline::changed`], which refreshes every view showing it, as for the
+//! engine's own reports (Details' dog-ear and "Front & back" follow a pairing that way).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use crate::pipeline::{self, Handle};
 use crate::review::human_size;
 use crate::{AppWindow, ItemMenu, PropRow};
 use archive_core::catalog::{AssetId, Catalog, Source};
+use archive_core::desktop;
 use archive_core::media::{classify, MediaKind};
 use archive_core::ops::{self, Properties};
 
@@ -161,13 +163,16 @@ fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-fn act(ui: &AppWindow, action: &str, target: Target) {
+/// Does `action` (an `ItemMenu.action` name) to `target`; also how Details' keys reach them.
+pub(crate) fn act(ui: &AppWindow, action: &str, target: Target) {
     match action {
         "rotate-left" => rotate_item(ui, target.path, 270),
         "rotate-right" => rotate_item(ui, target.path, 90),
         "delete" => delete(ui, target.path),
         "tag" => open_tag_dialog(ui, target.path),
         "properties" => properties(ui, target.path),
+        "show-in-folder" => show_in_folder(ui, target.path),
+        "open-external" => open_externally(ui, target.path),
         "pair-prev" => pair_with_neighbour(ui, target, -1),
         "pair-next" => pair_with_neighbour(ui, target, 1),
         "swap-sides" => change_pair(ui, target.path, PairChange::Swap),
@@ -257,6 +262,29 @@ fn change_pair(ui: &AppWindow, path: PathBuf, change: PairChange) {
             Ok(done) => notify(&ui, done, false, None),
             Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, None),
         });
+    });
+}
+
+/// Shows the item in the file manager, selected if it can ([`desktop::show_in_folder`]
+/// waits for the file manager's answer: on a worker).
+fn show_in_folder(ui: &AppWindow, path: PathBuf) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let result = desktop::show_in_folder(&path);
+        log::debug!("show in folder {}: {result:?}", path.display());
+        if let Err(e) = result {
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, None));
+        }
+    });
+}
+
+/// Opens the item in the desktop's default application for it.
+fn open_externally(ui: &AppWindow, path: PathBuf) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        if let Err(e) = desktop::open(&path) {
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't open {}: {e}", file_name(&path)), true, None));
+        }
     });
 }
 

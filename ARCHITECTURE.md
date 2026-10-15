@@ -16,7 +16,7 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties). `exif`: basic EXIF fields |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
 | `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces (name, not, ignore, delete-face, add-face), tags (tag, untag), front/back (pair, unpair, swap-sides), find by description |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |

@@ -8,6 +8,7 @@
 //! - [`catalog`]: the library database of assets and their tags, and tag search.
 //! - [`media`]: media kinds and file classification.
 //! - [`ops`]: what a front end does to one asset (rotate, delete to the trash, properties).
+//! - [`desktop`]: handing a file to the desktop (open it, show it in the file manager).
 //! - [`exif`]: the basic EXIF fields.
 //! - [`pipeline`]: what happens to files in the library (orient, faces, identify, sidecars),
 //!   run by an [`Engine`](pipeline::Engine) thread while a front end is open.
@@ -15,6 +16,7 @@
 //! See `ARCHITECTURE.md` at the repository root for the layering rule.
 
 pub mod catalog;
+pub mod desktop;
 pub mod device;
 pub mod devices;
 pub mod exif;
