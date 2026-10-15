@@ -86,8 +86,9 @@ enum Change {
 struct FaceGrid {
     ui: slint::Weak<AppWindow>,
     root: PathBuf,
-    /// The UI thread's connection, for crops.
-    catalog: Option<Catalog>,
+    /// The UI thread's connection, for crops: opened on a worker (opening can wait out a
+    /// migration), so `None` until it lands.
+    catalog: RefCell<Option<Catalog>>,
     faces: RefCell<Vec<FaceRef>>,
     columns: Cell<usize>,
     crops: RefCell<HashMap<FaceId, Image>>,
@@ -146,11 +147,23 @@ fn with_grid(f: impl FnOnce(&Rc<FaceGrid>)) {
 }
 
 pub fn install(ui: &AppWindow, root: PathBuf) {
-    let catalog = Catalog::open(&Catalog::default_path(&root), &root).ok();
+    let open = root.clone();
+    let _ = thread::Builder::new().name("people-catalog".into()).spawn(move || {
+        let catalog = Catalog::open(&Catalog::default_path(&open), &open)
+            .inspect_err(|e| log::warn!("people: no catalog for face crops: {e}"))
+            .ok();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_grid(|g| {
+                *g.catalog.borrow_mut() = catalog;
+                // Rows drawn so far had no crops.
+                g.notify.reset();
+            })
+        });
+    });
     let grid = Rc::new(FaceGrid {
         ui: ui.as_weak(),
         root: root.clone(),
-        catalog,
+        catalog: RefCell::default(),
         faces: RefCell::default(),
         columns: Cell::new(1),
         crops: RefCell::default(),
@@ -698,7 +711,7 @@ impl FaceGrid {
         if let Some(image) = self.crops.borrow().get(&id) {
             return Some(image.clone());
         }
-        let jpeg = self.catalog.as_ref()?.face_crop(id).ok()??;
+        let jpeg = self.catalog.borrow().as_ref()?.face_crop(id).ok()??;
         let rgb = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()?.to_rgb8();
         let image = Image::from_rgb8(Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
         let mut crops = self.crops.borrow_mut();

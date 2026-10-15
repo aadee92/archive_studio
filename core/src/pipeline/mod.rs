@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! file appears ─ register ─ orient ─┬─ faces ─────┬─ identify (library-wide, when quiet)
-//!                                    └─ signature └─ sync sidecars (when quiet)
+//!                                    ├─ signature └─ sync sidecars (when quiet)
+//!                                    └─ describe
 //! ```
 //!
 //! An [`Engine`] runs the pipeline on a thread for as long as its host (the GUI, the
@@ -21,6 +22,8 @@
 //!   upright).
 //! - **signature**: a perceptual hash and colour histogram for finding near-duplicates
 //!   ([`catalog::similar`]); needs no model.
+//! - **describe**: a CLIP embedding, for search by description ([`catalog::semantic`]), and
+//!   the scene, object and event tags it suggests ([`describe`]).
 //! - **identify**: suggestions from the confirmed faces and clusters of the unknown ones,
 //!   after a batch rather than per face.
 //! - **sync**: tags into XMP sidecars.
@@ -31,6 +34,7 @@
 //! One engine per library at a time: [`Engine::start`] takes a lock in the library's
 //! `.archive-studio` directory, released when the engine (or its process) ends.
 
+pub mod describe;
 pub mod rotate;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,7 +52,7 @@ use notify::{RecursiveMode, Watcher};
 use crate::catalog::faces::{self as catalog_faces, NewFace, DEFAULT_MIN_SIMILARITY};
 use crate::catalog::similar::Signature;
 use crate::catalog::runs::{self, Due, Run, RunCounts, RunStatus, StageQuery};
-use crate::catalog::{AssetId, Catalog, DEFAULT_MIN_CONFIDENCE};
+use crate::catalog::{AssetId, Catalog, Detection, DEFAULT_MIN_CONFIDENCE};
 use crate::media::{classify, MediaKind};
 
 pub const ORIENT: &str = "orient";
@@ -59,6 +63,8 @@ pub const FACES: &str = "faces";
 pub const SIGNATURE: &str = "signature";
 /// Changing how signatures are computed makes every signature run due again.
 pub const SIGNATURE_VERSION: &str = "dhash-hist-v1";
+/// CLIP embeddings and the tags they suggest ([`describe`]).
+pub const DESCRIBE: &str = "describe";
 /// Confidence from which a predicted rotation is applied without asking.
 pub const AUTO_ROTATE: f32 = 0.85;
 
@@ -80,6 +86,8 @@ pub struct Models {
     pub orientation: Option<PathBuf>,
     /// The `buffalo_l` directory (`det_10g.onnx`, `w600k_r50.onnx`).
     pub faces: Option<PathBuf>,
+    /// The `tinyclip-8m` directory (`visual.onnx`, `textual.onnx`).
+    pub describe: Option<PathBuf>,
 }
 
 impl Models {
@@ -97,9 +105,11 @@ impl Models {
         let Some(dir) = Self::dir() else { return Self::default() };
         let orientation = dir.join("orientation.onnx");
         let faces = dir.join("buffalo_l");
+        let describe = dir.join("tinyclip-8m");
         Self {
             orientation: orientation.is_file().then_some(orientation),
             faces: faces.join("det_10g.onnx").is_file().then_some(faces),
+            describe: describe.join("visual.onnx").is_file().then_some(describe),
         }
     }
 }
@@ -187,6 +197,18 @@ fn signature_query(availability: Availability) -> StageQuery<'static> {
 /// keep compiling).
 pub fn signature_status(catalog: &Catalog, availability: Availability) -> crate::catalog::Result<RunCounts> {
     catalog.run_counts(&signature_query(availability))
+}
+
+fn describe_query(availability: Availability) -> StageQuery<'static> {
+    // Upright first: the model sees the picture as it is meant to be seen.
+    let after = availability.orient.then_some(ORIENT);
+    StageQuery { stage: DESCRIBE, version: describe::VERSION, kind: MediaKind::Image, after }
+}
+
+/// How the describe stage stands (kept out of [`Status`], like [`signature_status`]). It
+/// runs when [`Models::describe`] is found and loads.
+pub fn describe_status(catalog: &Catalog, availability: Availability) -> crate::catalog::Result<RunCounts> {
+    catalog.run_counts(&describe_query(availability))
 }
 
 /// Rotates the asset's file `cw` degrees clockwise (90, 180 or 270) as the user's decision,
@@ -379,6 +401,7 @@ enum Stage {
     Orient,
     Faces,
     Signature,
+    Describe,
 }
 
 impl Stage {
@@ -387,6 +410,7 @@ impl Stage {
             Self::Orient => ORIENT,
             Self::Faces => FACES,
             Self::Signature => SIGNATURE,
+            Self::Describe => DESCRIBE,
         }
     }
 }
@@ -406,11 +430,13 @@ enum Outcome {
     Orient(Due, Result<(Prediction, Option<PathBuf>), String>),
     Faces(Due, Result<Vec<NewFace>, String>),
     Signature(Due, Result<Signature, String>),
+    Describe(Due, Result<describe::Description, String>),
 }
 
 struct Loaded {
     orientation: Option<orientation::OrientationDetector>,
     faces: Option<faces::Faces>,
+    describer: Option<describe::Describer>,
 }
 
 struct Workers {
@@ -419,6 +445,8 @@ struct Workers {
     active: Arc<AtomicUsize>,
     threads: usize,
     availability: Availability,
+    /// The describe stage's model loaded.
+    describe: bool,
 }
 
 impl Workers {
@@ -428,8 +456,15 @@ impl Workers {
             orientation::OrientationDetector::new(path).map_err(|e| warn("orientation", &e)).ok()
         });
         let faces = config.models.faces.as_ref().and_then(|dir| faces::Faces::from_dir(dir).map_err(|e| warn("face", &e)).ok());
+        let describer = config.models.describe.as_ref().and_then(|dir| {
+            let started = Instant::now();
+            let describer = describe::Describer::from_dir(dir).map_err(|e| warn("CLIP", &e)).ok();
+            log::debug!("CLIP model and tag vocabulary loaded in {:?}", started.elapsed());
+            describer
+        });
         let availability = Availability { orient: orientation.is_some(), faces: faces.is_some() };
-        let models = Arc::new(Loaded { orientation, faces });
+        let describe = describer.is_some();
+        let models = Arc::new(Loaded { orientation, faces, describer });
 
         let (jobs, receive) = mpsc::channel::<Job>();
         let receive = Arc::new(Mutex::new(receive));
@@ -448,7 +483,7 @@ impl Workers {
                 }
             });
         }
-        Self { jobs, active, threads, availability }
+        Self { jobs, active, threads, availability, describe }
     }
 }
 
@@ -469,6 +504,13 @@ fn work(job: Job, models: &Loaded) -> Outcome {
         Stage::Signature => {
             let result = Signature::of_file(&due.path);
             Outcome::Signature(due, result)
+        }
+        Stage::Describe => {
+            let result = match &models.describer {
+                Some(describer) => describer.describe_file(&due.path),
+                None => Err("no CLIP model".into()),
+            };
+            Outcome::Describe(due, result)
         }
     }
 }
@@ -602,6 +644,7 @@ impl Pipeline {
             Stage::Orient => orient_query(),
             Stage::Faces => faces_query(self.workers.availability),
             Stage::Signature => signature_query(self.workers.availability),
+            Stage::Describe => describe_query(self.workers.availability),
         }
     }
 
@@ -618,7 +661,12 @@ impl Pipeline {
             Mode::Normal => self.workers.threads * 2,
         };
         let availability = self.workers.availability;
-        let stages = [(Stage::Orient, availability.orient), (Stage::Faces, availability.faces), (Stage::Signature, true)];
+        let stages = [
+            (Stage::Orient, availability.orient),
+            (Stage::Faces, availability.faces),
+            (Stage::Signature, true),
+            (Stage::Describe, self.workers.describe),
+        ];
         for (stage, available) in stages {
             if !available {
                 continue;
@@ -756,7 +804,55 @@ impl Pipeline {
                     Err(e) => self.fail(&due, Stage::Signature, e),
                 }
             }
+            Outcome::Describe(due, result) => {
+                self.known.remove(&(due.asset, Stage::Describe));
+                match &result {
+                    Ok(d) => {
+                        let tags: Vec<String> = d.tags.iter().map(|t| format!("{} {:.0}%", t.path, t.confidence * 100.0)).collect();
+                        log::debug!("describe {}: [{}]", due.path.display(), tags.join(", "));
+                    }
+                    Err(e) => log::debug!("describe {}: error {e}", due.path.display()),
+                }
+                if !self.still_current(&due) {
+                    log::debug!("describe {}: file changed meanwhile, result dropped", due.path.display());
+                    return;
+                }
+                match result.and_then(|description| self.store_description(due.asset, &description)) {
+                    Ok(n) => {
+                        let run = Run {
+                            stage: DESCRIBE,
+                            version: describe::VERSION,
+                            input: &due.input,
+                            status: RunStatus::Done,
+                            value: Some(n as i64),
+                            detail: "",
+                        };
+                        self.record(due.asset, &run);
+                        if n > 0 {
+                            self.emit(Event::Updated(due.path));
+                        }
+                    }
+                    Err(e) => self.fail(&due, Stage::Describe, e),
+                }
+            }
         }
+    }
+
+    /// Stores the embedding and replaces the stage's tags on the asset. Returns how many
+    /// tags it proposed.
+    fn store_description(&mut self, asset: AssetId, description: &describe::Description) -> Result<usize, String> {
+        self.catalog.set_image_embedding(asset, clip::MODEL, &description.embedding).map_err(|e| e.to_string())?;
+        let mut found = Vec::new();
+        for tag in &description.tags {
+            // A tag the user already has under that path with another kind keeps theirs.
+            match self.catalog.tag(&tag.path, tag.kind) {
+                Ok(id) => found.push(Detection { tag: id, confidence: tag.confidence, region: None }),
+                Err(crate::catalog::Error::Invalid(e)) => log::debug!("describe: {}: {e}", tag.path),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        self.catalog.set_detections(asset, describe::DETECTOR, &found).map_err(|e| e.to_string())?;
+        Ok(found.len())
     }
 
     fn oriented(&mut self, due: &Due, result: Result<(Prediction, Option<PathBuf>), String>) -> Result<(), String> {
@@ -812,6 +908,7 @@ impl Pipeline {
             Stage::Orient => ORIENT_VERSION,
             Stage::Faces => catalog_faces::MODEL,
             Stage::Signature => SIGNATURE_VERSION,
+            Stage::Describe => describe::VERSION,
         };
         let run = Run { stage: stage.name(), version, input: &due.input, status: RunStatus::Failed, value: None, detail: &error };
         self.record(due.asset, &run);

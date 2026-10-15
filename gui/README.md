@@ -10,9 +10,15 @@ ARCHIVE_STUDIO_MOCK=ff680,vhs,reel,hi8 cargo run        # mixed scanners + video
 
 ## Logs
 
+In the app, click the status bar at the bottom of the window to open the live log: the last
+5000 records (filter by text or level), with what libraries print on stderr as target
+`stderr`. While it is closed, the bar shows the newest record and how many warnings and
+errors came in since it was last open.
+
 Each run writes `<library>/.archive-studio/logs/archive-studio.log` (the previous four runs
-are `archive-studio.log.1` … `.4`; a file is also rotated at 16 MB). It always has this app's
-`debug` lines, whatever stderr shows, so after something odd happened, look there first
+are `archive-studio.log.1` … `.4`; a file is also rotated at 16 MB). It always has `debug`
+lines from the app and its libraries (but tract's model optimizer and nusb's USB transfers,
+which would crowd out everything else), whatever stderr shows, so after something odd happened, look there first
 (`.1` if the app was restarted since). The first lines give the version and commit, the
 library, the log file and the Slint version / display.
 
@@ -64,9 +70,10 @@ install -Dm644 ui/icons/app.svg ~/.local/share/icons/hicolor/scalable/apps/archi
 
 | Path | Role |
 |---|---|
-| `ui/app.slint` | Window: sidebar + page host (pages stay alive when hidden) |
+| `ui/app.slint` | Window: sidebar + page host (pages stay alive when hidden), status bar under every page |
+| `ui/log.slint`, `src/log_view.rs` | The status bar (pipeline state with Pause / Resume, newest log record, unseen warning / error counts) and the log panel it opens above it: follows the newest record until scrolled up, text and level filter, Clear; drag its top edge to resize. Fed from `archive_logging::recent` / `subscribe`, polled on the UI thread every 150 ms |
 | `ui/acquire.slint` | One `DevicePanel` per device, tiled in a near-square grid (1→1×1, 2→2×1, 4→2×2, 6→3×2…) |
-| `ui/review.slint` | Search, kind chips, sort, tag list (`People|Ann` shown as "People / Ann"; picking one filters by it), virtualized thumbnail grid, size slider in the bottom bar |
+| `ui/review.slint` | Search, kind chips, sort, tag list (`People|Ann` shown as "People / Ann"; picking one filters by it), virtualized thumbnail grid, size slider in the bottom bar (the pipeline's state is in the window's status bar) |
 | `ui/people.slint` | People list (Unknown first, then person tags with faces) and the selected person's face crops: click / Shift / Ctrl / drag to select, name box (with matching names) and Ignore above the list. A person's suggested faces come first, highlighted |
 | `ui/details.slint` | One item enlarged; opened by double-clicking a tile in Review, a face in People or a recent capture in Acquire. Back arrow / Esc returns to that view as it was. Face boxes over the picture (placed in displayed-image coordinates) with names under confirmed ones, toggled independently in the bottom bar; a face opened from People pulses 3× over 1.5 s. Rotate left / right, and Accept / Keep for a rotation the pipeline proposes. A two-sided photo (catalog pair, else `-front` / `-back` names) has a turned-down corner that flips to the other side, and a "Front & back" toggle that shows both, front on the left, each with its faces. Under the picture, "Similar in …": up to 12 highly similar items among those of the view it was opened from (`Catalog::similar` on a worker; hidden if none); double-click opens one (Back returns), right-click gives its menu |
 | `ui/menu.slint`, `src/actions.rs` | The item context menu on every picture (Review tiles, People faces, Acquire's recent strip, Details and its similar strip): Rotate left / right, Add tag… (dialog with matching tags from the catalog; `kind:` prefix or `People|…` pick the kind, `ops::add_tag`), Properties (dialog of `ops::properties`), Delete (to the library trash, with Undo in the notice at the bottom). A window-level `ContextMenuArea` that pages show at the pointer through `nav::context_menu`. Each action runs on a worker and reports what it changed with `pipeline::changed`, which refreshes every view |

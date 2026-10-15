@@ -408,7 +408,9 @@ export component PeoplePage inherits Rectangle {
                     overlay := TouchArea {
                         x: list.x;
                         y: list.y;
-                        width: list.visible-width;
+                        // The Fluent scroll bar (14px) is drawn over the list's right edge, not
+                        // beside it: leave it uncovered so it can be clicked and dragged.
+                        width: list.visible-width - (list.content-height > list.visible-height ? 14px : 0px);
                         height: list.visible-height;
 
                         changed mouse-x => { root.track(); }

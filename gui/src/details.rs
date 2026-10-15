@@ -502,7 +502,7 @@ fn load_similar(ui: &AppWindow) {
     });
 }
 
-/// The items among `candidates` highly similar to `path`, best first.
+/// The items among `candidates` from the same scene or event as `path`, best first.
 fn similar(catalog: &Catalog, path: &Path, candidates: &[PathBuf]) -> Vec<(PathBuf, f32)> {
     let Some(asset) = catalog.find_asset(path).ok().flatten() else { return Vec::new() };
     let ids: Vec<_> = candidates.iter().filter_map(|p| catalog.find_asset(p).ok().flatten()).collect();

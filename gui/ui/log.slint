@@ -1,0 +1,294 @@
+// The window-wide status bar and the live log it opens. The bar sits under every page; a
+// click on it shows (or hides) the log panel above it. The log is fed from Rust
+// (`src/log_view.rs`): every record the app and its libraries log, and what they print on
+// stderr, newest last.
+
+import { ListView, LineEdit, ComboBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { PipelineStatus } from "pipeline.slint";
+
+// One log record, one or more lines of `text`.
+export struct LogLine {
+    time: string,     // "11:06:42.315"
+    level: string,    // "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+    target: string,   // module or library, "stderr" for raw output
+    text: string,
+}
+
+export global LogBridge {
+    // The records that pass the filter, oldest first.
+    in property <[LogLine]> lines;
+    // Records held (before the filter) and how many older ones were dropped.
+    in property <int> total;
+    in property <int> dropped;
+    // Warnings and errors logged since the panel was last open.
+    in property <int> unseen-warnings;
+    in property <int> unseen-errors;
+    // The newest record, for the bar while the panel is closed.
+    in property <string> latest;
+
+    in-out property <bool> open;
+    // Bumped by Rust just after opening: the list knows its rows' heights only once they
+    // were drawn, so following goes to the end once more.
+    in property <int> to-end;
+    in-out property <length> panel-height: 280px;
+    // The filter controls (kept here so they survive closing the panel).
+    in-out property <string> filter-text;
+    // 0 everything (trace and up), 1 debug and up, 2 info and up, 3 warnings and errors.
+    in-out property <int> min-level: 0;
+
+    callback filter-changed(string, int);
+    // The panel was opened or closed.
+    callback opened(bool);
+    callback clear();
+}
+
+component BarButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    height: 22px;
+    width: label.preferred-width + 16px;
+    border-radius: 4px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    label := Text {
+        text: root.text;
+        color: ta.has-hover ? Theme.accent : Theme.text-muted;
+        font-size: 12px;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Badge inherits Rectangle {
+    in property <int> count;
+    in property <color> tone;
+    height: 16px;
+    width: Math.max(16px, n.preferred-width + 10px);
+    border-radius: 8px;
+    background: root.tone;
+    n := Text {
+        text: root.count > 999 ? "999+" : root.count;
+        color: white;
+        font-size: 10px;
+        font-weight: 600;
+    }
+}
+
+component LogRow inherits Rectangle {
+    in property <LogLine> line;
+    property <color> tone: line.level == "ERROR" ? Theme.danger
+        : line.level == "WARN" ? #b45309
+        : line.level == "INFO" ? Theme.text
+        : Theme.text-muted;
+
+    background: line.level == "ERROR" ? #dc26260f : line.level == "WARN" ? #f59e0b12 : transparent;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 1px;
+        padding-bottom: 1px;
+        spacing: 10px;
+        Text {
+            width: 84px;
+            text: root.line.time;
+            color: Theme.placeholder;
+            font-family: "monospace";
+            font-size: 11px;
+        }
+        Text {
+            width: 40px;
+            text: root.line.level;
+            color: root.tone;
+            font-family: "monospace";
+            font-size: 11px;
+            font-weight: root.line.level == "ERROR" || root.line.level == "WARN" ? 600 : 400;
+        }
+        Text {
+            width: 150px;
+            text: root.line.target;
+            color: Theme.text-muted;
+            font-family: "monospace";
+            font-size: 11px;
+            overflow: elide;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.line.text;
+            color: root.line.level == "TRACE" || root.line.level == "DEBUG" ? Theme.text-muted : root.tone;
+            font-family: "monospace";
+            font-size: 11px;
+            wrap: char-wrap;
+        }
+    }
+}
+
+// The live log, docked above the status bar. Follows the newest record until scrolled up;
+// scrolling back to the bottom follows again.
+export component LogPanel inherits Rectangle {
+    // The window's height, which bounds dragging the top edge.
+    in property <length> window-height;
+    property <bool> follow: true;
+    property <length> bottom: Math.min(0px, list.visible-height - list.content-height);
+
+    height: LogBridge.panel-height;
+    background: Theme.surface;
+
+    function to-end() {
+        list.content-y = root.bottom;
+    }
+    // New rows (or the list laying them out) grow the content: keep the end in view.
+    changed bottom => {
+        if (root.follow) {
+            root.to-end();
+        }
+    }
+    init => { root.to-end(); }
+    property <int> to-end-serial: LogBridge.to-end;
+    changed to-end-serial => {
+        if (root.follow) {
+            root.to-end();
+        }
+    }
+
+    VerticalLayout {
+        Rectangle { height: 1px; background: Theme.border; }
+        HorizontalLayout {
+            height: 36px;
+            padding-left: 12px;
+            padding-right: 8px;
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: "Log";
+                font-weight: 600;
+                color: Theme.text;
+            }
+            Text {
+                vertical-alignment: center;
+                text: LogBridge.lines.length == LogBridge.total
+                    ? "\{LogBridge.total} records"
+                    : "\{LogBridge.lines.length} of \{LogBridge.total} records";
+                color: Theme.text-muted;
+                font-size: 12px;
+            }
+            if LogBridge.dropped > 0: Text {
+                vertical-alignment: center;
+                text: "· \{LogBridge.dropped} older dropped";
+                color: Theme.placeholder;
+                font-size: 12px;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                LineEdit {
+                    width: 220px;
+                    height: 28px;
+                    placeholder-text: "Filter (text or target)";
+                    text <=> LogBridge.filter-text;
+                    edited(text) => { LogBridge.filter-changed(text, LogBridge.min-level); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                ComboBox {
+                    width: 130px;
+                    height: 28px;
+                    model: ["Everything", "Debug and up", "Info and up", "Warnings"];
+                    current-index <=> LogBridge.min-level;
+                    selected => { LogBridge.filter-changed(LogBridge.filter-text, self.current-index); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton {
+                    text: root.follow ? "Following" : "Follow";
+                    clicked => {
+                        root.follow = true;
+                        root.to-end();
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton { text: "Clear"; clicked => { LogBridge.clear(); } }
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton { text: "Close"; clicked => { LogBridge.open = false; LogBridge.opened(false); } }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.border; }
+        list := ListView {
+            vertical-stretch: 1;
+            for line in LogBridge.lines: LogRow { line: line; }
+            // Scrolling up (wheel, drag, scroll bar) stops following; back at the bottom, it
+            // follows again. Only the user's scrolling: the list laying out rows moves too.
+            scrolled => { root.follow = self.content-y <= root.bottom + 2px; }
+        }
+    }
+
+    // The top edge: drag to resize.
+    Rectangle {
+        y: 0;
+        height: 5px;
+        TouchArea {
+            mouse-cursor: row-resize;
+            moved => {
+                LogBridge.panel-height = Math.max(120px, Math.min(root.window-height - 120px,
+                    LogBridge.panel-height - (self.mouse-y - self.pressed-y)));
+            }
+        }
+    }
+}
+
+// The window-wide status bar: the pipeline's standing on the left, the log's on the right.
+// Clicking anywhere on it (but Pause / Resume) opens or closes the log.
+export component StatusBar inherits Rectangle {
+    height: 28px;
+    background: LogBridge.open ? Theme.hover : ta.has-hover ? Theme.hover : Theme.sidebar;
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            LogBridge.open = !LogBridge.open;
+            LogBridge.opened(LogBridge.open);
+        }
+    }
+
+    VerticalLayout {
+        Rectangle { height: 1px; background: Theme.border; }
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 10px;
+            spacing: 10px;
+            PipelineStatus { horizontal-stretch: 0; }
+            Rectangle { horizontal-stretch: 1; min-width: 12px; }
+            if !LogBridge.open && LogBridge.latest != "": Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                text: LogBridge.latest;
+                color: Theme.placeholder;
+                font-family: "monospace";
+                font-size: 11px;
+                overflow: elide;
+            }
+            if LogBridge.unseen-errors > 0: VerticalLayout {
+                alignment: center;
+                Badge { count: LogBridge.unseen-errors; tone: Theme.danger; }
+            }
+            if LogBridge.unseen-warnings > 0: VerticalLayout {
+                alignment: center;
+                Badge { count: LogBridge.unseen-warnings; tone: #d97706; }
+            }
+            Text {
+                vertical-alignment: center;
+                text: LogBridge.open ? "Log ▾" : "Log ▴";
+                color: LogBridge.open || ta.has-hover ? Theme.accent : Theme.text-muted;
+                font-size: 12px;
+            }
+        }
+    }
+}

@@ -27,3 +27,5 @@ mod resize;
 pub use image;
 /// The face models [`catalog::faces::scan_image`] runs.
 pub use faces;
+/// The CLIP model [`pipeline::describe`] runs.
+pub use clip;

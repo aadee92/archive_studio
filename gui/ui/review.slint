@@ -1,6 +1,5 @@
 import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { PipelineStatus } from "pipeline.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
 import { ScrollRestore } from "nav.slint";
 import { ItemMenu } from "menu.slint";
@@ -436,7 +435,9 @@ export component ReviewPage inherits Rectangle {
                     overlay := TouchArea {
                         x: list.x;
                         y: list.y;
-                        width: list.visible-width;
+                        // The Fluent scroll bar (14px) is drawn over the list's right edge, not
+                        // beside it: leave it uncovered so it can be clicked and dragged.
+                        width: list.visible-width - (list.content-height > list.visible-height ? 14px : 0px);
                         height: list.visible-height;
 
                         changed mouse-x => { root.track(); }
@@ -480,7 +481,6 @@ export component ReviewPage inherits Rectangle {
                         font-size: 12px;
                         overflow: elide;
                     }
-                    PipelineStatus { horizontal-stretch: 2; }
                     Rectangle { width: 8px; }
                     Text { text: "Size"; color: Theme.text-muted; font-size: 12px; vertical-alignment: center; }
                     Slider {

@@ -7,6 +7,7 @@ edition = "2021"
 name = "archive_core"
 
 [dependencies]
+clip = { path = "../utils/clip" }
 fast_image_resize = { version = "6.1.0", features = ["image"] }
 faces = { path = "../utils/faces" }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }

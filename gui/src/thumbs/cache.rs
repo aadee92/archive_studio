@@ -94,7 +94,9 @@ impl DiskCache {
         if !has_color {
             conn.execute_batch("ALTER TABLE thumbs ADD COLUMN color INTEGER;").ok()?;
         }
-        conn.query_row("SELECT count(*) FROM thumbs", [], |_| Ok(())).ok()?;
+        // Reads a page, to catch a database that isn't one; `count(*)` would scan every
+        // thumbnail, on the UI thread at startup.
+        conn.query_row("SELECT 1 FROM thumbs LIMIT 1", [], |_| Ok(())).optional().ok()?;
         Some(Self { path: path.to_owned() })
     }
 

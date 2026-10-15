@@ -17,13 +17,14 @@ Archive Studio is a headless core with thin front ends.
 | Path | Crate | Role |
 |---|---|---|
 | `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag, properties). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, rotate, faces, find by description |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
 | `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings and clustering into people (lib; `examples/faces.rs` driver) |
 | `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
+| `utils/clip` | `clip` | TinyCLIP image and text embeddings, CLIP tokenizer, grouped zero-shot labels (lib; `examples/clip.rs` driver; `export_onnx.py` makes the model) |
 | `utils/*.py`, `utils/*.sh` | | Standalone scripts |
 
 The root `Cargo.toml` is a workspace of `core`, `gui`, `cli` and `logging` sharing one `Cargo.lock` and
@@ -52,8 +53,9 @@ is used by core as a path dependency.
 
 ## Pipeline (`archive_core::pipeline`)
 
-What happens to a file once it is in the library: register → orient → faces and signature, then, once
-the per-file stages are quiet, identify (suggestions and clusters) and XMP sidecar sync.
+What happens to a file once it is in the library: register → orient → faces, signature and
+describe, then, once the per-file stages are quiet, identify (suggestions and clusters) and
+XMP sidecar sync.
 
 - **Hosted, not a daemon**: a front end starts an `Engine` when it opens a library and drops
   it on exit. The engine catches up with what changed on disk while nothing ran, then
@@ -75,8 +77,9 @@ the per-file stages are quiet, identify (suggestions and clusters) and XMP sidec
 - **Threads**: per-file stages run on a worker pool; one engine thread does all catalog
   writes, scheduling and watching. Events go to the host's sink on the engine thread.
 - **Models**: `$ARCHIVE_STUDIO_MODELS`, else `~/.local/share/archive-studio/models`:
-  `orientation.onnx` and `buffalo_l/` (`det_10g.onnx`, `w600k_r50.onnx`). A stage whose
-  model is missing is skipped.
+  `orientation.onnx`, `buffalo_l/` (`det_10g.onnx`, `w600k_r50.onnx`) and `tinyclip-8m/`
+  (`visual.onnx`, `textual.onnx`, from `utils/clip/export_onnx.py`). A stage whose model is
+  missing is skipped.
 
 ## Catalog concepts (`archive_core::catalog`)
 
@@ -99,6 +102,15 @@ the per-file stages are quiet, identify (suggestions and clusters) and XMP sidec
 - **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
   computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
   candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).
+- **Describe** (`semantic`, `pipeline::describe`): the `describe` stage (after orient) stores
+  a CLIP embedding per image (schema 5, `image_embeddings`, with the model's name) and
+  proposes tags from a fixed vocabulary as detector `clip/tinyclip-8m`: `Scenes|…`,
+  `Objects|…`, `Events|…`, `Photo|…`. Labels compete within their group (softmax against
+  "none of these" prompts), not across groups. Tags from 35% are stored; as for any
+  detector, those from 50% are searched and written to sidecars. `TextSearch` (text model
+  only) ranks images against a description: `search_embedding(query, model, limit)` scans
+  every embedding, fine for tens of thousands of images. Changing the vocabulary means
+  bumping `describe::VERSION`, which redoes the stage.
 
 ## Logging
 

@@ -11,7 +11,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use archive_core::catalog::runs::{RunCounts, RunStatus};
 use archive_core::catalog::{AssetId, Catalog, TagKind};
 use archive_core::ops;
-use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, FACES, ORIENT, SIGNATURE};
+use archive_core::pipeline::describe::TextSearch;
+use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, DESCRIBE, FACES, ORIENT, SIGNATURE};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
 
@@ -37,7 +38,8 @@ untag PATH TAG             remove a tag (a person tag also un-names their faces 
 props PATH                 everything known about a file
 pair PATH                  the file's front or back
 pair PATH BACK             pair a back with its front by hand
-similar PATH [N]           highly similar files in the library
+similar PATH [N]           files from the same scene or event
+find WORDS...              files that fit a description (\"dog on a beach\")
 delete PATH                move the file (and its back) to the library's trash
 trash                      what is in the trash
 restore PATH               put a trashed file back (its original path)
@@ -161,7 +163,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     };
 
-    let mut shell = Shell { root: root.clone(), catalog, engine };
+    let mut shell = Shell { root: root.clone(), catalog, engine, search: None };
     for command in &args.commands {
         if !shell.execute(command) {
             return Ok(());
@@ -247,6 +249,8 @@ struct Shell {
     root: PathBuf,
     catalog: Catalog,
     engine: Option<Engine>,
+    /// Loaded on the first `find`.
+    search: Option<TextSearch>,
 }
 
 impl Shell {
@@ -284,6 +288,7 @@ impl Shell {
             "props" => self.props(rest),
             "pair" => self.pair(rest),
             "similar" => self.similar(rest),
+            "find" => self.find(rest),
             "delete" => self.delete(rest),
             "trash" => self.trash(),
             "restore" => self.restore(rest),
@@ -342,6 +347,8 @@ impl Shell {
         }
         let sig = pipeline::signature_status(&self.catalog, available).map_err(|e| e.to_string())?;
         line(SIGNATURE, true, sig);
+        let described = pipeline::describe_status(&self.catalog, available).map_err(|e| e.to_string())?;
+        line(DESCRIBE, models.describe.is_some(), described);
         println!("sidecars  {} to write", status.needs_sync);
         if self.engine.is_none() {
             println!("(pipeline not running in this shell)");
@@ -621,10 +628,30 @@ impl Shell {
         let candidates: Vec<AssetId> = everything.iter().filter_map(|p| self.catalog.find_asset(p).ok().flatten()).collect();
         let found = self.catalog.similar(asset, &candidates, limit).map_err(err)?;
         if found.is_empty() {
-            println!("nothing highly similar");
+            println!("nothing from the same scene");
         }
         for (other, score) in found {
             println!("{:>4.0}%  {}", score * 100.0, self.shown(other));
+        }
+        Ok(())
+    }
+
+    /// `find WORDS...`: the files whose CLIP embedding fits the words best.
+    fn find(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.is_empty() {
+            return Err("find WORDS...".into());
+        }
+        if self.search.is_none() {
+            let dir = Models::locate().describe.ok_or("no CLIP model (tinyclip-8m in the models directory)")?;
+            self.search = Some(TextSearch::from_dir(&dir).map_err(|e| format!("CLIP model: {e}"))?);
+        }
+        let search = self.search.as_ref().expect("loaded");
+        let found = search.search(&self.catalog, &args.join(" "), 20)?;
+        if found.is_empty() {
+            println!("nothing fits (only files the describe stage has done are searched)");
+        }
+        for (path, similarity) in found {
+            println!("{similarity:.3}  {}", show(&self.root, &path));
         }
         Ok(())
     }

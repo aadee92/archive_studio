@@ -7,11 +7,13 @@
 //!
 //! While the window is open it hosts the library's processing pipeline (`pipeline.rs`).
 //! Every item can be opened on the Details page (`details.rs`, via `nav.rs`) and has a
-//! context menu (`actions.rs`).
+//! context menu (`actions.rs`). The status bar under every page opens the live log
+//! (`log_view.rs`).
 
 mod acquire;
 mod actions;
 mod details;
+mod log_view;
 mod nav;
 mod people;
 mod pipeline;
@@ -37,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // icon; the window's own `icon` covers X11 and other platforms. Needs the platform
     // that `AppWindow::new` sets up, and must come before the window is shown.
     slint::set_xdg_app_id("archive-studio")?;
+    let _log = log_view::install(&ui);
     nav::install(&ui);
     let pipeline = pipeline::install(&ui, root.clone());
     let _acquire = acquire::install(&ui, &root, pipeline.clone());
@@ -60,14 +63,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The logger (stderr, filtered by `ARCHIVE_STUDIO_LOG`, default `info`; and
-/// `<root>/.archive-studio/logs/archive-studio.log`, which always gets this app's `debug`),
+/// `<root>/.archive-studio/logs/archive-studio.log`, which always gets `debug` from this app
+/// and its libraries, as does the log panel),
 /// and what the log should say about this run.
 fn start_logging(root: &std::path::Path) {
     let started = archive_logging::init(archive_logging::Config {
         dir: Some(archive_logging::dir_for(root)),
         file_name: "archive-studio.log",
         stderr_default: "info",
-        file_minimum: "info,archive_studio=debug,archive_core::ops=debug,archive_core::catalog=debug,panic=debug",
+        // Everything at debug for the log panel, but for two libraries that would crowd it
+        // out: tract's graph optimizer (tens of thousands of lines while a model loads) and
+        // nusb's per-transfer lines (a dozen a second while a scanner is plugged in).
+        file_minimum: "debug,tract_core=info,tract_hir=info,tract_onnx=info,tract_linalg=info,nusb=info",
     });
     // C libraries (graphics drivers, ONNX Runtime) print to fd 2: keep that in the log too.
     let captured = archive_logging::capture_stderr();

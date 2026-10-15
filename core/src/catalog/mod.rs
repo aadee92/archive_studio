@@ -24,6 +24,7 @@ pub mod pairs;
 pub mod people;
 pub mod query;
 pub mod runs;
+pub mod semantic;
 pub mod similar;
 pub mod trash;
 pub mod xmp;
@@ -35,8 +36,9 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// 1: assets and tags. 2: faces. 3: file states and pipeline runs. 4: front/back pairs,
-/// image signatures, the trash, and person tags backfilled from confirmed faces.
-const SCHEMA_VERSION: i32 = 4;
+/// image signatures, the trash, and person tags backfilled from confirmed faces. 5: image
+/// embeddings for search by description.
+const SCHEMA_VERSION: i32 = 5;
 
 const SCHEMA_4: &str = "
 -- While the asset is in the trash: where it was (relative to the root) and when it was
@@ -296,6 +298,12 @@ impl Catalog {
         // it in memory (200k assets × 6 tags is ~50 MB) rather than re-reading from the OS.
         conn.pragma_update(None, "cache_size", -128 * 1024)?;
         conn.pragma_update(None, "mmap_size", 1i64 << 30)?;
+        // Up to date: skip the write lock, which another connection may hold for a while (a
+        // migration's backfill, a batch of pipeline writes) - opens on a UI thread must not wait.
+        let current: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if current == SCHEMA_VERSION {
+            return Self::opened(conn, root);
+        }
         // Taking the write lock first: another thread may be creating the schema too.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Each version's additions, applied in turn from the database's version.
@@ -325,10 +333,17 @@ impl Catalog {
             let paired = pairs::pair_all_by_name(&tx)?;
             log::info!("catalog migration to schema 4: {tagged:?} person tags backfilled, {paired:?} front/back pairs");
         }
+        if version < 5 {
+            tx.execute_batch(semantic::SCHEMA)?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         tx.commit()?;
+        Self::opened(conn, root)
+    }
+
+    fn opened(conn: Connection, root: &Path) -> Result<Self> {
         let root = std::path::absolute(root).map_err(|_| Error::Path(root.to_owned()))?;
         let canonical_root = root.canonicalize().map_err(|_| Error::Path(root.clone()))?;
         Ok(Self { conn, root, canonical_root })

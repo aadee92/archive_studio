@@ -7,9 +7,10 @@ import { DetailsPage, DetailsBridge } from "details.slint";
 import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
 import { ItemMenu, PropRow, TagDialog, PropertiesDialog, Notice } from "menu.slint";
+import { StatusBar, LogPanel, LogBridge, LogLine } from "log.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
-export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, UiLog, ItemMenu, PropRow }
+export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, UiLog, ItemMenu, PropRow, LogBridge, LogLine }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
@@ -76,42 +77,47 @@ export component AppWindow inherits Window {
     property <string> notice: ItemMenu.notice;
     changed notice => { UiLog.debug("window.overlay", self.notice == "" ? "notice hidden" : "notice shown: \{self.notice}"); }
 
-    // Diagnostics only: logs every key on its way to the focused element (capture) and keys
-    // nothing handled (bubbled up here); never takes focus or consumes a key.
-    FocusScope {
-        focus-on-click: false;
-        focus-on-tab-navigation: false;
-        capture-key-pressed(event) => {
-            if (event.text == Key.Escape || event.text == Key.Return || event.text == Key.Tab
-                || event.modifiers.control || event.modifiers.alt) {
-                UiLog.debug("window.keys", "key \{root.key-name(event.text)}\{event.modifiers.control ? " +ctrl" : ""}\{event.modifiers.alt ? " +alt" : ""}\{event.modifiers.shift ? " +shift" : ""} (page \{root.page})");
-            } else {
-                UiLog.trace("window.keys", "key \{root.key-name(event.text)} (page \{root.page})");
+    // The pages over the window-wide status bar, and the log when it's open.
+    VerticalLayout {
+        // Diagnostics only: logs every key on its way to the focused element (capture) and keys
+        // nothing handled (bubbled up here); never takes focus or consumes a key.
+        FocusScope {
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            capture-key-pressed(event) => {
+                if (event.text == Key.Escape || event.text == Key.Return || event.text == Key.Tab
+                    || event.modifiers.control || event.modifiers.alt) {
+                    UiLog.debug("window.keys", "key \{root.key-name(event.text)}\{event.modifiers.control ? " +ctrl" : ""}\{event.modifiers.alt ? " +alt" : ""}\{event.modifiers.shift ? " +shift" : ""} (page \{root.page})");
+                } else {
+                    UiLog.trace("window.keys", "key \{root.key-name(event.text)} (page \{root.page})");
+                }
+                reject
             }
-            reject
-        }
-        key-pressed(event) => {
-            UiLog.debug("window.keys", "key \{root.key-name(event.text)} not handled by any element (page \{root.page})");
-            reject
-        }
+            key-pressed(event) => {
+                UiLog.debug("window.keys", "key \{root.key-name(event.text)} not handled by any element (page \{root.page})");
+                reject
+            }
 
-        HorizontalLayout {
-            Sidebar {
-                active: root.page;
-                navigate(i) => { NavBridge.navigate(i); }
-            }
-            Rectangle { width: 1px; background: Theme.border; }
+            HorizontalLayout {
+                Sidebar {
+                    active: root.page;
+                    navigate(i) => { NavBridge.navigate(i); }
+                }
+                Rectangle { width: 1px; background: Theme.border; }
 
-            // Every page stays alive so device previews keep running and each grid keeps its
-            // scroll position, filters and selection while another page is shown.
-            Rectangle {
-                horizontal-stretch: 1;
-                AcquirePage { visible: root.page == 0; }
-                ReviewPage { visible: root.page == 1; }
-                PeoplePage { visible: root.page == 2; }
-                DetailsPage { visible: root.page == 3; }
+                // Every page stays alive so device previews keep running and each grid keeps its
+                // scroll position, filters and selection while another page is shown.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    AcquirePage { visible: root.page == 0; }
+                    ReviewPage { visible: root.page == 1; }
+                    PeoplePage { visible: root.page == 2; }
+                    DetailsPage { visible: root.page == 3; }
+                }
             }
         }
+        if LogBridge.open: LogPanel { window-height: root.height; }
+        StatusBar { }
     }
 
     pure function key-name(text: string) -> string {
@@ -123,7 +129,7 @@ export component AppWindow inherits Window {
 
     if ItemMenu.notice != "": Notice {
         x: (root.width - self.width) / 2;
-        y: root.height - self.height - 52px;
+        y: root.height - self.height - 80px - (LogBridge.open ? LogBridge.panel-height : 0px);
     }
     if ItemMenu.tag-open: TagDialog {
         width: root.width;
