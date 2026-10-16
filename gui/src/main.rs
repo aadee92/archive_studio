@@ -8,11 +8,13 @@
 //! While the window is open it hosts the library's processing pipeline (`pipeline.rs`).
 //! Every item can be opened on the Details page (`details.rs`, via `nav.rs`) and has a
 //! context menu (`actions.rs`). The status bar under every page opens the live log
-//! (`log_view.rs`).
+//! (`log_view.rs`). At the bottom of the sidebar: the pipeline's failures (`failures.rs`,
+//! while there are any) and the library's trash (`trash.rs`).
 
 mod acquire;
 mod actions;
 mod details;
+mod failures;
 mod log_view;
 mod nav;
 mod people;
@@ -21,6 +23,7 @@ mod review;
 mod semantic;
 mod tags;
 mod thumbs;
+mod trash;
 
 use std::path::PathBuf;
 
@@ -49,6 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     details::install(&ui, root.clone(), pipeline.clone());
     people::install(&ui, root.clone());
     tags::install(&ui, root.clone());
+    trash::install(&ui, root.clone(), pipeline.clone());
+    failures::install(&ui, root.clone(), pipeline.clone());
     review::install(&ui, root, pipeline);
     // Diagnostics: start on another page (1 Review, 2 People), as if picked in the sidebar.
     if let Some(page) = std::env::var("ARCHIVE_STUDIO_PAGE").ok().and_then(|p| p.parse().ok()) {

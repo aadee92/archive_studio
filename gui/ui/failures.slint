@@ -1,0 +1,235 @@
+// The pipeline's failures (`src/failures.rs`): every stage that failed on a file, grouped by
+// stage, with the error, to retry or look at.
+
+import { ListView, Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { UiLog } from "nav.slint";
+import { ItemMenu } from "menu.slint";
+
+// A stage's heading (`header`), or one failure under it.
+export struct FailureRow {
+    header: bool,
+    stage: string,
+    // Heading: how many failed in the stage.
+    count: int,
+    name: string,
+    // The folder, relative to the library.
+    folder: string,
+    error: string,
+    // When it failed, local time.
+    time: string,
+    selected: bool,
+}
+
+export global FailuresBridge {
+    // How many files a stage failed on (the sidebar shows the page while there are any).
+    in property <int> count;
+    in property <[FailureRow]> rows;
+    in property <bool> loading;
+    in property <int> selection;
+    in property <bool> working;
+
+    // On row `i` of `rows` (a heading does nothing).
+    callback click(int, /* extend */ bool, /* toggle */ bool);
+    callback select-all();
+    callback clear-selection();
+    // Retry the selected failures, or every failure of a stage.
+    callback retry();
+    callback retry-stage(string);
+    // Row `i` on the Details page (stepping through the failures), its item menu, the
+    // selected one in the file manager.
+    callback open(int);
+    callback context-menu(int);
+    callback open-selected();
+    callback show-in-folder();
+}
+
+component FailureLine inherits Rectangle {
+    in property <FailureRow> item;
+    callback clicked(/* extend */ bool, /* toggle */ bool);
+    callback double-clicked();
+    callback right-clicked(length, length);
+    callback retry-stage();
+
+    height: root.item.header ? 40px : 44px;
+    background: root.item.selected ? Theme.accent-soft : ta.has-hover && !root.item.header ? Theme.hover : transparent;
+
+    ta := TouchArea {
+        pointer-event(event) => {
+            if (root.item.header) {
+                return;
+            }
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                root.clicked(event.modifiers.shift, event.modifiers.control);
+            }
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.right-clicked(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            }
+        }
+        double-clicked => {
+            if (!root.item.header) {
+                root.double-clicked();
+            }
+        }
+    }
+
+    if root.item.header: HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 10px;
+        spacing: 10px;
+        Text {
+            vertical-alignment: center;
+            text: root.item.stage;
+            font-size: 14px;
+            font-weight: 600;
+            color: Theme.text;
+        }
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            text: root.item.count == 1 ? "1 file" : "\{root.item.count} files";
+            font-size: 12px;
+            color: Theme.text-muted;
+        }
+        Text {
+            vertical-alignment: center;
+            text: "Retry all";
+            font-size: 12px;
+            color: retry-ta.has-hover ? Theme.accent : Theme.text-muted;
+            retry-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.retry-stage(); }
+            }
+        }
+    }
+    if !root.item.header: HorizontalLayout {
+        padding-left: 28px;
+        padding-right: 14px;
+        spacing: 12px;
+        VerticalLayout {
+            width: 40%;
+            alignment: center;
+            Text { text: root.item.name; font-size: 12px; color: Theme.text; overflow: elide; }
+            Text { text: root.item.folder == "" ? "Library" : root.item.folder; font-size: 11px; color: Theme.text-muted; overflow: elide; }
+        }
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            text: root.item.error;
+            font-size: 12px;
+            color: Theme.danger;
+            overflow: elide;
+        }
+        Text {
+            vertical-alignment: center;
+            text: root.item.time;
+            font-size: 11px;
+            color: Theme.text-muted;
+        }
+    }
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+}
+
+export component FailuresPage inherits Rectangle {
+    changed visible => {
+        if (self.visible) {
+            keys.focus();
+        }
+    }
+
+    VerticalLayout {
+        padding: 20px;
+        padding-bottom: 0px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            height: 32px;
+            spacing: 8px;
+            Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                text: "Failures";
+                font-size: 20px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+            if FailuresBridge.selection > 0: Button {
+                text: FailuresBridge.selection == 1 ? "Retry" : "Retry \{FailuresBridge.selection}";
+                primary: true;
+                enabled: !FailuresBridge.working;
+                clicked => { FailuresBridge.retry(); }
+            }
+            Button {
+                text: "Open";
+                enabled: FailuresBridge.selection == 1;
+                clicked => { FailuresBridge.open-selected(); }
+            }
+            Button {
+                text: "Show in folder";
+                enabled: FailuresBridge.selection == 1;
+                clicked => { FailuresBridge.show-in-folder(); }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+
+            keys := FocusScope {
+                key-pressed(event) => {
+                    if (event.modifiers.control && (event.text == "a" || event.text == "A")) {
+                        FailuresBridge.select-all();
+                        return accept;
+                    }
+                    if (event.text == Key.Escape && FailuresBridge.selection > 0) {
+                        FailuresBridge.clear-selection();
+                        return accept;
+                    }
+                    if (event.text == Key.Return && FailuresBridge.selection == 1) {
+                        UiLog.debug("failures.keys", "Enter: open");
+                        FailuresBridge.open-selected();
+                        return accept;
+                    }
+                    reject
+                }
+                ListView {
+                    for row[i] in FailuresBridge.rows: FailureLine {
+                        item: row;
+                        clicked(extend, toggle) => {
+                            keys.focus();
+                            FailuresBridge.click(i, extend, toggle);
+                        }
+                        double-clicked => { FailuresBridge.open(i); }
+                        right-clicked(x, y) => {
+                            ItemMenu.x = x;
+                            ItemMenu.y = y;
+                            FailuresBridge.context-menu(i);
+                        }
+                        retry-stage => { FailuresBridge.retry-stage(row.stage); }
+                    }
+                }
+            }
+
+            if FailuresBridge.rows.length == 0: Text {
+                text: FailuresBridge.loading ? "Loading…" : "Nothing failed";
+                color: Theme.text-muted;
+            }
+        }
+
+        HorizontalLayout {
+            height: 34px;
+            Text {
+                vertical-alignment: center;
+                text: FailuresBridge.selection > 0 ? "\{FailuresBridge.selection} selected · Retry runs the stage on them again"
+                    : "Failed stages aren't retried until the file changes or you ask · double-click to open";
+                color: Theme.placeholder;
+                font-size: 11px;
+            }
+        }
+    }
+}

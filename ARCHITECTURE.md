@@ -16,8 +16,8 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction), and tags as a whole (`tag_tree`, `rename_tag`, `merge_tags`, `delete_tag`). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face; `reject` / `unreject FACE_ID... PERSON`, `rejected PERSON`, `unignore`, `ignored`), people (`people [name|faces|recent] [TEXT]` with counts and cover face, `person rename / merge / delete / cover`), tags (tag, untag; `tag` and `delete` / `restore` take several files; `tags` as a tree with counts, `rename-tag`, `merge-tag`, `delete-tag`), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`) |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction), tags as a whole (`tag_tree`, `rename_tag`, `merge_tags`, `delete_tag`), and `retry` of failed stages (through the engine if one runs here). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face; `reject` / `unreject FACE_ID... PERSON`, `rejected PERSON`, `unignore`, `ignored`), people (`people [name|faces|recent] [TEXT]` with counts and cover face, `person rename / merge / delete / cover`), tags (tag, untag; `tag` and `delete` / `restore` take several files; `tags` as a tree with counts, `rename-tag`, `merge-tag`, `delete-tag`), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`), failures (`failed` with errors, `retry [STAGE|PATH...]`), trash (`trash` with dates, sizes and totals, `restore`, `purge PATH...`, `empty-trash [DAYS]`) |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -159,8 +159,16 @@ XMP sidecar sync.
   `FAILED` cheaply for a status line.
 - **Trash** (`trash`): deleting moves the file and sidecar to
   `.archive-studio/trash/<when>-<id>/<path>` and the asset row with it (kept, marked
-  trashed and missing, out of searches). `restore` undoes it; `empty_trash` deletes for good.
-  A front takes its back along.
+  trashed and missing, out of searches). `restore` undoes it; `empty_trash(older_than)`
+  deletes for good what was trashed that long ago, `purge(assets)` chosen items. A front
+  takes its back along (each `Trashed` names its `back`). `trashed()` lists the trash
+  newest first with each item's original path, file in the trash (to draw a thumbnail
+  from), when and size; `trash_totals()` counts items and bytes in one query.
+- **Failures** (`runs`): `failures()` lists every stage that failed on the current file of
+  a live asset (stage, path, error, when), by stage then path; a failure isn't retried
+  until the file changes or `retry(Retry::All | Stage(s) | Runs(asset, stage…))` forgets
+  it. A running engine needs telling: `Engine::retry` does it on the engine thread and
+  looks for work at once; front ends go through `ops::retry(catalog, engine)`.
 - **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
   computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
   candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).

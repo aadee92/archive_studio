@@ -4,7 +4,7 @@
 export global NavBridge {
     // There is a view to go back to.
     in property <bool> can-go-back;
-    // Sidebar: show page `i` (0 Acquire, 1 Review, 2 People, 3 Details).
+    // Sidebar: show page `i` (0 Acquire, 1 Review, 2 People, 3 Details, 4 Trash, 5 Failures).
     callback navigate(int);
     // Back to the previous view (Details: the back arrow and Esc).
     callback back();

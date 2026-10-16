@@ -308,6 +308,50 @@ impl Catalog {
             .execute([stage])?)
     }
 
+    /// Every stage that failed on the current file of a present asset (not in the trash),
+    /// by stage, then path: what a front end lists as failures. A run on an older version
+    /// of the file doesn't count (the stage is due again anyway).
+    pub fn failures(&self) -> Result<Vec<Failure>> {
+        let sql = format!(
+            "SELECT a.id, a.path, r.stage, r.detail, r.at FROM stage_runs r JOIN assets a ON a.id = r.asset_id
+             WHERE r.status = 'failed' AND NOT a.missing AND a.trashed_from IS NULL AND r.input = {FINGERPRINT}
+             ORDER BY r.stage, a.path"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((AssetId(row.get(0)?), row.get::<_, String>(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?;
+        let rows: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(asset, rel, stage, error, at)| Failure { asset, path: self.root.join(rel), stage, error, at })
+            .collect())
+    }
+
+    /// Forgets the failed runs `which` names, so the pipeline runs those stages again (an
+    /// engine that is running needs telling: [`Engine::retry`](crate::pipeline::Engine::retry)
+    /// does both). Returns how many runs were forgotten.
+    pub fn retry(&self, which: &Retry) -> Result<usize> {
+        let result = match which {
+            Retry::All => self.clear_failed(None),
+            Retry::Stage(stage) => self.clear_failed(Some(stage)),
+            Retry::Runs(runs) => (|| {
+                let tx = self.conn.unchecked_transaction()?;
+                let mut n = 0;
+                {
+                    let mut stmt =
+                        tx.prepare_cached("DELETE FROM stage_runs WHERE status = 'failed' AND asset_id = ?1 AND stage = ?2")?;
+                    for (asset, stage) in runs {
+                        n += stmt.execute(params![asset.0, stage])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(n)
+            })(),
+        };
+        super::logged(format_args!("retry {which:?}"), result)
+    }
+
     /// Turns the face boxes and tag regions of `asset` with the image, `cw` degrees
     /// clockwise (90, 180 or 270), after its file was rotated.
     pub fn rotate_regions(&self, asset: AssetId, cw: u16) -> Result<()> {
@@ -360,6 +404,29 @@ impl Catalog {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+}
+
+/// A stage that failed on an asset's current file ([`Catalog::failures`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub asset: AssetId,
+    pub path: PathBuf,
+    pub stage: String,
+    /// The error, as the stage reported it.
+    pub error: String,
+    /// When it failed, seconds since the epoch.
+    pub at: i64,
+}
+
+/// Which failed runs to try again ([`Catalog::retry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// Every failed run.
+    All,
+    /// Every failed run of a stage.
+    Stage(String),
+    /// These stages on these assets.
+    Runs(Vec<(AssetId, String)>),
 }
 
 /// A stage's last run on an asset, for a properties view.

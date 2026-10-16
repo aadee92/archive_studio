@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle, Timer, TimerMode};
 
 use archive_core::catalog::flags::AttentionCounts;
+use archive_core::catalog::trash::TrashTotals;
 use archive_core::catalog::Catalog;
 use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, Status, FACES, ORIENT};
 
 use crate::review::{self, FileUpdate};
-use crate::{acquire, details, people, AppWindow, Attention, PipelineBridge};
+use crate::{acquire, details, failures, nav, people, trash, AppWindow, Attention, PipelineBridge};
 
 /// A burst of engine events is gathered this long before it is passed on.
 const GATHER: Duration = Duration::from_millis(100);
@@ -117,8 +118,9 @@ struct Batch {
     /// The last of `Busy` / `Idle`.
     busy: Option<bool>,
     status: Option<Status>,
-    /// Counted with `status`.
+    /// Counted with `status` (also without an engine here).
     attention: Option<AttentionCounts>,
+    trash: Option<TrashTotals>,
     message: Option<String>,
 }
 
@@ -200,7 +202,8 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
             h.apply_mode();
         })
     });
-    // The status line's counts show those items in Review.
+    // The status line's counts: rotations to review show those items in Review, failures
+    // the Failures page (Review's "Failed" chip filters the grid by them).
     let weak = ui.as_weak();
     ui.global::<PipelineBridge>().on_show_review(move || {
         if let Some(ui) = weak.upgrade() {
@@ -210,7 +213,7 @@ pub fn install(ui: &AppWindow, root: PathBuf) -> Handle {
     let weak = ui.as_weak();
     ui.global::<PipelineBridge>().on_show_failed(move || {
         if let Some(ui) = weak.upgrade() {
-            review::show_attention(&ui, Attention { failed: true, ..Attention::default() });
+            nav::go(&ui, nav::FAILURES);
         }
     });
     host.publish();
@@ -307,6 +310,10 @@ impl Host {
         }
         if let Some(attention) = batch.attention {
             self.attention.set(attention);
+            failures::recounted(&ui, attention.failed);
+        }
+        if let Some(totals) = batch.trash {
+            trash::totals(&ui, totals);
         }
         if let Some(message) = batch.message {
             *self.message.borrow_mut() = Some(message);
@@ -468,8 +475,9 @@ impl Digest {
 fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
     let catalog = Catalog::open(&Catalog::default_path(root), root).ok();
     let mut availability = None;
-    // The engine moved since the last count, and when that count was.
-    let (mut owed, mut counted) = (false, None::<Instant>);
+    // The engine moved since the last count (at first: count once, for the sidebar), and
+    // when that count was.
+    let (mut owed, mut counted) = (true, None::<Instant>);
     let count_due = |counted: Option<Instant>| counted.map_or(Duration::ZERO, |t: Instant| STATUS_EVERY.saturating_sub(t.elapsed()));
     loop {
         let wait = if owed { count_due(counted) } else { Duration::from_secs(3600) };
@@ -503,9 +511,16 @@ fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
                     Ok(status) => batch.status = Some(status),
                     Err(e) => log::warn!("pipeline: status: {e}"),
                 }
+            }
+            // The sidebar's Failures and Trash, with or without an engine here.
+            if let Some(catalog) = &catalog {
                 match catalog.attention_counts() {
                     Ok(counts) => batch.attention = Some(counts),
                     Err(e) => log::warn!("pipeline: attention counts: {e}"),
+                }
+                match catalog.trash_totals() {
+                    Ok(totals) => batch.trash = Some(totals),
+                    Err(e) => log::warn!("pipeline: trash totals: {e}"),
                 }
             }
             (owed, counted) = (false, Some(Instant::now()));
@@ -518,6 +533,8 @@ fn relay(root: &Path, notes: mpsc::Receiver<Note>, ui: slint::Weak<AppWindow>) {
             && !batch.identified
             && batch.busy.is_none()
             && batch.status.is_none()
+            && batch.attention.is_none()
+            && batch.trash.is_none()
             && batch.message.is_none();
         if !nothing {
             log::trace!(

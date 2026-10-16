@@ -30,6 +30,10 @@
 //! - Many at once (a multi-selection): [`delete_all`] / [`restore_all`] (one Undo for all
 //!   of them), [`add_tag_all`]. Each returns what happened to every asset, or is all or
 //!   nothing, as documented.
+//! - The trash as a whole: [`Catalog::trashed`], [`Catalog::trash_totals`],
+//!   [`Catalog::purge`] (chosen items for good), [`Catalog::empty_trash`].
+//! - Failures: [`Catalog::failures`] lists them; [`retry`] runs them again, through the
+//!   engine when one runs here.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -39,7 +43,7 @@ use image::{ImageDecoder, ImageReader};
 
 use crate::catalog::faces::{self as catalog_faces, FaceId};
 use crate::catalog::people::FaceBox;
-use crate::catalog::runs::{RunStatus, StageRun};
+use crate::catalog::runs::{Retry, RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
 use crate::catalog::people::{display_name, person_path, PEOPLE};
 use crate::catalog::tags::{self, TagNode};
@@ -444,6 +448,16 @@ pub fn face_models() -> Result<faces::Faces, String> {
     let models = faces::Faces::from_dir(&dir).map_err(|e| format!("face model: {e}"))?;
     log::debug!("face models loaded from {} in {:?}", dir.display(), started.elapsed());
     Ok(models)
+}
+
+/// Forgets the failed runs `which` names so their stages run again: by `engine` if it runs
+/// on the library in this process (it then looks for work at once), else in the catalog
+/// (an engine elsewhere picks them up the next time it looks). Returns how many runs.
+pub fn retry(catalog: &Catalog, engine: Option<&Engine>, which: Retry) -> Result<usize, String> {
+    match engine {
+        Some(engine) => engine.retry(which),
+        None => catalog.retry(&which).map_err(|e| e.to_string()),
+    }
 }
 
 /// The text model [`text_search`] loaded, kept for the life of the process.

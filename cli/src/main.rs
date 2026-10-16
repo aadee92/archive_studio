@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
-use archive_core::catalog::runs::{RunCounts, RunStatus};
+use archive_core::catalog::runs::{Retry, RunCounts, RunStatus};
 use archive_core::catalog::faces::FaceId;
 use archive_core::catalog::flags::AssetFlags;
 use archive_core::catalog::{AssetId, Catalog, Region, TagKind};
@@ -24,12 +24,12 @@ review                     rotations waiting for you
 accept PATH|all            apply the proposed rotation
 keep PATH|all              the file is upright as it is
 rotate PATH 90|180|270     turn the file clockwise (rewrites it)
-failed                     files a stage failed on
+failed                     files a stage failed on, by stage, with the error
 list [STATE]...            files in all of these states: review (a rotation to review),
                            failed, untagged (no tag of yours; named faces count),
                            faces, unknown-faces, has-back, is-back, tagged; no-STATE
                            for files not in it (list faces no-tagged)
-retry                      run the failed stages again
+retry [STAGE|PATH...]      run the failed stages again: all, one stage's, or the files'
 add PATH...                take in files now, without waiting for them to settle
 faces [PATH]               people and unknown faces, or the faces in one file
 name FACE_ID... NAME       name faces (ids from faces PATH); tags their files People|NAME
@@ -72,8 +72,9 @@ similar PATH [N]           files from the same scene or event
 find WORDS...              files that fit a description (\"dog on a beach\"), best first
 like PATH [N]              files that look like this one (by their descriptions), best first
 delete PATH...             move the files (and their backs) to the library's trash
-trash                      what is in the trash
+trash                      what is in the trash: when it was deleted, size, totals
 restore PATH...            put trashed files back (their original paths)
+purge PATH...              delete trashed files for good (with their backs)
 empty-trash [DAYS]         delete for good what was trashed DAYS (default 0) ago
 pause | resume | background   stop starting work / full speed / one thread
 help | quit";
@@ -303,7 +304,7 @@ impl Shell {
             "rotate" => self.rotate(rest),
             "failed" => self.failed(),
             "list" => self.list(rest),
-            "retry" => self.engine().map(|e| e.retry_failed()),
+            "retry" => self.retry(rest),
             "add" => self.engine().map(|engine| {
                 for arg in rest {
                     engine.add(self.resolve(arg));
@@ -344,6 +345,7 @@ impl Shell {
             "delete" => self.delete(rest),
             "trash" => self.trash(),
             "restore" => self.restore(rest),
+            "purge" => self.purge(rest),
             "empty-trash" => self.empty_trash(rest),
             "pause" => self.engine().map(|e| e.set_mode(Mode::Paused)),
             "resume" => self.engine().map(|e| e.set_mode(Mode::Normal)),
@@ -451,16 +453,29 @@ impl Shell {
     }
 
     fn failed(&self) -> Result<(), String> {
-        let mut any = false;
-        for stage in [ORIENT, FACES, SIGNATURE] {
-            for (_, path, _, detail) in self.catalog.runs_with_status(stage, RunStatus::Failed).map_err(|e| e.to_string())? {
-                println!("{stage}: {}: {detail}", show(&self.root, &path));
-                any = true;
-            }
-        }
-        if !any {
+        let failures = self.catalog.failures().map_err(err)?;
+        if failures.is_empty() {
             println!("no failures");
         }
+        for f in failures {
+            println!("{}: {}: {}  ({})", f.stage, show(&self.root, &f.path), f.error, ago(f.at));
+        }
+        Ok(())
+    }
+
+    fn retry(&self, args: &[&str]) -> Result<(), String> {
+        let stages = [ORIENT, FACES, SIGNATURE, DESCRIBE];
+        let which = match args {
+            [] => Retry::All,
+            [stage] if stages.contains(stage) => Retry::Stage((*stage).to_owned()),
+            paths => {
+                let assets = paths.iter().map(|p| self.asset(p)).collect::<Result<Vec<_>, _>>()?;
+                let failures = self.catalog.failures().map_err(err)?;
+                Retry::Runs(failures.into_iter().filter(|f| assets.contains(&f.asset)).map(|f| (f.asset, f.stage)).collect())
+            }
+        };
+        let n = ops::retry(&self.catalog, self.engine.as_ref(), which)?;
+        println!("{n} failed runs to try again{}", if self.engine.is_none() && n > 0 { " (when the pipeline next runs)" } else { "" });
         Ok(())
     }
 
@@ -947,10 +962,30 @@ impl Shell {
         let items = self.catalog.trashed().map_err(err)?;
         if items.is_empty() {
             println!("the trash is empty");
+            return Ok(());
         }
-        for item in items {
-            println!("{}  (trashed at {} unix)", show(&self.root, &item.original), item.trashed_at);
+        for item in &items {
+            let size = item.size.map_or_else(|| "-".to_owned(), megabytes);
+            println!("{}  ({}, {size})", show(&self.root, &item.original), ago(item.trashed_at));
         }
+        let totals = self.catalog.trash_totals().map_err(err)?;
+        println!("{} files, {}", totals.items, megabytes(totals.bytes));
+        Ok(())
+    }
+
+    fn purge(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.is_empty() {
+            return Err("purge PATH...".into());
+        }
+        let trashed = self.catalog.trashed().map_err(err)?;
+        let mut assets = Vec::new();
+        for arg in args {
+            let path = self.resolve(arg);
+            let item = trashed.iter().find(|t| t.original == path || t.in_trash == path);
+            assets.push(item.ok_or_else(|| format!("{} is not in the trash", show(&self.root, &path)))?.asset);
+        }
+        let n = self.catalog.purge(&assets).map_err(err)?;
+        println!("deleted {n} files for good");
         Ok(())
     }
 
@@ -1015,6 +1050,21 @@ fn two_names(args: &[&str], usage: &str) -> Result<(String, String), String> {
         None if args.len() == 2 => Ok((args[0].to_owned(), args[1].to_owned())),
         _ => Err(usage.to_owned()),
     }
+}
+
+/// "today", "1 day ago", "12 days ago" for a time in seconds since the epoch.
+fn ago(at: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    match (now - at).max(0) / 86_400 {
+        0 => "today".to_owned(),
+        1 => "1 day ago".to_owned(),
+        days => format!("{days} days ago"),
+    }
+}
+
+/// "3.4 MB".
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
 fn err(e: archive_core::catalog::Error) -> String {

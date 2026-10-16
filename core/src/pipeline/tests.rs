@@ -96,6 +96,47 @@ fn stages_are_due_until_run_on_the_current_file() {
 }
 
 #[test]
+fn failures_are_listed_and_retried() {
+    use crate::catalog::runs::{Failure, Retry};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_png(&root.join("a.png"), 4, 2);
+    write_png(&root.join("b.png"), 4, 2);
+    let mut catalog = open(root);
+    catch_up(&catalog).unwrap();
+    let id = |name: &str| catalog.find_asset(&root.join(name)).unwrap().unwrap();
+    let (a, b) = (id("a.png"), id("b.png"));
+    let fail = |asset, stage: &str, input: &str| {
+        let run = Run { stage, version: ORIENT_VERSION, input, status: RunStatus::Failed, value: None, detail: "broken" };
+        catalog.set_run(asset, &run).unwrap();
+    };
+    let input = |asset| catalog.current_input(asset).unwrap().unwrap();
+    fail(a, FACES, &input(a));
+    fail(b, FACES, &input(b));
+    fail(a, ORIENT, &input(a));
+    fail(b, ORIENT, "1:2"); // on an older version of the file: doesn't count
+    let listed = |catalog: &Catalog| -> Vec<(AssetId, String)> {
+        catalog.failures().unwrap().into_iter().map(|f: Failure| (f.asset, f.stage)).collect()
+    };
+    assert_eq!(listed(&catalog), [(a, FACES.into()), (b, FACES.into()), (a, ORIENT.into())], "by stage, then path");
+    let first = &catalog.failures().unwrap()[0];
+    assert_eq!((first.path.clone(), first.error.as_str()), (root.join("a.png"), "broken"));
+    assert!(first.at > 0);
+
+    assert_eq!(catalog.retry(&Retry::Runs(vec![(a, FACES.into()), (a, SIGNATURE.into())])).unwrap(), 1);
+    assert_eq!(listed(&catalog), [(b, FACES.into()), (a, ORIENT.into())]);
+    assert_eq!(catalog.due(&orient_query(), 10).unwrap().len(), 1, "only the one failed on an older file");
+    assert_eq!(catalog.retry(&Retry::Stage(ORIENT.into())).unwrap(), 2, "the stale one goes too");
+    assert_eq!(catalog.due(&orient_query(), 10).unwrap().len(), 2);
+    assert_eq!(listed(&catalog), [(b, FACES.into())]);
+
+    // Trashed files aren't listed.
+    catalog.trash(b).unwrap();
+    assert!(catalog.failures().unwrap().is_empty());
+    assert_eq!(catalog.retry(&Retry::All).unwrap(), 1);
+}
+
+#[test]
 fn regions_turn_with_the_image() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = open(dir.path());

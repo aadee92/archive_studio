@@ -7,7 +7,9 @@
 //! the file's mtime, so no stage runs again). Trashed assets don't appear in
 //! [searches](Catalog::search), and the pipeline neither watches the hidden trash nor runs
 //! stages on missing assets. Trashing a front also trashes its back (a back is part of the
-//! same photo), and restoring it restores the back. [`Catalog::empty_trash`] deletes for good.
+//! same photo), and restoring it restores the back. [`Catalog::empty_trash`] deletes for good
+//! what was trashed some time ago, [`Catalog::purge`] chosen items; [`Catalog::trash_totals`]
+//! counts what is in the trash cheaply (for a front end's sidebar).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -29,6 +31,20 @@ pub struct Trashed {
     pub in_trash: PathBuf,
     /// Seconds since the epoch.
     pub trashed_at: i64,
+    /// The file's size as the catalog last saw it (else as it is in the trash), if known.
+    pub size: Option<u64>,
+    /// Its back, if it is a front: restoring or purging it takes the back along when that
+    /// is in the trash too.
+    pub back: Option<AssetId>,
+}
+
+/// How much is in the trash ([`Catalog::trash_totals`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrashTotals {
+    /// Assets (a front and its back are two).
+    pub items: usize,
+    /// Their files' sizes as the catalog last saw them.
+    pub bytes: u64,
 }
 
 fn now() -> i64 {
@@ -87,24 +103,48 @@ impl Catalog {
                 let _ = move_file(&in_trash, &original);
                 return Err(e.into());
             }
-            done.push(Trashed { asset, original, in_trash, trashed_at: at });
+            let size = std::fs::metadata(&in_trash).ok().map(|m| m.len());
+            let back = self.back_of(asset)?;
+            done.push(Trashed { asset, original, in_trash, trashed_at: at, size, back });
         }
         Ok(done)
     }
 
-    /// Everything in the trash, most recently trashed first.
+    /// Everything in the trash, most recently trashed first. `in_trash` is the file to draw a
+    /// thumbnail from.
     pub fn trashed(&self) -> Result<Vec<Trashed>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, trashed_from, path, trashed_at FROM assets WHERE trashed_from IS NOT NULL ORDER BY trashed_at DESC, id",
+            "SELECT a.id, a.trashed_from, a.path, a.trashed_at, a.size, p.back FROM assets a LEFT JOIN asset_pairs p ON p.front = a.id
+             WHERE a.trashed_from IS NOT NULL ORDER BY a.trashed_at DESC, a.id",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((AssetId(row.get(0)?), row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+            Ok((
+                AssetId(row.get(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?.map(AssetId),
+            ))
         })?;
         let rows: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
         Ok(rows
             .into_iter()
-            .map(|(asset, from, path, at)| Trashed { asset, original: self.root.join(from), in_trash: self.root.join(path), trashed_at: at })
+            .map(|(asset, from, path, at, size, back)| {
+                let in_trash = self.root.join(path);
+                // Files the pipeline never looked at have no size in the catalog.
+                let size = size.map(|s| s as u64).or_else(|| std::fs::metadata(&in_trash).ok().map(|m| m.len()));
+                Trashed { asset, original: self.root.join(from), in_trash, trashed_at: at, size, back }
+            })
             .collect())
+    }
+
+    /// How many assets are in the trash and how much their files take, in one query.
+    pub fn trash_totals(&self) -> Result<TrashTotals> {
+        let mut stmt =
+            self.conn.prepare_cached("SELECT count(*), coalesce(sum(size), 0) FROM assets WHERE trashed_from IS NOT NULL")?;
+        let (items, bytes): (i64, i64) = stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(TrashTotals { items: items as usize, bytes: bytes as u64 })
     }
 
     /// Puts a trashed asset back where it was, with its back if that is in the trash too.
@@ -153,9 +193,31 @@ impl Catalog {
 
     fn empty_trash_inner(&mut self, older_than: Duration) -> Result<usize> {
         let cutoff = now() - older_than.as_secs() as i64;
+        let items: Vec<Trashed> = self.trashed()?.into_iter().filter(|t| t.trashed_at <= cutoff).collect();
+        self.delete_for_good(&items)
+    }
+
+    /// Deletes these trashed assets for good, as [`empty_trash`](Self::empty_trash) does,
+    /// each with its back if that is in the trash too (as [`restore`](Self::restore) would
+    /// have brought it back). Assets not in the trash are left alone. Returns how many
+    /// assets were deleted.
+    pub fn purge(&mut self, assets: &[AssetId]) -> Result<usize> {
+        let result = self.purge_inner(assets);
+        super::logged(format_args!("purge assets {:?}", assets.iter().map(|a| a.0).collect::<Vec<_>>()), result)
+    }
+
+    fn purge_inner(&mut self, assets: &[AssetId]) -> Result<usize> {
+        let trashed = self.trashed()?;
+        let backs: Vec<AssetId> = trashed.iter().filter(|t| assets.contains(&t.asset)).filter_map(|t| t.back).collect();
+        let items: Vec<Trashed> = trashed.into_iter().filter(|t| assets.contains(&t.asset) || backs.contains(&t.asset)).collect();
+        self.delete_for_good(&items)
+    }
+
+    /// Removes trashed items' files and sidecars, then their assets.
+    fn delete_for_good(&mut self, items: &[Trashed]) -> Result<usize> {
         let trash_root = self.root.join(TRASH_DIR);
         let mut removed = 0;
-        for item in self.trashed()?.into_iter().filter(|t| t.trashed_at <= cutoff) {
+        for item in items {
             for path in [item.in_trash.clone(), xmp::sidecar_path(&item.in_trash)] {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
@@ -231,6 +293,47 @@ mod tests {
         assert!(cat.trashed().unwrap().is_empty());
         assert_eq!(cat.back_of(front).unwrap(), None);
         assert_eq!(std::fs::read_dir(root.join(TRASH_DIR)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn purge_and_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut cat = Catalog::open_in_memory(root);
+        for (name, bytes) in [("photo-0001-front.png", 10), ("photo-0001-back.png", 20), ("a.png", 300), ("b.png", 4000)] {
+            std::fs::write(root.join(name), vec![0u8; bytes]).unwrap();
+        }
+        let id = |cat: &Catalog, name: &str| cat.asset(&root.join(name)).unwrap();
+        let (front, back, a, b) = (id(&cat, "photo-0001-front.png"), id(&cat, "photo-0001-back.png"), id(&cat, "a.png"), id(&cat, "b.png"));
+        assert_eq!(cat.trash_totals().unwrap(), TrashTotals::default());
+
+        for asset in [front, a, b] {
+            cat.trash(asset).unwrap();
+        }
+        let trashed = cat.trashed().unwrap();
+        assert_eq!(trashed.len(), 4);
+        // Never seen by the pipeline: the size comes from the file in the trash.
+        let size = |asset| trashed.iter().find(|t| t.asset == asset).unwrap().size;
+        assert_eq!((size(front), size(back), size(b)), (Some(10), Some(20), Some(4000)));
+        assert_eq!(trashed.iter().find(|t| t.asset == front).unwrap().back, Some(back));
+        assert_eq!(trashed.iter().find(|t| t.asset == back).unwrap().back, None);
+        assert_eq!(cat.trash_totals().unwrap().items, 4);
+        cat.conn.execute("UPDATE assets SET size = 4000 WHERE id = ?1", [b.0]).unwrap();
+        assert_eq!(cat.trash_totals().unwrap(), TrashTotals { items: 4, bytes: 4000 }, "sizes the catalog knows");
+
+        // A front takes its trashed back along; what isn't in the trash is left alone.
+        let other = {
+            std::fs::write(root.join("c.png"), "c").unwrap();
+            id(&cat, "c.png")
+        };
+        assert_eq!(cat.purge(&[front, other]).unwrap(), 2);
+        assert!(cat.find_asset(&root.join("c.png")).unwrap().is_some() && root.join("c.png").exists());
+        let left: Vec<AssetId> = cat.trashed().unwrap().iter().map(|t| t.asset).collect();
+        assert_eq!(left, [a, b]);
+        assert!(!trashed[0].in_trash.exists());
+        assert_eq!(cat.purge(&[a]).unwrap(), 1);
+        assert_eq!(cat.trash_totals().unwrap(), TrashTotals { items: 1, bytes: 4000 });
+        assert_eq!(cat.purge(&[a]).unwrap(), 0, "already gone");
     }
 
     #[test]

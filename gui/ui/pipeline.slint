@@ -10,7 +10,7 @@ export global PipelineBridge {
     // `text` is a warning or failure.
     in property <bool> alert;
     // What needs the user, after `text` ("3 rotations to review", "2 failed"; empty for
-    // none): each a link to those items in Review.
+    // none): links to those items in Review, and to the Failures page.
     in property <string> review-text;
     in property <string> failed-text;
 
@@ -19,7 +19,7 @@ export global PipelineBridge {
     callback show-failed();
 }
 
-// A count in the status line that shows its items in Review.
+// A count in the status line that shows its items (Review, or the Failures page).
 component CountLink inherits HorizontalLayout {
     in property <string> text;
     in property <color> tone;

@@ -1,0 +1,347 @@
+// The library's trash (`src/trash.rs`): what was deleted, with where it was and when, to
+// restore or delete for good.
+
+import { ListView, Button, CheckBox, SpinBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { UiLog } from "nav.slint";
+
+// One trashed item.
+export struct TrashTile {
+    // Its index in the trash list (Rust side).
+    index: int,
+    thumb: image,
+    thumb-ready: bool,
+    name: string,
+    // The folder it was in, relative to the library ("" for the top).
+    folder: string,
+    // "Deleted 2026-10-15 14:03 · 2.1 MB".
+    detail: string,
+    selected: bool,
+}
+
+export struct TrashRow { tiles: [TrashTile] }
+
+export global TrashBridge {
+    // Sidebar and summary: how many items are in the trash, and "1,204 items · 3.4 GB".
+    in property <int> count;
+    in property <string> summary;
+    in property <[TrashRow]> rows;
+    in property <bool> loading;
+    in property <int> selection;
+    in property <bool> working;
+    in property <length> tile-size: 150px;
+
+    callback columns-changed(int);
+    // On the tile with this index; -1 for a click beside every tile.
+    callback click(int, /* extend */ bool, /* toggle */ bool);
+    callback select-all();
+    callback clear-selection();
+    // The selection back where it was.
+    callback restore();
+    // Asks to delete the selection for good (`confirm-mode` "purge"), or to empty the trash
+    // ("empty").
+    callback purge();
+    callback empty();
+
+    // The confirmation: "" (closed), "purge" or "empty".
+    in property <string> confirm-mode;
+    // What will go, e.g. "12 items (40 MB) will be deleted for good. This can't be undone."
+    in property <string> confirm-message;
+    in property <string> confirm-error;
+    // Empty: only what was deleted more than `confirm-days` days ago.
+    in-out property <bool> confirm-older;
+    in-out property <int> confirm-days: 30;
+    // `confirm-older` or `confirm-days` changed: the message follows.
+    callback confirm-changed();
+    callback confirm();
+    callback cancel();
+}
+
+component TrashCell inherits Rectangle {
+    in property <TrashTile> tile;
+    in property <length> size;
+    callback clicked(/* extend */ bool, /* toggle */ bool);
+
+    width: size;
+    height: size + 52px;
+
+    Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        clip: true;
+        background: Theme.well;
+        if root.tile.thumb-ready: Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.tile.thumb;
+            image-fit: contain;
+        }
+    }
+    Rectangle {
+        y: 0;
+        width: root.size;
+        height: root.size;
+        border-radius: 6px;
+        border-width: root.tile.selected ? 3px : ta.has-hover ? 1px : 0px;
+        border-color: root.tile.selected ? Theme.accent : Theme.border;
+    }
+    if root.tile.selected: Rectangle {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.accent;
+        Text { text: "✓"; color: white; font-size: 11px; font-weight: 700; }
+    }
+    VerticalLayout {
+        y: root.size + 4px;
+        height: 48px;
+        spacing: 1px;
+        Text { text: root.tile.name; font-size: 12px; color: Theme.text; overflow: elide; }
+        Text { text: root.tile.folder == "" ? "Library" : root.tile.folder; font-size: 11px; color: Theme.text-muted; overflow: elide; }
+        Text { text: root.tile.detail; font-size: 11px; color: Theme.text-muted; overflow: elide; }
+    }
+    ta := TouchArea {
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                root.clicked(event.modifiers.shift, event.modifiers.control);
+            }
+        }
+    }
+}
+
+export component TrashPage inherits Rectangle {
+    property <length> gap: 14px;
+    property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / (TrashBridge.tile-size + root.gap)));
+
+    changed columns => { TrashBridge.columns-changed(self.columns); }
+    changed visible => {
+        if (self.visible) {
+            TrashBridge.columns-changed(self.columns);
+            keys.focus();
+        }
+    }
+    init => { TrashBridge.columns-changed(self.columns); }
+
+    VerticalLayout {
+        padding: 20px;
+        padding-bottom: 0px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            height: 32px;
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: "Trash";
+                font-size: 20px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+            Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                text: TrashBridge.summary;
+                color: Theme.text-muted;
+                font-size: 12px;
+                overflow: elide;
+            }
+            if TrashBridge.selection > 0: Button {
+                text: TrashBridge.selection == 1 ? "Restore" : "Restore \{TrashBridge.selection}";
+                primary: true;
+                enabled: !TrashBridge.working;
+                clicked => { TrashBridge.restore(); }
+            }
+            if TrashBridge.selection > 0: Button {
+                text: TrashBridge.selection == 1 ? "Delete permanently" : "Delete \{TrashBridge.selection} permanently";
+                enabled: !TrashBridge.working;
+                clicked => { TrashBridge.purge(); }
+            }
+            Button {
+                text: "Empty trash…";
+                enabled: !TrashBridge.working && TrashBridge.count > 0;
+                clicked => { TrashBridge.empty(); }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            clip: true;
+
+            // A click beside the tiles clears the selection; keys: Ctrl+A, Esc, Enter restores,
+            // Delete asks to delete for good.
+            keys := FocusScope {
+                key-pressed(event) => {
+                    if (event.modifiers.control && (event.text == "a" || event.text == "A")) {
+                        TrashBridge.select-all();
+                        return accept;
+                    }
+                    if (event.text == Key.Escape && TrashBridge.selection > 0) {
+                        TrashBridge.clear-selection();
+                        return accept;
+                    }
+                    if (event.text == Key.Delete && TrashBridge.selection > 0 && !TrashBridge.working) {
+                        UiLog.debug("trash.keys", "Delete: ask to delete \{TrashBridge.selection} for good");
+                        TrashBridge.purge();
+                        return accept;
+                    }
+                    if (event.text == Key.Return && TrashBridge.selection > 0 && !TrashBridge.working) {
+                        UiLog.debug("trash.keys", "Enter: restore \{TrashBridge.selection}");
+                        TrashBridge.restore();
+                        return accept;
+                    }
+                    reject
+                }
+                TouchArea {
+                    clicked => {
+                        keys.focus();
+                        TrashBridge.click(-1, false, false);
+                    }
+                }
+                list := ListView {
+                    for row in TrashBridge.rows: HorizontalLayout {
+                        padding-left: root.gap;
+                        padding-top: root.gap;
+                        spacing: root.gap;
+                        alignment: start;
+                        for t in row.tiles: TrashCell {
+                            tile: t;
+                            size: TrashBridge.tile-size;
+                            clicked(extend, toggle) => {
+                                keys.focus();
+                                TrashBridge.click(t.index, extend, toggle);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if TrashBridge.rows.length == 0: Text {
+                text: TrashBridge.loading ? "Loading…" : "The trash is empty";
+                color: Theme.text-muted;
+            }
+        }
+
+        HorizontalLayout {
+            height: 34px;
+            spacing: 12px;
+            Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                text: TrashBridge.selection > 0 ? "\{TrashBridge.selection} selected · Enter restores · Delete deletes for good"
+                    : "Click, Shift-click or Ctrl-click to select · Ctrl+A for all";
+                color: Theme.placeholder;
+                font-size: 11px;
+            }
+            if TrashBridge.rows.length > 0: Text {
+                vertical-alignment: center;
+                text: TrashBridge.selection > 0 ? "Clear selection" : "Select all";
+                color: Theme.accent;
+                font-size: 12px;
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if (TrashBridge.selection > 0) {
+                            TrashBridge.clear-selection();
+                        } else {
+                            TrashBridge.select-all();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Deleting for good, confirmed: the selection ("purge"), or emptying the trash ("empty"),
+// everything or only what was deleted more than some days ago.
+export component TrashConfirmDialog inherits Rectangle {
+    background: #0000002a;
+    TouchArea {
+        clicked => { TrashBridge.cancel(); }
+    }
+    init => { keys.focus(); }
+
+    Rectangle {
+        width: Math.min(440px, root.width - 40px);
+        height: col.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: Math.max(20px, (root.height - self.height) / 3);
+        background: Theme.surface;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000030;
+        drop-shadow-offset-y: 6px;
+        TouchArea { }
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    TrashBridge.cancel();
+                    return accept;
+                }
+                if (event.text == Key.Return && !TrashBridge.working) {
+                    TrashBridge.confirm();
+                    return accept;
+                }
+                reject
+            }
+            col := VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: TrashBridge.confirm-mode == "empty" ? "Empty trash" : "Delete permanently";
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                if TrashBridge.confirm-mode == "empty": HorizontalLayout {
+                    spacing: 8px;
+                    CheckBox {
+                        text: "Only items deleted more than";
+                        checked <=> TrashBridge.confirm-older;
+                        toggled => { TrashBridge.confirm-changed(); }
+                    }
+                    SpinBox {
+                        width: 90px;
+                        minimum: 1;
+                        maximum: 3650;
+                        enabled: TrashBridge.confirm-older;
+                        value <=> TrashBridge.confirm-days;
+                        edited => { TrashBridge.confirm-changed(); }
+                    }
+                    Text { vertical-alignment: center; text: "days ago"; color: Theme.text; font-size: 12px; }
+                }
+                Text { text: TrashBridge.confirm-message; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+                if TrashBridge.confirm-error != "": Text {
+                    text: TrashBridge.confirm-error;
+                    color: Theme.danger;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Cancel";
+                        clicked => { TrashBridge.cancel(); }
+                    }
+                    Button {
+                        text: "Delete permanently";
+                        primary: true;
+                        enabled: !TrashBridge.working;
+                        clicked => { TrashBridge.confirm(); }
+                    }
+                }
+            }
+        }
+    }
+}

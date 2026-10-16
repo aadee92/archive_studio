@@ -17,13 +17,15 @@ use std::sync::Arc;
 
 use slint::ComponentHandle;
 
-use crate::{actions, details, people, review, AppWindow, NavBridge, UiLog};
+use crate::{actions, details, failures, people, review, trash, AppWindow, NavBridge, UiLog};
 use archive_core::catalog::faces::FaceId;
 
 /// Sidebar indices of the pages (`AppWindow.page`); 0 is Acquire.
 pub const REVIEW: i32 = 1;
 pub const PEOPLE: i32 = 2;
 pub const DETAILS: i32 = 3;
+pub const TRASH: i32 = 4;
+pub const FAILURES: i32 = 5;
 
 /// Views kept for Back.
 const HISTORY: usize = 64;
@@ -141,7 +143,7 @@ pub fn open(ui: &AppWindow, target: Target) {
     ui.set_page(DETAILS);
 }
 
-/// The sidebar: shows `page` as it is now (People re-reads the catalog).
+/// The sidebar: shows `page` as it is now (People, Trash and Failures re-read the catalog).
 pub fn go(ui: &AppWindow, page: i32) {
     if page == ui.get_page() {
         log::debug!("go {page}: already shown");
@@ -150,8 +152,11 @@ pub fn go(ui: &AppWindow, page: i32) {
     log::debug!("go {page} (from page {})", ui.get_page());
     leave(ui);
     ui.set_page(page);
-    if page == PEOPLE {
-        people::entered();
+    match page {
+        PEOPLE => people::entered(),
+        TRASH => trash::entered(ui),
+        FAILURES => failures::entered(ui),
+        _ => {}
     }
 }
 

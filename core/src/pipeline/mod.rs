@@ -51,7 +51,7 @@ use notify::{RecursiveMode, Watcher};
 
 use crate::catalog::faces::{self as catalog_faces, NewFace, DEFAULT_MIN_SIMILARITY};
 use crate::catalog::similar::Signature;
-use crate::catalog::runs::{self, Due, Run, RunCounts, RunStatus, StageQuery};
+use crate::catalog::runs::{self, Due, Retry, Run, RunCounts, RunStatus, StageQuery};
 use crate::catalog::{AssetId, Catalog, Detection, DEFAULT_MIN_CONFIDENCE};
 use crate::media::{classify, MediaKind};
 
@@ -281,7 +281,8 @@ enum Command {
     Accept(PathBuf, Reply),
     /// The file is upright as it is.
     Keep(PathBuf, Reply),
-    RetryFailed,
+    /// Forgets these failed runs and runs the stages again; replies with how many.
+    Retry(Retry, Option<mpsc::Sender<Result<usize, String>>>),
     SetMode(Mode),
     Shutdown,
 }
@@ -377,7 +378,15 @@ impl Engine {
 
     /// Runs the failed stages again.
     pub fn retry_failed(&self) {
-        let _ = self.send.send(Msg::Command(Command::RetryFailed));
+        let _ = self.send.send(Msg::Command(Command::Retry(Retry::All, None)));
+    }
+
+    /// Runs the failed stages `which` names again ([`Catalog::retry`] on the engine's
+    /// thread, which then looks for work at once). Returns how many runs were forgotten.
+    pub fn retry(&self, which: Retry) -> Result<usize, String> {
+        let (reply, answer) = mpsc::channel();
+        self.send.send(Msg::Command(Command::Retry(which, Some(reply)))).map_err(|_| "the pipeline has stopped".to_owned())?;
+        answer.recv().map_err(|_| "the pipeline has stopped".to_owned())?
     }
 
     pub fn set_mode(&self, mode: Mode) {
@@ -948,7 +957,7 @@ impl Pipeline {
             Command::Rotate(path, cw, _) => log::debug!("command: rotate {} {cw}°", path.display()),
             Command::Accept(path, _) => log::debug!("command: accept {}", path.display()),
             Command::Keep(path, _) => log::debug!("command: keep {}", path.display()),
-            Command::RetryFailed => log::info!("command: retry failed"),
+            Command::Retry(which, _) => log::info!("command: retry {which:?}"),
             Command::SetMode(mode) => log::debug!("command: mode {mode:?}"),
             Command::Shutdown => {}
         }
@@ -984,12 +993,18 @@ impl Pipeline {
                 log::debug!("keep {}: {result:?}", path.display());
                 let _ = reply.send(result);
             }
-            Command::RetryFailed => {
-                if let Err(e) = self.catalog.clear_failed(None) {
+            Command::Retry(which, reply) => {
+                let result = self.catalog.retry(&which).map_err(|e| e.to_string());
+                if let (Err(e), None) = (&result, &reply) {
                     self.emit(Event::Warning(format!("retry: {e}")));
                 }
-                self.sync_failed.clear();
+                if which == Retry::All {
+                    self.sync_failed.clear();
+                }
                 self.changed();
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
             Command::SetMode(mode) => {
                 self.mode = mode;

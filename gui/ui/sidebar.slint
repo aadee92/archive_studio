@@ -1,9 +1,14 @@
 import { Theme } from "theme.slint";
+import { TrashBridge } from "trash.slint";
+import { FailuresBridge } from "failures.slint";
 
 component NavButton inherits Rectangle {
     in property <image> icon;
     in property <string> label;
     in property <bool> active;
+    // A count in a small pill over the icon's corner (0: none).
+    in property <int> badge;
+    in property <color> badge-tone: Theme.text-muted;
     callback clicked;
 
     height: 58px;
@@ -26,6 +31,20 @@ component NavButton inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 colorize: root.active ? Theme.accent : Theme.text-muted;
+                if root.badge > 0: Rectangle {
+                    x: 14px;
+                    y: -5px;
+                    width: Math.max(16px, badge-text.preferred-width + 8px);
+                    height: 16px;
+                    border-radius: 8px;
+                    background: root.badge-tone;
+                    badge-text := Text {
+                        text: root.badge > 999 ? "999+" : root.badge;
+                        color: white;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                }
             }
         }
         Text {
@@ -51,8 +70,8 @@ export component Sidebar inherits Rectangle {
 
     VerticalLayout {
         padding-top: 14px;
+        padding-bottom: 10px;
         spacing: 6px;
-        alignment: start;
 
         HorizontalLayout {
             alignment: center;
@@ -89,6 +108,24 @@ export component Sidebar inherits Rectangle {
             label: "Details";
             active: root.active == 3;
             clicked => { root.navigate(3); }
+        }
+
+        // At the bottom: the pipeline's failures (while there are any) and the trash.
+        Rectangle { vertical-stretch: 1; }
+        if FailuresBridge.count > 0 || root.active == 5: NavButton {
+            icon: @image-url("icons/failures.svg");
+            label: "Failures";
+            active: root.active == 5;
+            badge: FailuresBridge.count;
+            badge-tone: Theme.danger;
+            clicked => { root.navigate(5); }
+        }
+        NavButton {
+            icon: @image-url("icons/trash.svg");
+            label: "Trash";
+            active: root.active == 4;
+            badge: TrashBridge.count;
+            clicked => { root.navigate(4); }
         }
     }
 }
