@@ -24,6 +24,7 @@ Archive Studio is a headless core with thin front ends.
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
 | `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings (also of a hand-drawn box) and clustering into people (lib; `examples/faces.rs` driver) |
 | `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
+| `utils/picture` | `picture` | Decoding pictures no larger than they are shown, upright: JPEG at a reduced DCT scale, a TIFF's reduced page, the EXIF preview; sizes from headers (lib; used by the GUI's thumbnails and Details; optimized in debug builds too) |
 | `utils/clip` | `clip` | TinyCLIP image and text embeddings, CLIP tokenizer, grouped zero-shot labels (lib; `examples/clip.rs` driver; `export_onnx.py` makes the model) |
 | `utils/*.py`, `utils/*.sh` | | Standalone scripts |
 

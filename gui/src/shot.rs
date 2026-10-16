@@ -8,7 +8,9 @@
 //! logical pixel), `--page review|people|details|trash|failures|acquire` (default review),
 //! `--item N` (Details: the Nth image of the library by path, default 0), `--wait SECONDS`
 //! (how long the app runs before the shot, default 5), `--fullscreen`, `--info` (Details:
-//! full screen; the info panel open). The user's settings are neither read nor written.
+//! full screen; the info panel open), `--steps N` and `--step-ms MS` (Details: steps to the
+//! next item N times, one every MS milliseconds (default 500) from a second in, as Right
+//! does: for timing steps in the log). The user's settings are neither read nor written.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -35,6 +37,8 @@ pub struct Options {
     pub wait: Duration,
     pub fullscreen: bool,
     pub info: bool,
+    pub steps: u32,
+    pub step_every: Duration,
 }
 
 /// `--shot OUT.png [options] [DIR]` from the arguments after the program's name: the options
@@ -55,6 +59,8 @@ pub fn parse(args: &[String]) -> Result<Option<(Options, Option<PathBuf>)>, Stri
         wait: Duration::from_secs(5),
         fullscreen: false,
         info: false,
+        steps: 0,
+        step_every: Duration::from_millis(500),
     };
     let mut dir = None;
     while let Some(arg) = it.next() {
@@ -72,6 +78,8 @@ pub fn parse(args: &[String]) -> Result<Option<(Options, Option<PathBuf>)>, Stri
             "--wait" => options.wait = Duration::from_secs_f32(value()?.parse().map_err(|_| "--wait: seconds")?),
             "--fullscreen" => options.fullscreen = true,
             "--info" => options.info = true,
+            "--steps" => options.steps = value()?.parse().map_err(|_| "--steps: a number")?,
+            "--step-ms" => options.step_every = Duration::from_millis(value()?.parse().map_err(|_| "--step-ms: milliseconds")?),
             _ if !arg.starts_with("--") && dir.is_none() => dir = Some(arg.into()),
             _ => return Err(format!("--shot: unknown argument {arg}")),
         }
@@ -96,6 +104,8 @@ pub fn install_platform(options: &Options) -> Result<(), String> {
 
 /// Shows the page asked for, once everything is installed.
 pub fn show_page(ui: &AppWindow, root: &Path, options: &Options) {
+    // Sized already, as a real window is by the time anything is opened (Details decodes for it).
+    ui.window().set_size(PhysicalSize::new((options.width as f32 * options.scale) as u32, (options.height as f32 * options.scale) as u32));
     let details = ui.global::<DetailsBridge>();
     details.set_info_open(options.info);
     let page = match options.page.as_str() {
@@ -127,6 +137,19 @@ pub fn show_page(ui: &AppWindow, root: &Path, options: &Options) {
     }
     if options.fullscreen {
         details.set_fullscreen(true);
+    }
+    if page == nav::DETAILS && options.steps > 0 {
+        let (weak, every, mut left) = (ui.as_weak(), options.step_every, options.steps);
+        slint::Timer::single_shot(Duration::from_secs(1), move || {
+            let timer = Box::leak(Box::new(slint::Timer::default()));
+            timer.start(slint::TimerMode::Repeated, every, move || {
+                if let Some(ui) = weak.upgrade().filter(|_| left > 0) {
+                    left -= 1;
+                    log::info!("shot: step");
+                    ui.global::<DetailsBridge>().invoke_step(1);
+                }
+            });
+        });
     }
 }
 

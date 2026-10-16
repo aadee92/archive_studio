@@ -29,7 +29,7 @@ pub mod sched;
 mod writer;
 
 #[allow(unused_imports)] // used by capture backends
-pub use decode::{decode, decode_full, decode_preview, dimensions, fit, write_tiff_with_reduced_page};
+pub use decode::{decode, decode_full, decode_preview, dimensions, fit, upright_dimensions, write_tiff_with_reduced_page};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -456,13 +456,18 @@ pub fn small_for_file(path: &Path) -> Option<RgbImage> {
 
 /// [`small_for_file`] for a run of images, with one disk cache connection: calls `each`
 /// with every path's index and thumbnail in turn, until it returns false.
-pub fn small_for_files<P: AsRef<Path>>(paths: &[P], mut each: impl FnMut(usize, Option<RgbImage>) -> bool) {
+pub fn small_for_files<P: AsRef<Path>>(paths: &[P], each: impl FnMut(usize, Option<RgbImage>) -> bool) {
+    for_files(paths, Tier::Small, each);
+}
+
+/// [`small_for_files`] at any tier.
+pub fn for_files<P: AsRef<Path>>(paths: &[P], tier: Tier, mut each: impl FnMut(usize, Option<RgbImage>) -> bool) {
     let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
     let mut loader = disk.as_ref().map(|disk| Loader::new(Some(disk), Arc::new(Mutex::new(Lru::new(1 << 20)))));
     for (i, path) in paths.iter().enumerate() {
         let path = path.as_ref();
-        let cached = loader.as_mut().zip(Fingerprint::of(path)).and_then(|(loader, fingerprint)| loader.cached(fingerprint, Tier::Small));
-        let image = cached.map(|(image, _)| image).or_else(|| decode::decode(path, MediaKind::Image, Tier::Small.edge()));
+        let cached = loader.as_mut().zip(Fingerprint::of(path)).and_then(|(loader, fingerprint)| loader.cached(fingerprint, tier));
+        let image = cached.map(|(image, _)| image).or_else(|| decode::decode(path, MediaKind::Image, tier.edge()));
         if !each(i, image) {
             return;
         }

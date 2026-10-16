@@ -707,6 +707,16 @@ fn with_grid(f: impl FnOnce(&GridModel)) {
     });
 }
 
+/// The grid's thumbnail of `path` if it has one in memory (the large one if it can), for
+/// Details to show at once while it decodes the picture.
+pub fn thumbnail(path: &Path) -> Option<slint::Image> {
+    GRID.with_borrow(|grid| {
+        let grid = grid.as_ref()?;
+        let id = grid.id_of(path)?;
+        grid.thumbs.get(id, Tier::Large).map(|(image, _exact)| image)
+    })
+}
+
 pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     let db = thumbs::cache::default_db_path();
     let ready = Arc::new(Mailbox::new());

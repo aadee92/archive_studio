@@ -1,6 +1,9 @@
 //! Details page: one item enlarged, opened through [`nav::open`] (double-click in Review,
-//! People or Acquire). The image is decoded off the UI thread, together with its faces from
-//! the catalog; a newer open retires an older decode.
+//! People or Acquire). The image is decoded off the UI thread no larger than the window shows
+//! it ([`pictures`]); its faces and the rest are read from the catalog on another worker
+//! meanwhile, a newer open retiring an older read. Until the picture is in, its thumbnail
+//! (from the thumbnail cache, as in the filmstrip) stands in for it, the same shape, so the
+//! sharp one replaces it in place.
 //!
 //! Faces are drawn as boxes over the picture (placed by the page in displayed-image
 //! coordinates, so they follow the window), named when someone confirmed who they are. A
@@ -18,8 +21,10 @@
 //! the picture shows the items around the shown one (small thumbnails from the cache, on a
 //! worker); a click shows another. Stepping replaces the item in place, without history, so
 //! Back returns to the view it was opened from (whose selection follows: see `nav::back`).
-//! The pictures of the next items are decoded ahead on a prefetch thread, so a step shows
-//! the new one at once (else its thumbnail until it is decoded).
+//! The pictures of the next items (three ahead in the direction of the last step, two
+//! behind) are decoded ahead, several at once, so a step shows the new one from memory, in
+//! the same frame; past those (holding an arrow key) it shows the thumbnail and then the
+//! picture once decoded.
 //!
 //! The picture zooms and pans (the page does that: wheel, drag, double-click, + / - / 0 / 1).
 //! Zoomed in past what the decoded picture resolves, the page asks for the part in view
@@ -63,12 +68,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::SystemTime;
+use std::time::Instant;
 
 use image::RgbImage;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+
+mod pictures;
+
+use pictures::{stamp, Picture, Stamp};
 
 use crate::actions;
 use crate::nav::{self, Scope, Target};
@@ -84,8 +93,9 @@ use archive_core::ops;
 use archive_core::media::{classify, MediaKind};
 use archive_core::pipeline::ORIENT;
 
-/// Longest edge decoded: sharp on a 4K screen, ~50 MB of RGB at most.
-const EDGE: u32 = 4096;
+/// Longest edge decoded for the page, whatever the window: a picture shown larger than that is
+/// sharpened by the full-resolution detail ([`detail`]).
+const MAX_EDGE: u32 = 8192;
 /// The other side, shown at most half as wide.
 const OTHER_EDGE: u32 = 2048;
 /// Most pixels decoded for zooming in (~300 MB of RGB): a larger file is decoded as large
@@ -115,9 +125,13 @@ struct Shown {
     /// The items in the similar strip.
     similar: Vec<PathBuf>,
     similar_generation: u64,
-    /// The picture shown is the decoded one already (prefetched), not a placeholder.
-    decoded: bool,
-    /// The last step went forward: prefetch ahead in that direction.
+    /// How good the picture up is.
+    up: Up,
+    /// The file's own size, upright, once read.
+    dims: Option<(u32, u32)>,
+    /// When it was asked for, to log how long its pictures took.
+    shown_at: Option<Instant>,
+    /// The last step went forward: decode ahead in that direction.
     forward: bool,
     /// The filmstrip: the items in it, and their thumbnails as far as loaded.
     film: Rc<VecModel<FilmItem>>,
@@ -126,6 +140,17 @@ struct Shown {
     /// Retires info panel reads of earlier items (or before a change).
     info_generation: u64,
     other_side_generation: u64,
+}
+
+/// The picture on the page, worst first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Up {
+    #[default]
+    Nothing,
+    Thumbnail,
+    /// Decoded for a smaller window.
+    Soft,
+    Sharp,
 }
 
 impl Shown {
@@ -145,13 +170,13 @@ thread_local! {
 }
 
 /// The latest load (`Shown::generation`), for its worker: a superseded one (stepped past)
-/// doesn't decode.
+/// doesn't read the catalog.
 static LOADING: AtomicU64 = AtomicU64::new(0);
 /// Retires filmstrip thumbnail workers of earlier items.
 static FILM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// The shown picture at full resolution, for zooming in past [`EDGE`] ([`detail`]): one at a
-/// time, decoded on first need, dropped when no longer zoomed in.
+/// The shown picture at full resolution, for zooming in past what it was decoded at
+/// ([`detail`]): one at a time, decoded on first need, dropped when no longer zoomed in.
 struct Full {
     path: PathBuf,
     stamp: Stamp,
@@ -222,6 +247,10 @@ static OWN_FACE_MODELS: OnceLock<Option<Arc<Faces>>> = OnceLock::new();
 
 pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     CONTEXT.set(Some(Context { root, pipeline }));
+    let weak = ui.as_weak();
+    pictures::start(move |path| {
+        let _ = weak.upgrade_in_event_loop(move |ui| picture_ready(&ui, &path));
+    });
     let details = ui.global::<DetailsBridge>();
     let weak = ui.as_weak();
     details.on_item_action(move |action| {
@@ -411,6 +440,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
 
 /// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
 pub fn show(ui: &AppWindow, mut target: Target) {
+    let started = Instant::now();
     locate(&mut target);
     log::debug!("details: show {target:?}");
     let path = target.path.clone();
@@ -437,7 +467,9 @@ pub fn show(ui: &AppWindow, mut target: Target) {
         shown.other = None;
         shown.other_generation += 1;
         shown.similar.clear();
-        shown.decoded = false;
+        shown.up = Up::Nothing;
+        shown.dims = None;
+        shown.shown_at = Some(started);
     });
     details.set_has_item(true);
     details.set_name(name);
@@ -463,19 +495,21 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_similar(ModelRc::default());
     details.set_info_tag_error(SharedString::default());
     details.set_info_tag_matches(ModelRc::default());
-    // Up at once if prefetched, else its thumbnail until decoded.
-    if kind.is_some() {
-        if let Some(pixels) = prefetched(&path) {
-            details.set_info(format!("{info} · {} × {}", pixels.width(), pixels.height()).into());
-            details.set_image(slint::Image::from_rgb8(pixels));
-            details.set_image_ready(true);
-            SHOWN.with_borrow_mut(|shown| shown.decoded = true);
-        } else if let Some(thumb) = SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()).filter(|t| t.size().width > 0) {
-            details.set_image(thumb);
-            details.set_image_ready(true);
+    // Up at once if decoded ahead, else its thumbnail until it is.
+    let image = kind == Some(MediaKind::Image);
+    if image {
+        pictures::want(screen_edge(ui), [path.clone()].into_iter().chain(neighbours).collect());
+        if !show_picture(ui, &path) {
+            // The filmstrip's, else Review's (opened from there).
+            let thumb = SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()).or_else(|| crate::review::thumbnail(&path));
+            if let Some(thumb) = thumb.filter(|t| t.size().width > 0) {
+                set_picture(ui, thumb, Up::Thumbnail);
+            }
         }
     }
-    prefetch(&path, neighbours);
+    let up = SHOWN.with_borrow(|shown| shown.up);
+    details.set_loading(image && up < Up::Sharp);
+    log::debug!("details: show: {up:?} up in {:?}", started.elapsed());
     load(ui);
     load_similar(ui);
     load_film(ui);
@@ -538,7 +572,7 @@ fn neighbours(target: &Target) -> Vec<PathBuf> {
     let paths = target.scope.paths();
     let forward = SHOWN.with_borrow(|shown| shown.forward);
     let at = |offset: i64| usize::try_from(i as i64 + offset).ok().and_then(|j| paths.get(j));
-    let order: [i64; 3] = if forward { [1, 2, -1] } else { [-1, -2, 1] };
+    let order: [i64; 5] = if forward { [1, 2, 3, -1, -2] } else { [-1, -2, -3, 1, 2] };
     order.into_iter().filter_map(at).filter(|p| classify(p) == Some(MediaKind::Image)).cloned().collect()
 }
 
@@ -548,11 +582,14 @@ fn load_film(ui: &AppWindow) {
     let Some((scope, model)) = SHOWN.with_borrow(|shown| Some((shown.target.as_ref()?.scope.clone(), shown.film.clone()))) else { return };
     let details = ui.global::<DetailsBridge>();
     if scope.len < 2 {
-        SHOWN.with_borrow_mut(|shown| {
+        let shown = SHOWN.with_borrow_mut(|shown| {
             shown.film_paths.clear();
             shown.film_thumbs.clear();
+            shown.path().map(Path::to_path_buf)
         });
         model.set_vec(Vec::new());
+        // Its thumbnail all the same, to show until the picture is in.
+        film_thumbs(ui, shown.into_iter().collect());
         return;
     }
     let paths = scope.paths();
@@ -580,36 +617,113 @@ fn load_film(ui: &AppWindow) {
         missing.into_iter().map(|(_, p)| p).collect()
     });
     details.set_film_start(start as i32);
+    log::trace!("details: filmstrip: {} thumbnails to load around #{center}", missing.len());
+    film_thumbs(ui, missing);
+}
+
+/// Loads these thumbnails on a worker (in order), for the filmstrip and to stand in for the
+/// pictures until they are decoded: large ones, as they are shown the size of the page.
+fn film_thumbs(ui: &AppWindow, missing: Vec<PathBuf>) {
     let generation = FILM_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     if missing.is_empty() {
         return;
     }
-    log::trace!("details: filmstrip #{generation}: {} thumbnails to load around #{center}", missing.len());
     let weak = ui.as_weak();
     thread::spawn(move || {
-        thumbs::small_for_files(&missing, |i, small| {
+        thumbs::for_files(&missing, thumbs::Tier::Large, |i, small| {
             if FILM_GENERATION.load(Ordering::Relaxed) != generation {
                 return false;
             }
             let path = missing[i].clone();
             let pixels = small.map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
-            let _ = weak.upgrade_in_event_loop(move |_| film_thumb(path, pixels));
+            let _ = weak.upgrade_in_event_loop(move |ui| film_thumb(&ui, path, pixels));
             true
         });
     });
 }
 
-/// A filmstrip thumbnail came in (none: the file has none; not asked for again).
-fn film_thumb(path: PathBuf, pixels: Option<Pixels>) {
-    SHOWN.with_borrow_mut(|shown| {
-        let Some(i) = shown.film_paths.iter().position(|p| *p == path) else { return };
-        let thumb = pixels.map(slint::Image::from_rgb8).unwrap_or_default();
-        if let Some(mut item) = shown.film.row_data(i) {
-            item.thumb = thumb.clone();
-            shown.film.set_row_data(i, item);
+/// A filmstrip thumbnail came in (none: the file has none; not asked for again); it stands
+/// in for the picture shown until that is decoded.
+fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
+    let thumb = pixels.map(slint::Image::from_rgb8).unwrap_or_default();
+    let placeholder = SHOWN.with_borrow_mut(|shown| {
+        let placeholder = shown.path() == Some(path.as_path()) && shown.up == Up::Nothing && thumb.size().width > 0;
+        if let Some(i) = shown.film_paths.iter().position(|p| *p == path) {
+            if let Some(mut item) = shown.film.row_data(i) {
+                item.thumb = thumb.clone();
+                shown.film.set_row_data(i, item);
+            }
         }
-        shown.film_thumbs.insert(path, thumb);
+        if shown.film_paths.contains(&path) || placeholder {
+            shown.film_thumbs.insert(path, thumb.clone());
+        }
+        placeholder
     });
+    if placeholder {
+        log::debug!("details: thumbnail up {:?} after the show", SHOWN.with_borrow(|shown| shown.shown_at.map(|t| t.elapsed())));
+        set_picture(ui, thumb, Up::Thumbnail);
+    }
+}
+
+/// The longest edge of the window, in physical pixels: no picture on the page is shown larger.
+fn screen_edge(ui: &AppWindow) -> u32 {
+    let size = ui.window().size();
+    // Not yet sized (the first open, before the window is shown): as a large screen.
+    let edge = if size.width == 0 { 2560 } else { size.width.max(size.height) };
+    edge.clamp(256, MAX_EDGE)
+}
+
+/// Shows the decoded picture of `path` if it is ready (and better than what is up); whether
+/// one is up now.
+fn show_picture(ui: &AppWindow, path: &Path) -> bool {
+    let up = SHOWN.with_borrow(|shown| shown.up);
+    match pictures::get(path) {
+        Some(Picture::Sharp(pixels)) => set_picture(ui, slint::Image::from_rgb8(pixels), Up::Sharp),
+        Some(Picture::Soft(pixels)) if up < Up::Soft => set_picture(ui, slint::Image::from_rgb8(pixels), Up::Soft),
+        Some(Picture::Failed) => {
+            let details = ui.global::<DetailsBridge>();
+            details.set_loading(false);
+            if up == Up::Nothing {
+                details.set_image_ready(false);
+            }
+        }
+        _ => {}
+    }
+    SHOWN.with_borrow(|shown| shown.up) > Up::Nothing
+}
+
+/// Puts `image` up as the shown item's picture.
+fn set_picture(ui: &AppWindow, image: slint::Image, up: Up) {
+    let details = ui.global::<DetailsBridge>();
+    details.set_image(image);
+    details.set_image_ready(true);
+    SHOWN.with_borrow_mut(|shown| shown.up = up);
+    if up == Up::Sharp {
+        details.set_loading(false);
+    }
+    show_dims(ui);
+}
+
+/// The file's size in the info line, and what 100% zoom is, once both it and a decoded
+/// picture are in (with only a thumbnail up, the page would ask for detail at once).
+fn show_dims(ui: &AppWindow) {
+    let details = ui.global::<DetailsBridge>();
+    let Some((info, (w, h), up)) = SHOWN.with_borrow(|shown| Some((shown.info.clone(), shown.dims?, shown.up))) else { return };
+    details.set_info(format!("{info} · {w} × {h}").into());
+    details.set_full_edge(if up >= Up::Soft { w.max(h) as i32 } else { 0 });
+}
+
+/// A picture came in from [`pictures`]: up, if it is of the item shown and better.
+fn picture_ready(ui: &AppWindow, path: &Path) {
+    let Some((up, shown_at)) = SHOWN.with_borrow(|shown| (shown.path() == Some(path)).then_some((shown.up, shown.shown_at))) else { return };
+    if up == Up::Sharp {
+        return;
+    }
+    show_picture(ui, path);
+    let now = SHOWN.with_borrow(|shown| shown.up);
+    if now != up {
+        log::debug!("details: {up:?} -> {now:?} {:?} after the show", shown_at.map(|t| t.elapsed()));
+    }
 }
 
 /// Shows nothing (the item shown is gone and there is nowhere to go back to).
@@ -698,9 +812,11 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
     if this || other || similar {
         log::debug!("details: {} changed (shown {this}, other side {other}, similar {similar})", path.display());
     }
-    forget(path);
+    pictures::forget(path);
     if this {
-        SHOWN.with_borrow_mut(|shown| shown.decoded = false);
+        // The old picture stays up as a stand-in until the new one is decoded.
+        SHOWN.with_borrow_mut(|shown| shown.up = shown.up.min(Up::Thumbnail));
+        ui.global::<DetailsBridge>().set_full_edge(0);
         // The page asks again for the new file once its picture is up.
         detail(ui, None);
         load(ui);
@@ -773,65 +889,39 @@ fn load(ui: &AppWindow) {
     }) else {
         return;
     };
-    let details = ui.global::<DetailsBridge>();
-    details.set_loading(true);
-    details.set_is_image(kind == MediaKind::Image);
+    ui.global::<DetailsBridge>().set_is_image(kind == MediaKind::Image);
 
     let root = root();
     let weak = ui.as_weak();
     log::debug!("details: load #{generation} {}", path.display());
     LOADING.store(generation, Ordering::Relaxed);
     thread::spawn(move || {
-        let started = std::time::Instant::now();
+        if LOADING.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        let started = Instant::now();
         let catalog = root.filter(|_| kind == MediaKind::Image).and_then(|root| open_catalog(&root));
         let review = catalog.as_ref().and_then(|c| orient_review(c, &path));
         let faces = catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default();
         let other = if kind == MediaKind::Image { read_other_side(catalog.as_ref(), &path) } else { None };
         drop(catalog);
-        if LOADING.load(Ordering::Relaxed) != generation {
-            log::debug!("details: load #{generation} superseded before decoding - dropped");
-            return;
-        }
-        let pixels = decode(&path, kind);
-        let full_edge = thumbs::dimensions(&path).map_or(0, |(w, h)| w.max(h));
-        log::debug!(
-            "details: load #{generation} read in {:?}: decoded {}, {} faces, review {:?}, other side {:?}",
-            started.elapsed(),
-            pixels.as_ref().map_or_else(|| "nothing".to_owned(), |p| format!("{}x{}", p.width(), p.height())),
-            faces.len(),
-            review,
-            other
-        );
+        let dims = if kind == MediaKind::Image { thumbs::upright_dimensions(&path) } else { None };
+        log::debug!("details: load #{generation} read in {:?}: {dims:?}, {} faces, review {review:?}, other side {other:?}", started.elapsed(), faces.len());
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let Some((info, flash, decoded)) = SHOWN.with_borrow_mut(|shown| {
+            let Some(flash) = SHOWN.with_borrow_mut(|shown| {
                 (shown.generation == generation).then(|| {
-                    let flash = if pixels.is_some() { shown.flash.take() } else { None };
-                    (shown.info.clone(), flash, std::mem::replace(&mut shown.decoded, pixels.is_some()))
+                    shown.dims = dims;
+                    shown.flash.take()
                 })
             }) else {
                 log::debug!("details: load #{generation} superseded - dropped");
                 return;
             };
             let details = ui.global::<DetailsBridge>();
-            details.set_loading(false);
             let (cw, detail) = review.unwrap_or_default();
             details.set_review_cw(cw as i32);
             details.set_review_detail(detail.into());
-            match pixels {
-                Some(pixels) => {
-                    details.set_info(format!("{info} · {} × {}", pixels.width(), pixels.height()).into());
-                    details.set_full_edge(full_edge.max(pixels.width()).max(pixels.height()) as i32);
-                    // Already up if it was prefetched.
-                    if !decoded {
-                        details.set_image(slint::Image::from_rgb8(pixels));
-                    }
-                    details.set_image_ready(true);
-                }
-                None => {
-                    details.set_info(info.into());
-                    details.set_image_ready(false);
-                }
-            }
+            show_dims(&ui);
             // Ignored faces (not a face, a stranger) aren't drawn, unless that's the one asked for.
             let flash_at = show_faces(&ui, faces, flash);
             if let Some(id) = flash {
@@ -1083,127 +1173,6 @@ fn change_tag(ui: &AppWindow, change: TagChange) {
             }
         });
     });
-}
-
-/// When a file was decoded: a prefetched picture of an older version isn't used.
-type Stamp = Option<(u64, SystemTime)>;
-
-fn stamp(path: &Path) -> Stamp {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
-}
-
-/// Pictures decoded ahead for the items next to the shown one ([`prefetch`]), shared by the
-/// prefetch thread and the loads (which wait for a prefetch in flight rather than decode
-/// the same file twice).
-struct Prefetch {
-    /// To decode, likeliest next first.
-    wanted: Vec<PathBuf>,
-    /// What may be kept decoded: the shown item and `wanted`.
-    keep: Vec<PathBuf>,
-    pending: Vec<PathBuf>,
-    ready: Vec<(PathBuf, Stamp, Pixels)>,
-    started: bool,
-}
-
-static PREFETCH: Mutex<Prefetch> = Mutex::new(Prefetch { wanted: Vec::new(), keep: Vec::new(), pending: Vec::new(), ready: Vec::new(), started: false });
-/// Signalled whenever `PREFETCH` changes.
-static PREFETCH_CHANGED: Condvar = Condvar::new();
-
-impl Prefetch {
-    fn ready(&self, path: &Path, stamp: Stamp) -> Option<Pixels> {
-        let (_, _, pixels) = self.ready.iter().find(|(p, s, _)| p == path && stamp.is_some() && *s == stamp)?;
-        Some(pixels.clone())
-    }
-
-    /// Keeps `pixels` for `path` if it is still wanted.
-    fn put(&mut self, path: &Path, stamp: Stamp, pixels: &Pixels) {
-        if self.keep.iter().any(|p| p == path) && self.ready(path, stamp).is_none() {
-            self.ready.retain(|(p, _, _)| p != path);
-            self.ready.push((path.to_path_buf(), stamp, pixels.clone()));
-        }
-    }
-}
-
-fn decode_now(path: &Path, kind: MediaKind) -> Option<Pixels> {
-    thumbs::decode(path, kind, EDGE).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()))
-}
-
-/// The picture of `path` for the page: prefetched, or decoded now (on a worker).
-fn decode(path: &Path, kind: MediaKind) -> Option<Pixels> {
-    let stamp = stamp(path);
-    let mut prefetch = PREFETCH.lock().unwrap();
-    loop {
-        if let Some(pixels) = prefetch.ready(path, stamp) {
-            log::trace!("details: {} was prefetched", path.display());
-            return Some(pixels);
-        }
-        if !prefetch.pending.iter().any(|p| p == path) {
-            break;
-        }
-        prefetch = PREFETCH_CHANGED.wait(prefetch).unwrap();
-    }
-    drop(prefetch);
-    let pixels = decode_now(path, kind)?;
-    // Kept for stepping back to it.
-    PREFETCH.lock().unwrap().put(path, stamp, &pixels);
-    Some(pixels)
-}
-
-/// The picture of `path`, if prefetched (on the UI thread: doesn't wait).
-fn prefetched(path: &Path) -> Option<Pixels> {
-    PREFETCH.lock().unwrap().ready(path, stamp(path))
-}
-
-/// Decodes `next` ahead on the prefetch thread (started on first use), dropping what was
-/// decoded for items other than `shown` and those.
-fn prefetch(shown: &Path, next: Vec<PathBuf>) {
-    let mut prefetch = PREFETCH.lock().unwrap();
-    prefetch.keep = next.iter().cloned().chain([shown.to_path_buf()]).collect();
-    let keep = std::mem::take(&mut prefetch.keep);
-    prefetch.ready.retain(|(p, _, _)| keep.contains(p));
-    prefetch.keep = keep;
-    prefetch.wanted = next;
-    if !prefetch.started {
-        prefetch.started = true;
-        let _ = thread::Builder::new().name("details-prefetch".into()).spawn(prefetch_thread);
-    }
-    PREFETCH_CHANGED.notify_all();
-}
-
-/// Drops a prefetched picture of `path` (the file changed).
-fn forget(path: &Path) {
-    PREFETCH.lock().unwrap().ready.retain(|(p, _, _)| p != path);
-}
-
-fn prefetch_thread() {
-    loop {
-        let path = {
-            let mut prefetch = PREFETCH.lock().unwrap();
-            loop {
-                let p = &*prefetch;
-                let next = p.wanted.iter().find(|w| !p.pending.contains(w) && !p.ready.iter().any(|(r, _, _)| r == *w)).cloned();
-                if let Some(next) = next {
-                    prefetch.pending.push(next.clone());
-                    break next;
-                }
-                prefetch = PREFETCH_CHANGED.wait(prefetch).unwrap();
-            }
-        };
-        let started = std::time::Instant::now();
-        let stamp = stamp(&path);
-        let pixels = decode_now(&path, MediaKind::Image);
-        log::trace!("details: prefetched {} in {:?} ({})", path.display(), started.elapsed(), if pixels.is_some() { "ok" } else { "failed" });
-        let mut prefetch = PREFETCH.lock().unwrap();
-        prefetch.pending.retain(|p| *p != path);
-        // Not tried again if it failed.
-        prefetch.wanted.retain(|p| *p != path);
-        if let Some(pixels) = &pixels {
-            prefetch.put(&path, stamp, pixels);
-        }
-        drop(prefetch);
-        PREFETCH_CHANGED.notify_all();
-    }
 }
 
 /// The page's zoomed `view` of the shown picture, settled (`None`: no longer zoomed in past
@@ -1661,22 +1630,6 @@ mod tests {
         let mut target = Target::new("c-back".into(), Scope::of("Review".into(), paths, Some(1)));
         locate(&mut target);
         assert_eq!(target.scope.current, Some(1));
-    }
-
-    #[test]
-    fn prefetched_pictures_are_kept_while_wanted_and_current() {
-        let mut prefetch = Prefetch { wanted: Vec::new(), keep: vec!["a".into()], pending: Vec::new(), ready: Vec::new(), started: false };
-        let pixels = Pixels::new(2, 2);
-        let stamp = Some((1, SystemTime::UNIX_EPOCH));
-        prefetch.put(Path::new("b"), stamp, &pixels);
-        assert!(prefetch.ready.is_empty(), "not wanted");
-        prefetch.put(Path::new("a"), stamp, &pixels);
-        assert!(prefetch.ready(Path::new("a"), stamp).is_some());
-        let changed = Some((2, SystemTime::UNIX_EPOCH));
-        assert!(prefetch.ready(Path::new("a"), changed).is_none(), "file changed since");
-        assert!(prefetch.ready(Path::new("a"), None).is_none(), "file gone");
-        prefetch.put(Path::new("a"), changed, &pixels);
-        assert_eq!(prefetch.ready.len(), 1, "replaced");
     }
 
     #[test]

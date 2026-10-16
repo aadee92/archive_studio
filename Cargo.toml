@@ -8,3 +8,35 @@ exclude = ["utils"]
 # GUI usable with a scanner.
 [profile.dev.package.photo-duplex]
 opt-level = 3
+
+# Image decoding and resizing are 10-20x slower unoptimized (a phone JPEG took 3 s instead of
+# 0.2 s on Details): optimize the codecs in debug builds too, and `picture`, where their
+# generic code is instantiated.
+[profile.dev.package.picture]
+opt-level = 3
+[profile.dev.package.jpeg-decoder]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.fast_image_resize]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.tiff]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.image-webp]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
