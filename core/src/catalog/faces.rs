@@ -13,8 +13,10 @@
 //! 3. **Review.** [`Catalog::faces`] lists a selection (one person's suggestions, a cluster, …)
 //!    in [`FaceOrder::Similarity`], a path where each face resembles the one before, so a
 //!    run of faces ages gradually instead of jumping from child to grandparent. The user
-//!    [confirms](Catalog::confirm_faces), [rejects a suggestion](Catalog::reject_suggestions),
-//!    or [ignores](Catalog::ignore_faces) faces, in bulk.
+//!    [confirms](Catalog::confirm_faces), [rejects a suggestion](Catalog::reject_suggestions)
+//!    (or [a person](Catalog::reject_person)), or [ignores](Catalog::ignore_faces) faces, in
+//!    bulk. Both are undone the same way: [`FaceFilter::Ignored`] and [`FaceFilter::Rejected`]
+//!    list them, [`Catalog::unignore_faces`] and [`Catalog::clear_rejections`] take them back.
 //! 4. **Fix up**, one picture at a time: say a named face is [not that person](Catalog::not_person),
 //!    [delete](Catalog::delete_faces) a box that isn't a face at all, or [add](Catalog::add_face)
 //!    one the detector missed ([`scan_region`] embeds it, so suggestions and clusters use it).
@@ -149,6 +151,9 @@ pub enum FaceFilter {
     /// Unreviewed and in this cluster.
     Cluster(i64),
     Ignored,
+    /// The user said aren't this person ([`Catalog::reject_person`], [`Catalog::not_person`]),
+    /// whatever they are now.
+    Rejected(TagId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,17 +302,7 @@ impl Catalog {
 
     /// The faces `filter` selects, in `order`.
     pub fn faces(&self, filter: FaceFilter, order: FaceOrder) -> Result<Vec<Face>> {
-        const UNREVIEWED: &str = "person IS NULL AND NOT ignored";
-        let (condition, arg): (String, Option<i64>) = match filter {
-            FaceFilter::All => ("1".into(), None),
-            FaceFilter::Asset(a) => ("asset_id = ?1".into(), Some(a.0)),
-            FaceFilter::Unreviewed => (UNREVIEWED.into(), None),
-            FaceFilter::Unknown => (format!("{UNREVIEWED} AND suggested IS NULL"), None),
-            FaceFilter::Suggested(t) => (format!("{UNREVIEWED} AND suggested = ?1"), Some(t.0)),
-            FaceFilter::Confirmed(t) => ("person = ?1".into(), Some(t.0)),
-            FaceFilter::Cluster(c) => (format!("{UNREVIEWED} AND cluster = ?1"), Some(c)),
-            FaceFilter::Ignored => ("ignored".into(), None),
-        };
+        let (condition, arg) = filter_sql(filter);
         let sort = match order {
             FaceOrder::Confidence => "ORDER BY f.similarity IS NULL, f.similarity DESC, f.score DESC, f.id",
             FaceOrder::Asset | FaceOrder::Similarity => "ORDER BY a.path, f.x, f.id",
@@ -349,6 +344,13 @@ impl Catalog {
             }
             _ => faces,
         })
+    }
+
+    /// How many faces `filter` selects (without reading them, as [`faces`](Self::faces) does).
+    pub fn count_faces(&self, filter: FaceFilter) -> Result<usize> {
+        let (condition, arg) = filter_sql(filter);
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT count(*) FROM faces f WHERE {condition}"))?;
+        Ok(stmt.query_row(rusqlite::params_from_iter(arg), |row| row.get::<_, i64>(0))? as usize)
     }
 
     /// The face's crop (JPEG), if it has one.
@@ -406,10 +408,7 @@ impl Catalog {
     }
 
     fn confirm_faces_inner(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
-        let kind: String = self.conn.query_row("SELECT kind FROM tags WHERE id = ?1", [person.0], |row| row.get(0))?;
-        if kind != TagKind::Person.name() {
-            return Err(Error::Invalid(format!("tag {} is a {kind}, not a person", person.0)));
-        }
+        self.ensure_person(person)?;
         let tx = self.conn.transaction()?;
         for &face in faces {
             release(&tx, face, Some(person))?;
@@ -453,6 +452,46 @@ impl Catalog {
         Ok(())
     }
 
+    /// The user says these faces are not `person` (a person tag), whoever they are suggested
+    /// as by now: that person isn't suggested for them again, and a suggestion of them is
+    /// dropped. The faces stay unreviewed (a face named as `person` is left alone: that is
+    /// [`not_person`](Self::not_person)). [`clear_rejections`](Self::clear_rejections) undoes it.
+    pub fn reject_person(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
+        let result = self.reject_person_inner(faces, person);
+        super::logged(format_args!("reject_person {} as person {}", super::face_ids(faces), person.0), result)
+    }
+
+    fn reject_person_inner(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
+        self.ensure_person(person)?;
+        let tx = self.conn.transaction()?;
+        for &face in faces {
+            tx.execute(
+                "INSERT OR IGNORE INTO face_rejections (face_id, tag_id) SELECT id, ?2 FROM faces WHERE id = ?1 AND person IS NOT ?2",
+                [face.0, person.0],
+            )?;
+            tx.execute("UPDATE faces SET suggested = NULL, similarity = NULL WHERE id = ?1 AND suggested = ?2", [face.0, person.0])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Takes back rejections of `person` for these faces ([`FaceFilter::Rejected`] lists
+    /// them): the next [`refresh_suggestions`](Self::refresh_suggestions) may suggest them
+    /// as that person again.
+    pub fn clear_rejections(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
+        let result = self.clear_rejections_inner(faces, person);
+        super::logged(format_args!("clear_rejections {} of person {}", super::face_ids(faces), person.0), result)
+    }
+
+    fn clear_rejections_inner(&mut self, faces: &[FaceId], person: TagId) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &face in faces {
+            tx.execute("DELETE FROM face_rejections WHERE face_id = ?1 AND tag_id = ?2", [face.0, person.0])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The user says these faces aren't worth naming (not a face, a stranger in a crowd).
     pub fn ignore_faces(&mut self, faces: &[FaceId]) -> Result<()> {
         let result = self.ignore_faces_inner(faces);
@@ -471,6 +510,23 @@ impl Catalog {
 
     fn unreview_faces_inner(&mut self, faces: &[FaceId]) -> Result<()> {
         self.set_unnamed(faces, false)
+    }
+
+    /// Undoes an ignore only: the ignored ones of these faces are unreviewed again (and
+    /// suggested from the next [`refresh_suggestions`](Self::refresh_suggestions)); a face
+    /// named meanwhile is left as it is, unlike with [`unreview_faces`](Self::unreview_faces).
+    pub fn unignore_faces(&mut self, faces: &[FaceId]) -> Result<()> {
+        let result = self.unignore_faces_inner(faces);
+        super::logged(format_args!("unignore_faces {}", super::face_ids(faces)), result)
+    }
+
+    fn unignore_faces_inner(&mut self, faces: &[FaceId]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &face in faces {
+            tx.execute("UPDATE faces SET ignored = 0 WHERE id = ?1 AND ignored AND person IS NULL", [face.0])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn set_unnamed(&mut self, faces: &[FaceId], ignored: bool) -> Result<()> {
@@ -618,11 +674,36 @@ impl Catalog {
         Ok(labels.iter().flatten().max().map_or(0, |m| m + 1))
     }
 
+    /// Fails unless `tag` is a person tag.
+    fn ensure_person(&self, tag: TagId) -> Result<()> {
+        let kind: String = self.conn.query_row("SELECT kind FROM tags WHERE id = ?1", [tag.0], |row| row.get(0))?;
+        if kind != TagKind::Person.name() {
+            return Err(Error::Invalid(format!("tag {} is a {kind}, not a person", tag.0)));
+        }
+        Ok(())
+    }
+
     /// `(first column, embedding)` for each row of `sql`.
     fn load_embeddings(&self, sql: &str) -> Result<Vec<(i64, Embedding)>> {
         let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, embedding(row.get_ref(1)?.as_blob()?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// The SQL condition on `faces f` that selects what `filter` says, and its argument.
+fn filter_sql(filter: FaceFilter) -> (String, Option<i64>) {
+    const UNREVIEWED: &str = "f.person IS NULL AND NOT f.ignored";
+    match filter {
+        FaceFilter::All => ("1".into(), None),
+        FaceFilter::Asset(a) => ("f.asset_id = ?1".into(), Some(a.0)),
+        FaceFilter::Unreviewed => (UNREVIEWED.into(), None),
+        FaceFilter::Unknown => (format!("{UNREVIEWED} AND f.suggested IS NULL"), None),
+        FaceFilter::Suggested(t) => (format!("{UNREVIEWED} AND f.suggested = ?1"), Some(t.0)),
+        FaceFilter::Confirmed(t) => ("f.person = ?1".into(), Some(t.0)),
+        FaceFilter::Cluster(c) => (format!("{UNREVIEWED} AND f.cluster = ?1"), Some(c)),
+        FaceFilter::Ignored => ("f.ignored".into(), None),
+        FaceFilter::Rejected(t) => ("f.id IN (SELECT face_id FROM face_rejections WHERE tag_id = ?1)".into(), Some(t.0)),
     }
 }
 
@@ -814,6 +895,62 @@ mod tests {
         lib.cat.unreview_faces(&new).unwrap();
         lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
         assert_eq!(lib.suggestion(new[0]), Some(alice));
+    }
+
+    #[test]
+    fn rejecting_a_person_keeps_the_face_unknown_until_taken_back() {
+        let mut lib = Lib::new();
+        let (alice, bob) = (lib.person("Alice"), lib.person("Bob"));
+        let (_, a) = lib.photo("alice.jpg", &[0.0]);
+        let (_, b) = lib.photo("bob.jpg", &[40.0]);
+        lib.cat.confirm_faces(&a, alice).unwrap();
+        lib.cat.confirm_faces(&b, bob).unwrap();
+        let (_, new) = lib.photo("new.jpg", &[15.0, 5.0]);
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(new[0]), Some(alice));
+
+        // Rejecting Alice drops only her suggestion; rejecting Bob for a face suggested as
+        // Alice keeps that suggestion. A face named Alice isn't rejected as her.
+        lib.cat.reject_person(&new[..1], alice).unwrap();
+        lib.cat.reject_person(&new[1..], bob).unwrap();
+        lib.cat.reject_person(&a, alice).unwrap();
+        assert_eq!(lib.suggestion(new[0]), None);
+        assert_eq!(lib.suggestion(new[1]), Some(alice));
+        assert_eq!(lib.ids(FaceFilter::Unreviewed), new);
+        assert_eq!(lib.ids(FaceFilter::Rejected(alice)), [new[0]]);
+        assert_eq!(lib.ids(FaceFilter::Rejected(bob)), [new[1]]);
+        assert_eq!(lib.cat.count_faces(FaceFilter::Rejected(alice)).unwrap(), 1);
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(new[0]), Some(bob));
+
+        lib.cat.clear_rejections(&new, alice).unwrap();
+        assert_eq!(lib.ids(FaceFilter::Rejected(alice)), []);
+        assert_eq!(lib.ids(FaceFilter::Rejected(bob)), [new[1]], "only Alice's rejections go");
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(new[0]), Some(alice));
+
+        let beach = lib.cat.tag("Scenes|Beach", TagKind::Scene).unwrap();
+        assert!(matches!(lib.cat.reject_person(&new, beach), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn unignoring_brings_back_only_ignored_faces() {
+        let mut lib = Lib::new();
+        let alice = lib.person("Alice");
+        let (_, known) = lib.photo("alice.jpg", &[0.0]);
+        lib.cat.confirm_faces(&known, alice).unwrap();
+        let (_, faces) = lib.photo("crowd.jpg", &[3.0, 90.0, 180.0]);
+        lib.cat.ignore_faces(&faces).unwrap();
+        assert_eq!(lib.cat.count_faces(FaceFilter::Ignored).unwrap(), 3);
+        assert_eq!(lib.cat.count_faces(FaceFilter::Unreviewed).unwrap(), 0);
+        // Named from the ignored list meanwhile: unignoring leaves the name.
+        lib.cat.confirm_faces(&faces[2..], alice).unwrap();
+        lib.cat.unignore_faces(&faces).unwrap();
+        assert_eq!(lib.ids(FaceFilter::Ignored), []);
+        assert_eq!(lib.ids(FaceFilter::Unreviewed), &faces[..2]);
+        assert_eq!(lib.ids(FaceFilter::Confirmed(alice)), [known[0], faces[2]]);
+        lib.cat.refresh_suggestions(DEFAULT_MIN_SIMILARITY).unwrap();
+        assert_eq!(lib.suggestion(faces[0]), Some(alice));
     }
 
     #[test]

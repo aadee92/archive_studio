@@ -35,6 +35,11 @@ faces [PATH]               people and unknown faces, or the faces in one file
 name FACE_ID... NAME       name faces (ids from faces PATH); tags their files People|NAME
 not FACE_ID...             they aren't who they're named (or suggested) as: un-name, untag
 ignore FACE_ID...          faces not worth naming (strangers, not a face)
+unignore FACE_ID...        ignored faces back to unknown
+ignored                    the ignored faces
+reject FACE_ID... PERSON   they aren't PERSON: never suggested as them (still unknown)
+unreject FACE_ID... PERSON take that back: they may be suggested as PERSON again
+rejected PERSON            the faces said not to be PERSON
 delete-face FACE_ID...     remove face boxes altogether (false detections)
 add-face PATH X Y W H      box a face the detector missed (fractions of the picture: left,
                            top, width, height); prints its id, to name it
@@ -309,6 +314,12 @@ impl Shell {
             "name" => self.name(rest),
             "not" => self.each_face(rest, "not", Catalog::not_person),
             "ignore" => self.each_face(rest, "ignore", Catalog::ignore_faces),
+            "unignore" => self.each_face(rest, "unignore", Catalog::unignore_faces),
+            "reject" => self.reject(rest, false),
+            "unreject" => self.reject(rest, true),
+            "ignored" => self.list_faces(archive_core::catalog::faces::FaceFilter::Ignored),
+            "rejected" => existing_person(&self.catalog, &rest.join(" "))
+                .and_then(|person| self.list_faces(archive_core::catalog::faces::FaceFilter::Rejected(person))),
             "delete-face" => self.each_face(rest, "delete-face", Catalog::delete_faces),
             "add-face" => self.add_face(rest),
             "person" => self.person(rest),
@@ -557,6 +568,40 @@ impl Shell {
         Ok(())
     }
 
+    /// `reject FACE_ID... PERSON` (`undo`: `unreject`).
+    fn reject(&mut self, args: &[&str], undo: bool) -> Result<(), String> {
+        let command = if undo { "unreject" } else { "reject" };
+        let ids: Vec<FaceId> = args.iter().map_while(|a| a.parse().ok().map(FaceId)).collect();
+        let name = args[ids.len()..].join(" ");
+        if ids.is_empty() || name.is_empty() {
+            return Err(format!("{command} FACE_ID... PERSON"));
+        }
+        let person = existing_person(&self.catalog, &name)?;
+        if undo {
+            self.catalog.clear_rejections(&ids, person).map_err(err)?;
+        } else {
+            self.catalog.reject_person(&ids, person).map_err(err)?;
+        }
+        println!("{command}: {} faces", ids.len());
+        Ok(())
+    }
+
+    /// The faces `filter` selects, with their files.
+    fn list_faces(&self, filter: archive_core::catalog::faces::FaceFilter) -> Result<(), String> {
+        use archive_core::catalog::faces::{FaceOrder, FaceStatus};
+        let faces = self.catalog.faces(filter, FaceOrder::Asset).map_err(err)?;
+        for f in &faces {
+            let status = match f.status {
+                FaceStatus::Confirmed(_) => "  (named)",
+                FaceStatus::Ignored => "  (ignored)",
+                FaceStatus::Unreviewed => "",
+            };
+            println!("face {:<6} {}{status}", f.id.0, self.shown(f.asset));
+        }
+        println!("{} faces", faces.len());
+        Ok(())
+    }
+
     /// `COMMAND FACE_ID...`: `change` on those faces.
     fn each_face(
         &mut self,
@@ -599,19 +644,7 @@ impl Shell {
         let usage = "person rename NAME -> NEW | person merge NAME -> INTO | person delete NAME | person cover NAME FACE_ID|auto";
         let Some((&action, rest)) = args.split_first() else { return Err(usage.into()) };
         let two = || two_names(rest, usage);
-        let existing = |catalog: &Catalog, name: &str| -> Result<archive_core::catalog::TagId, String> {
-            let known = catalog.leaf_tags(TagKind::Person).map_err(err)?;
-            let lower = name.to_lowercase();
-            let matches: Vec<_> = known
-                .iter()
-                .filter(|(_, p)| p.eq_ignore_ascii_case(name) || archive_core::catalog::people::display_name(p).to_lowercase() == lower)
-                .collect();
-            match matches[..] {
-                [(id, _)] => Ok(*id),
-                [] => Err(format!("no person {name}")),
-                _ => Err(format!("{name} is ambiguous; give the full path")),
-            }
-        };
+        let existing = existing_person;
         match action {
             "rename" => {
                 let (old, new) = two()?;
@@ -961,6 +994,21 @@ impl Shell {
 }
 
 /// Two names (tags, people) from the arguments: separated by `->`, or one word each.
+/// The person tag `name` names: its path, or a display name only one person has.
+fn existing_person(catalog: &Catalog, name: &str) -> Result<archive_core::catalog::TagId, String> {
+    let known = catalog.leaf_tags(TagKind::Person).map_err(err)?;
+    let lower = name.to_lowercase();
+    let matches: Vec<_> = known
+        .iter()
+        .filter(|(_, p)| p.eq_ignore_ascii_case(name) || archive_core::catalog::people::display_name(p).to_lowercase() == lower)
+        .collect();
+    match matches[..] {
+        [(id, _)] => Ok(*id),
+        [] => Err(format!("no person {name}")),
+        _ => Err(format!("{name} is ambiguous; give the full path")),
+    }
+}
+
 fn two_names(args: &[&str], usage: &str) -> Result<(String, String), String> {
     match args.iter().position(|w| *w == "->") {
         Some(i) if i > 0 && i + 1 < args.len() => Ok((args[..i].join(" "), args[i + 1..].join(" "))),

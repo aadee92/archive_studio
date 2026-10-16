@@ -3,7 +3,8 @@ import { Theme } from "theme.slint";
 import { ScrollRestore, UiLog } from "nav.slint";
 import { ItemMenu } from "menu.slint";
 
-// A person tag with faces, or "Unknown" (key -1) for faces nobody has named yet.
+// A person tag with faces, "Unknown" (key -1) for faces nobody has named yet, or "Ignored"
+// (key -3, last) for the faces ignored.
 export struct PersonItem {
     key: int,
     name: string,
@@ -25,9 +26,10 @@ export struct FaceTile {
     // Suggested rather than confirmed: highlighted, and listed before the confirmed faces.
     suggested: bool,
     selected: bool,
-    // Named (or ignored) since the grid was loaded: the face stays where it is, masked
-    // and labelled, until the grid is reloaded.
+    // Named (or ignored, rejected, un-ignored) since the grid was loaded: the face stays
+    // where it is, masked and labelled, until the grid is reloaded.
     assigned: string,
+    // Masked light (not named).
     ignored: bool,
 }
 
@@ -40,6 +42,12 @@ export global PeopleBridge {
     in-out property <int> sort: 0;
     in-out property <string> filter;
     in-out property <int> selected: -1;
+    // The grid shows the faces said not to be the selected person, rather than theirs.
+    in property <bool> rejected-view;
+    // How many faces were said not to be the selected person.
+    in property <int> rejected-count;
+    // Selected faces still only suggested as the person on screen.
+    in property <int> selected-suggestions;
     // Face crops, `columns` per row; a face is addressed by (row, column).
     in property <[FaceRow]> rows;
     in property <string> title;
@@ -81,6 +89,13 @@ export global PeopleBridge {
     callback name-edited(string);
     callback assign(string);
     callback ignore();
+    // On the selected faces: "confirm", "reject" (a person's suggestions), "unignore"
+    // (Ignored), "unreject" (a person's rejected faces).
+    callback act(string);
+    // Show the selected person's rejected faces (true), or theirs again.
+    callback show-rejected(bool);
+    // `text` is one character to type (not a special key).
+    pure callback is-text(string) -> bool;
 }
 
 component FaceCell inherits Rectangle {
@@ -191,6 +206,7 @@ export component PeoplePage inherits Rectangle {
         UiLog.debug("people", "visible = \{self.visible ? "yes" : "no"}; \{root.lists-state()}");
         if (self.visible) {
             PeopleBridge.columns-changed(self.columns);
+            keys.focus();
         }
     }
     init => { PeopleBridge.columns-changed(self.columns); }
@@ -290,14 +306,21 @@ export component PeoplePage inherits Rectangle {
         }
     }
 
-    // A new selection: offer the person on screen, so Enter confirms their suggestions.
+    // A new selection: offer the person on screen, so Enter confirms their suggestions; the
+    // grid keeps the keys (typing a letter starts a name in the box).
     function selection-started() {
         if (name-box.text == "" && PeopleBridge.person-name != "") {
             name-box.text = PeopleBridge.person-name;
             PeopleBridge.name-edited(name-box.text);
         }
-        name-box.focus();
-        name-box.select-all();
+        keys.focus();
+    }
+
+    // What the view does to faces (its button, Backspace / Delete, the item menu).
+    pure function view-action() -> string {
+        return PeopleBridge.selected == -3 ? "unignore"
+            : PeopleBridge.selected >= 0 && PeopleBridge.rejected-view ? "unreject"
+            : PeopleBridge.selected >= 0 ? "reject" : "";
     }
 
     HorizontalLayout {
@@ -362,7 +385,7 @@ export component PeoplePage inherits Rectangle {
                         Button {
                             horizontal-stretch: 1;
                             text: "Ignore";
-                            enabled: PeopleBridge.selection > 0;
+                            enabled: PeopleBridge.selection > 0 && PeopleBridge.selected != -3;
                             clicked => { PeopleBridge.ignore(); }
                         }
                     }
@@ -410,7 +433,7 @@ export component PeoplePage inherits Rectangle {
                     plist := ListView {
                         for person[i] in PeopleBridge.people: Rectangle {
                             property <bool> drop-target: root.drag-key != -2 && root.drop-index == i
-                                && person.key != -1 && person.key != root.drag-key;
+                                && person.key >= 0 && person.key != root.drag-key;
                             height: root.person-row;
                             background: self.drop-target || PeopleBridge.selected == person.key ? Theme.accent-soft
                                 : person-ta.has-hover && root.drag-key == -2 ? Theme.hover : transparent;
@@ -447,7 +470,7 @@ export component PeoplePage inherits Rectangle {
                                     horizontal-stretch: 1;
                                     text: person.name;
                                     font-size: 12px;
-                                    font-italic: person.key == -1;
+                                    font-italic: person.key < 0;
                                     color: PeopleBridge.selected == person.key ? Theme.accent : Theme.text;
                                     overflow: elide;
                                     vertical-alignment: center;
@@ -465,7 +488,7 @@ export component PeoplePage inherits Rectangle {
                             person-ta := TouchArea {
                                 mouse-cursor: root.drag-key != -2 ? MouseCursor.grabbing : MouseCursor.pointer;
                                 pointer-event(event) => {
-                                    if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down && person.key != -1) {
+                                    if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down && person.key >= 0) {
                                         root.menu-person = person;
                                         UiLog.debug("people.list", "menu for row \{i} (key \{person.key}, \{person.name})");
                                         person-menu-area.show({
@@ -481,7 +504,7 @@ export component PeoplePage inherits Rectangle {
                                     }
                                 }
                                 moved => {
-                                    if (self.pressed && person.key != -1
+                                    if (self.pressed && person.key >= 0
                                         && (root.drag-key != -2 || Math.abs(self.mouse-y - self.pressed-y) > 6px)) {
                                         if (root.drag-key == -2) {
                                             UiLog.debug("people.list", "dragging row \{i} (key \{person.key}, \{person.name})");
@@ -519,7 +542,48 @@ export component PeoplePage inherits Rectangle {
                 padding-bottom: 0px;
                 spacing: 14px;
 
-                Text { text: PeopleBridge.title; font-size: 20px; font-weight: 600; color: Theme.text; overflow: elide; }
+                // The title, and what can be done to the selected faces in this view.
+                HorizontalLayout {
+                    height: 32px;
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        text: PeopleBridge.title;
+                        font-size: 20px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        overflow: elide;
+                    }
+                    if PeopleBridge.selected >= 0 && !PeopleBridge.rejected-view && PeopleBridge.selected-suggestions > 0: Button {
+                        text: "Confirm \{PeopleBridge.selected-suggestions}";
+                        primary: true;
+                        clicked => { PeopleBridge.act("confirm"); }
+                    }
+                    if PeopleBridge.selected >= 0 && !PeopleBridge.rejected-view && PeopleBridge.selected-suggestions > 0: Button {
+                        text: "Not \{PeopleBridge.person-name}";
+                        clicked => { PeopleBridge.act("reject"); }
+                    }
+                    if PeopleBridge.selected == -3 && PeopleBridge.selection > 0: Button {
+                        text: PeopleBridge.selection == 1 ? "Un-ignore" : "Un-ignore \{PeopleBridge.selection}";
+                        clicked => { PeopleBridge.act("unignore"); }
+                    }
+                    if PeopleBridge.rejected-view && PeopleBridge.selection > 0: Button {
+                        text: "Suggest as \{PeopleBridge.person-name} again";
+                        clicked => { PeopleBridge.act("unreject"); }
+                    }
+                    // To the faces said not to be them, and back.
+                    if PeopleBridge.selected >= 0 && (PeopleBridge.rejected-view || PeopleBridge.rejected-count > 0): Text {
+                        vertical-alignment: center;
+                        text: PeopleBridge.rejected-view ? "Back to \{PeopleBridge.person-name}" : "\{PeopleBridge.rejected-count} rejected";
+                        color: Theme.accent;
+                        font-size: 12px;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { PeopleBridge.show-rejected(!PeopleBridge.rejected-view); }
+                        }
+                    }
+                }
 
                 Rectangle {
                     vertical-stretch: 1;
@@ -546,6 +610,45 @@ export component PeoplePage inherits Rectangle {
                         }
                     }
 
+                    // The grid's keys: Enter names the selection as the name box says (the person
+                    // on screen: confirms), Backspace / Delete does the view's action (Not Ann,
+                    // Un-ignore, …), Ctrl+A, Esc; a letter starts a name in the name box.
+                    keys := FocusScope {
+                        focus-on-click: false;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return && PeopleBridge.selection > 0 && name-box.text != "") {
+                                UiLog.debug("people.keys", "Enter: assign \{name-box.text}");
+                                root.assign-typed();
+                                return accept;
+                            }
+                            if ((event.text == Key.Backspace || event.text == Key.Delete) && PeopleBridge.selection > 0 && root.view-action() != "") {
+                                UiLog.debug("people.keys", "\{event.text == Key.Delete ? "Delete" : "Backspace"}: \{root.view-action()}");
+                                PeopleBridge.act(root.view-action());
+                                return accept;
+                            }
+                            if (event.text == Key.Escape && PeopleBridge.selection > 0) {
+                                name-box.text = "";
+                                PeopleBridge.name-edited("");
+                                PeopleBridge.clear-selection();
+                                return accept;
+                            }
+                            if (event.modifiers.control && (event.text == "a" || event.text == "A")) {
+                                PeopleBridge.select-all();
+                                root.selection-started();
+                                return accept;
+                            }
+                            if (!event.modifiers.control && !event.modifiers.alt && PeopleBridge.selection > 0 && PeopleBridge.is-text(event.text)) {
+                                name-box.text = event.text;
+                                root.match-index = -1;
+                                PeopleBridge.name-edited(name-box.text);
+                                name-box.focus();
+                                name-box.set-selection-offsets(1000, 1000);
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
                     // All pointer input over the faces (not the scroll bar): click, shift-click
                     // for a range, ctrl-click to toggle, drag for a rubber band, double-click
                     // to open. Faces are found from the grid's geometry.
@@ -568,6 +671,7 @@ export component PeoplePage inherits Rectangle {
                                 PeopleBridge.context-menu(root.row-at(self.mouse-y - list.content-y), root.col-at(self.mouse-x));
                             }
                             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                keys.focus();
                                 root.press-x = self.mouse-x;
                                 root.press-y = self.mouse-y - list.content-y;
                                 root.press-keep = event.modifiers.shift || event.modifiers.control;
@@ -649,7 +753,11 @@ export component PeoplePage inherits Rectangle {
                     }
                     if PeopleBridge.rows.length > 0: Text {
                         vertical-alignment: center;
-                        text: "Click, Shift-click or drag to select · Ctrl-click to add";
+                        text: PeopleBridge.selection == 0 ? "Click, Shift-click or drag to select · Ctrl-click to add"
+                            : root.view-action() == "reject" ? "Type a name · Enter confirms · Backspace: not \{PeopleBridge.person-name}"
+                            : root.view-action() == "unignore" ? "Type a name · Backspace: un-ignore"
+                            : root.view-action() == "unreject" ? "Type a name · Backspace: suggest again"
+                            : "Type a name · Enter assigns";
                         color: Theme.placeholder;
                         font-size: 11px;
                     }
@@ -722,7 +830,7 @@ export component PeoplePage inherits Rectangle {
         background: #1f2328e8;
         drag-label := Text {
             text: root.drop-index >= 0 && root.drop-index < PeopleBridge.people.length
-                && PeopleBridge.people[root.drop-index].key != -1 && PeopleBridge.people[root.drop-index].key != root.drag-key
+                && PeopleBridge.people[root.drop-index].key >= 0 && PeopleBridge.people[root.drop-index].key != root.drag-key
                 ? "Merge \{root.drag-name} into \{PeopleBridge.people[root.drop-index].name}" : root.drag-name;
             color: white;
             font-size: 12px;

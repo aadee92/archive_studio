@@ -76,6 +76,10 @@ export component AppWindow inherits Window {
                     activated => { ItemMenu.action("unpair"); }
                 }
             }
+            if ItemMenu.face-action != "": MenuItem {
+                title: ItemMenu.face-action;
+                activated => { ItemMenu.action("face-action"); }
+            }
             if ItemMenu.cover-for != "": MenuItem {
                 title: "Set as cover for \{ItemMenu.cover-for}";
                 activated => { ItemMenu.action("set-cover"); }

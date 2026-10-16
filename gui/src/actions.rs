@@ -2,7 +2,8 @@
 //! the previous / next item of the view, swap, unpair), Find similar (Review ranked by how
 //! much pictures look like it: [`review::find_similar`](crate::review::find_similar)), Show
 //! in folder, Properties, Delete, and for a face confirmed as someone (People's grid) Set as
-//! cover ([`people::set_cover`](crate::people::set_cover)),
+//! cover ([`people::set_cover`](crate::people::set_cover)), and for faces in People what its
+//! view does to them (Not Ann, Un-ignore, …: [`offer_face_action`]),
 //! for any item a page shows (a Review tile, a face in People, a recent capture in Acquire,
 //! the Details picture and its similar strip). Pages resolve the item under the pointer and
 //! call [`nav::context_menu`](crate::nav::context_menu), which lands in [`show_menu`]; the
@@ -157,6 +158,7 @@ pub fn show_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
     });
     let menu = ui.global::<ItemMenu>();
     menu.set_cover_for(SharedString::default());
+    menu.set_face_action(SharedString::default());
     menu.set_count(count as i32);
     menu.set_can_rotate(rotatable);
     menu.set_can_pair_prev(at.is_some_and(|i| i > 0));
@@ -169,6 +171,12 @@ pub fn show_menu_for(ui: &AppWindow, target: Target, items: Vec<PathBuf>) {
 pub fn offer_cover(ui: &AppWindow, person: TagId, name: String) {
     ui.global::<ItemMenu>().set_cover_for(name.as_str().into());
     with_state(|s| s.cover = Some((person, name)));
+}
+
+/// Offers `title` (People's "Not Ann", "Un-ignore", …) in the menu just shown (right after
+/// [`show_menu`]); picking it is [`people::face_menu_action`](crate::people::face_menu_action).
+pub fn offer_face_action(ui: &AppWindow, title: String) {
+    ui.global::<ItemMenu>().set_face_action(title.into());
 }
 
 /// An image whose file can be turned losslessly.
@@ -239,6 +247,7 @@ pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<Pa
             (Some(face), Some((person, name))) => crate::people::set_cover(ui, person, face, name),
             _ => log::warn!("context menu: set-cover on {target:?} with no named face - ignored"),
         },
+        "face-action" => crate::people::face_menu_action(),
         "open-external" => open_externally(ui, target.path),
         "pair-prev" => pair_with_neighbour(ui, target, -1),
         "pair-next" => pair_with_neighbour(ui, target, 1),

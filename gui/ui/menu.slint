@@ -30,8 +30,12 @@ export global ItemMenu {
     // A face confirmed as a person (right-clicked in People): their name, for "Set as cover
     // for …"; "" otherwise.
     in property <string> cover-for;
+    // What People can do to the faces right-clicked in its view ("Not Ann", "Un-ignore", …);
+    // "" for nothing.
+    in property <string> face-action;
     // "rotate-left", "rotate-right", "delete", "tag", "properties", "pair-prev", "pair-next"
-    // (it is the back of that item), "swap-sides", "unpair", "find-similar", "set-cover".
+    // (it is the back of that item), "swap-sides", "unpair", "find-similar", "set-cover",
+    // "face-action".
     callback action(string);
 
     // Add tag dialog.
