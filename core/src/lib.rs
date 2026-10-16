@@ -8,7 +8,9 @@
 //! - [`catalog`]: the library database of assets and their tags, and tag search.
 //! - [`media`]: media kinds and file classification.
 //! - [`ops`]: what a front end does to one asset (rotate, delete to the trash, properties).
-//! - [`desktop`]: handing a file to the desktop (open it, show it in the file manager).
+//! - [`desktop`]: handing a file to the desktop (open it, show it in the file manager, what
+//!   a copy of files puts on the clipboard).
+//! - [`settings`]: per-user settings a front end keeps across runs.
 //! - [`exif`]: the basic EXIF fields.
 //! - [`pipeline`]: what happens to files in the library (orient, faces, identify, sidecars),
 //!   run by an [`Engine`](pipeline::Engine) thread while a front end is open.
@@ -24,6 +26,7 @@ pub mod media;
 pub mod ops;
 pub mod pipeline;
 mod resize;
+pub mod settings;
 
 /// The `image` version [`device::Frame`] comes from.
 pub use image;

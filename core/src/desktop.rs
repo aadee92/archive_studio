@@ -1,5 +1,6 @@
 //! Handing files to the desktop (freedesktop.org: Linux and the BSDs): [`open`] a file in
-//! its default application, [`show_in_folder`] in the file manager with the file selected.
+//! its default application, [`show_in_folder`] in the file manager with the file selected,
+//! and what copying files puts on the clipboard ([`CopiedFiles`]).
 //!
 //! Both run external tools (`xdg-open`, `gdbus` / `dbus-send`); [`show_in_folder`] waits for
 //! the file manager to answer (at most a few seconds), so front ends call it on a worker.
@@ -124,6 +125,31 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
+/// Files copied to the clipboard, in the formats other programs paste: a file manager takes
+/// `text/uri-list` (or GNOME's `x-special/gnome-copied-files`) and copies the files, a text
+/// field takes the paths as text. A front end offers all of them at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopiedFiles {
+    /// `text/uri-list` (RFC 2483): a `file://` URI per line, CRLF-terminated.
+    pub uri_list: String,
+    /// `x-special/gnome-copied-files`: `copy`, then a URI per line.
+    pub gnome: String,
+    /// `text/plain`: the paths, one per line.
+    pub text: String,
+}
+
+impl CopiedFiles {
+    /// The formats for `paths` (absolute, as the catalog has them).
+    pub fn new(paths: &[impl AsRef<Path>]) -> Self {
+        let uris: Vec<String> = paths.iter().map(|p| file_uri(p.as_ref())).collect();
+        Self {
+            uri_list: uris.iter().map(|u| format!("{u}\r\n")).collect(),
+            gnome: std::iter::once("copy").chain(uris.iter().map(String::as_str)).collect::<Vec<_>>().join("\n"),
+            text: paths.iter().map(|p| p.as_ref().to_string_lossy()).collect::<Vec<_>>().join("\n"),
+        }
+    }
+}
+
 /// Starts `program` detached (its exit is reaped on a thread), or says why it couldn't.
 fn spawn<const N: usize>(program: &str, args: [OsString; N]) -> Result<(), String> {
     let mut child = Command::new(program)
@@ -145,6 +171,14 @@ mod tests {
     fn file_uris_are_percent_encoded() {
         assert_eq!(file_uri(Path::new("/lib/a-1_b.~x.jpg")), "file:///lib/a-1_b.~x.jpg");
         assert_eq!(file_uri(Path::new("/lib/Mom's, 1980/ü #2.jpg")), "file:///lib/Mom%27s%2C%201980/%C3%BC%20%232.jpg");
+    }
+
+    #[test]
+    fn copied_files_in_every_format() {
+        let copied = CopiedFiles::new(&[Path::new("/lib/a b.jpg"), Path::new("/lib/c.png")]);
+        assert_eq!(copied.uri_list, "file:///lib/a%20b.jpg\r\nfile:///lib/c.png\r\n");
+        assert_eq!(copied.gnome, "copy\nfile:///lib/a%20b.jpg\nfile:///lib/c.png");
+        assert_eq!(copied.text, "/lib/a b.jpg\n/lib/c.png");
     }
 
     #[test]

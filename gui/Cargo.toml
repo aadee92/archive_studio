@@ -10,6 +10,10 @@ path = "src/main.rs"
 [dependencies]
 archive-core = { path = "../core" }
 archive-logging = { path = "../logging" }
+# The clipboard for copying files (Slint's own clipboard only takes text): the same crates
+# Slint's winit backend uses for it.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+wl-clipboard-rs = "0.9"
 log = "0.4"
 fast_image_resize = { version = "6.1.0", features = ["image"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "webp", "bmp"] }

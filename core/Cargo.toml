@@ -20,6 +20,8 @@ photo-duplex = { path = "../utils/photo-duplex" }
 png = "0.18.1"
 quick-xml = "0.41.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = "1"
+serde_json = "1"
 x980 = { version = "0.1.0", path = "../utils/epson/v850" }
 
 [dev-dependencies]

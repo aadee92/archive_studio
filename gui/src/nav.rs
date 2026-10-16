@@ -151,6 +151,16 @@ pub fn go(ui: &AppWindow, page: i32) {
     }
     log::debug!("go {page} (from page {})", ui.get_page());
     leave(ui);
+    enter(ui, page);
+}
+
+/// Starts on `page` (the one shown last time, `settings.rs`), with nothing to go Back to.
+pub fn start_on(ui: &AppWindow, page: i32) {
+    log::debug!("start on page {page}");
+    enter(ui, page);
+}
+
+fn enter(ui: &AppWindow, page: i32) {
     ui.set_page(page);
     match page {
         PEOPLE => people::entered(),

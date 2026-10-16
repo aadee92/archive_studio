@@ -732,6 +732,36 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     spawn_indexer(root, ui.as_weak());
 }
 
+/// The tag tree's collapsed nodes (lowercase paths), for the settings kept across runs.
+pub fn collapsed_tags() -> Vec<String> {
+    GRID.with_borrow(|grid| {
+        let mut paths: Vec<String> = grid.as_ref().map(|g| g.collapsed.borrow().iter().cloned().collect()).unwrap_or_default();
+        paths.sort_unstable();
+        paths
+    })
+}
+
+/// Sets up the view as it was left last time (`settings.rs`, at startup): the tag tree's
+/// collapsed nodes, and the filters the bridge was given (media kind, sort, search mode).
+pub fn restore_settings(ui: &AppWindow, collapsed: Vec<String>) {
+    let bridge = ui.global::<ReviewBridge>();
+    let filters = Filters {
+        kind: bridge.get_kind_filter(),
+        sort: bridge.get_sort_index(),
+        mode: bridge.get_search_mode(),
+        attention: bridge.get_attention(),
+        ..Default::default()
+    };
+    log::debug!("review: restored kind {}, sort {}, search mode {}, {} tags collapsed", filters.kind, filters.sort, filters.mode, collapsed.len());
+    with_grid(|g| {
+        *g.collapsed.borrow_mut() = collapsed.into_iter().map(|p| p.to_ascii_lowercase()).collect();
+        g.publish_tags();
+        if filters != Filters::default() {
+            g.set_filters(filters);
+        }
+    });
+}
+
 /// Shows Review with only the items that need `attention` (the status line's "3 rotations to
 /// review", "2 failed"): search, tags and media type are cleared, the sort is kept. Coming
 /// from another page, Back returns there.
@@ -1666,6 +1696,7 @@ impl GridModel {
             }
             "delete" if !ctrl => return self.act("delete"),
             "t" if !ctrl => return self.act("tag"),
+            "c" if ctrl => return self.act("copy"),
             "r" if !ctrl => return self.act(if shift { "rotate-left" } else { "rotate-right" }),
             _ => return false,
         };

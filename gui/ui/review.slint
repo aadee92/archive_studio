@@ -34,7 +34,9 @@ export global ReviewBridge {
     in property <bool> indexing;
     in property <bool> empty;
     in property <[TagItem]> available-tags;
-    in-out property <length> tile-size: 160px;
+    // The size slider's value (kept across runs, `settings.rs`), and the tile size it gives.
+    in-out property <float> tile-value: 160;
+    out property <length> tile-size: tile-value * 1px;
 
     // The filter controls' state, kept here so the view can be snapshotted and restored (Back).
     in-out property <string> search-text;
@@ -256,8 +258,7 @@ export component ReviewPage inherits Rectangle {
     property <bool> press-keep;
 
     // The size slider's value; Ctrl+wheel over the grid changes it too.
-    property <float> tile-value: 160;
-    changed tile-value => { ReviewBridge.tile-size = self.tile-value * 1px; }
+    property <float> tile-value <=> ReviewBridge.tile-value;
 
     // Tile size also picks the thumbnail resolution tier on the Rust side.
     property <length> tile-size: ReviewBridge.tile-size;
@@ -762,7 +763,7 @@ export component ReviewPage inherits Rectangle {
                         }
                     }
 
-                    // The grid's keys (arrows, Enter, Delete, T, R, Ctrl+A, Esc); focused on a
+                    // The grid's keys (arrows, Enter, Delete, T, R, Ctrl+A, Ctrl+C, Esc); focused on a
                     // click on the grid and when the page is shown, so the search boxes keep
                     // theirs while they are being typed in.
                     keys := FocusScope {

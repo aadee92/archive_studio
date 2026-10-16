@@ -10,10 +10,11 @@ import { FailuresPage, FailuresBridge, FailureRow } from "failures.slint";
 import { NavBridge, UiLog } from "nav.slint";
 import { ItemMenu, PropRow, TagDialog, PropertiesDialog, Notice, TagEdit, TagEditDialog } from "menu.slint";
 import { StatusBar, LogPanel, LogBridge, LogLine } from "log.slint";
+import { HelpOverlay, HelpBridge, HelpSection, HelpRow } from "help.slint";
 
 // Re-export the bridges and data types so the Rust side can reach them.
 export { AcquireBridge, ReviewBridge, PeopleBridge, DetailsBridge, PipelineBridge, NavBridge, UiLog, ItemMenu, TagEdit, PropRow, LogBridge, LogLine }
-export { TrashBridge, TrashTile, TrashRow, FailuresBridge, FailureRow }
+export { TrashBridge, TrashTile, TrashRow, FailuresBridge, FailureRow, HelpBridge, HelpSection, HelpRow }
 export { DeviceTile, DeviceState, MediaTile, MediaRow, MediaKind } from "types.slint";
 
 export component AppWindow inherits Window {
@@ -28,6 +29,8 @@ export component AppWindow inherits Window {
     min-width: 820px;
     min-height: 540px;
     background: Theme.bg;
+    // Keys reach the window's handlers below before anything was clicked (Acquire).
+    forward-focus: shell;
     default-font-size: Theme.font-size;
 
     // The item context menu, shown by Rust (`ItemMenu.serial`) where the page was
@@ -98,6 +101,10 @@ export component AppWindow inherits Window {
                 activated => { ItemMenu.action("show-in-folder"); }
             }
             MenuItem {
+                title: ItemMenu.count > 1 ? "Copy \{ItemMenu.count} items" : "Copy";
+                activated => { ItemMenu.action("copy"); }
+            }
+            MenuItem {
                 title: "Properties";
                 enabled: ItemMenu.count <= 1;
                 activated => { ItemMenu.action("properties"); }
@@ -130,7 +137,7 @@ export component AppWindow inherits Window {
     VerticalLayout {
         // Diagnostics only: logs every key on its way to the focused element (capture) and keys
         // nothing handled (bubbled up here); never takes focus or consumes a key.
-        FocusScope {
+        shell := FocusScope {
             focus-on-click: false;
             focus-on-tab-navigation: false;
             capture-key-pressed(event) => {
@@ -139,6 +146,21 @@ export component AppWindow inherits Window {
                     UiLog.debug("window.keys", "key \{root.key-name(event.text)}\{event.modifiers.control ? " +ctrl" : ""}\{event.modifiers.alt ? " +alt" : ""}\{event.modifiers.shift ? " +shift" : ""} (page \{root.page})");
                 } else {
                     UiLog.trace("window.keys", "key \{root.key-name(event.text)} (page \{root.page})");
+                }
+                // The shortcut list (src/shortcuts.rs) takes every key while it is open; ? or F1
+                // opens it, but ? is typed text in a text box.
+                if (HelpBridge.open) {
+                    if (event.text == Key.Escape || event.text == Key.F1 || event.text == "?") {
+                        UiLog.debug("window.keys", "\{root.key-name(event.text)}: close the shortcut list");
+                        HelpBridge.open = false;
+                    }
+                    return accept;
+                }
+                if (event.text == Key.F1 || (event.text == "?" && !event.modifiers.control && !event.modifiers.alt
+                        && !TextInputInterface.text-input-focused)) {
+                    UiLog.debug("window.keys", "\{root.key-name(event.text)}: shortcut list (page \{root.page})");
+                    HelpBridge.show(root.page);
+                    return accept;
                 }
                 reject
             }
@@ -189,7 +211,7 @@ export component AppWindow inherits Window {
             : text == Key.LeftArrow ? "Left" : text == Key.RightArrow ? "Right"
             : text == Key.UpArrow ? "Up" : text == Key.DownArrow ? "Down"
             : text == Key.Backspace ? "Backspace" : text == Key.Delete ? "Delete" : text == Key.F11 ? "F11"
-            : text == Key.Space ? "Space" : "\"\{text}\"";
+            : text == Key.Space ? "Space" : text == Key.F1 ? "F1" : "\"\{text}\"";
     }
 
     if ItemMenu.notice != "": Notice {
@@ -212,4 +234,10 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
     }
+    if HelpBridge.open: HelpOverlay {
+        width: root.width;
+        height: root.height;
+    }
+    property <bool> help-open: HelpBridge.open;
+    changed help-open => { UiLog.debug("window.overlay", "shortcut list \{self.help-open ? "shown" : "hidden"}"); }
 }

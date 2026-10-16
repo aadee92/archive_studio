@@ -68,6 +68,8 @@ export global DetailsBridge {
     in property <[DetailFace]> faces;
     in-out property <bool> show-boxes: true;
     in-out property <bool> show-names: true;
+    // Seconds per item in a slideshow (3, 5 or 10).
+    in-out property <int> slideshow-seconds: 5;
     // The face (index in `faces`) to flash when `flash-serial` changes: the one double-clicked
     // in People. It flashes even with the boxes turned off.
     in property <int> flash-face: -1;
@@ -996,7 +998,7 @@ export component DetailsPage inherits Rectangle {
     // Slideshow: the next item of the view every few seconds (after the last, the first);
     // any key or click stops it. Stepping prefetches the next pictures as Right does.
     property <bool> slideshow;
-    property <int> slideshow-seconds: 5;
+    property <int> slideshow-seconds: DetailsBridge.slideshow-seconds;
     function toggle-slideshow() {
         self.slideshow = !self.slideshow && DetailsBridge.scope-count > 1;
         UiLog.debug("details", "slideshow \{self.slideshow ? "started (every \{self.slideshow-seconds} s)" : "stopped"}");
@@ -1118,6 +1120,11 @@ export component DetailsPage inherits Rectangle {
             if (DetailsBridge.has-item && (event.text == "i" || event.text == "I") && !event.modifiers.alt && !event.modifiers.control) {
                 DetailsBridge.info-open = !DetailsBridge.info-open;
                 DetailsBridge.info-toggled();
+                return accept;
+            }
+            // Ctrl+C copies the file (the path box keeps its own while it has the keys).
+            if (DetailsBridge.has-item && event.modifiers.control && !event.modifiers.alt && (event.text == "c" || event.text == "C")) {
+                DetailsBridge.item-action("copy");
                 return accept;
             }
             // The item's actions, as the buttons and the item menu do them (not while a face
@@ -1259,9 +1266,9 @@ export component DetailsPage inherits Rectangle {
                     if DetailsBridge.scope-count > 1: ComboBox {
                         width: 76px;
                         model: ["3 s", "5 s", "10 s"];
-                        current-index: 1;
+                        current-index: DetailsBridge.slideshow-seconds <= 3 ? 0 : DetailsBridge.slideshow-seconds >= 10 ? 2 : 1;
                         selected => {
-                            root.slideshow-seconds = [3, 5, 10][self.current-index];
+                            DetailsBridge.slideshow-seconds = [3, 5, 10][self.current-index];
                             keys.focus();
                         }
                     }

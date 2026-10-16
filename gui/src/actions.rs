@@ -1,7 +1,7 @@
 //! The item context menu: Rotate left / right, Add tag…, front and back (pair as the back of
 //! the previous / next item of the view, swap, unpair), Find similar (Review ranked by how
 //! much pictures look like it: [`review::find_similar`](crate::review::find_similar)), Show
-//! in folder, Properties, Delete, and for a face confirmed as someone (People's grid) Set as
+//! in folder, Copy (the files to the clipboard, [`crate::clipboard`]), Properties, Delete, and for a face confirmed as someone (People's grid) Set as
 //! cover ([`people::set_cover`](crate::people::set_cover)), and for faces in People what its
 //! view does to them (Not Ann, Un-ignore, …: [`offer_face_action`]),
 //! for any item a page shows (a Review tile, a face in People, a recent capture in Acquire,
@@ -233,6 +233,7 @@ pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<Pa
             "rotate-right" => rotate_items(ui, items, 90),
             "delete" => delete(ui, items),
             "tag" => open_tag_dialog(ui, items),
+            "copy" => copy_files(ui, items),
             other => log::warn!("context menu: {other:?} is for one item, not {} - ignored", items.len()),
         }
         return;
@@ -243,6 +244,7 @@ pub(crate) fn act_on(ui: &AppWindow, action: &str, target: Target, items: Vec<Pa
         "delete" => delete(ui, vec![target.path]),
         "tag" => open_tag_dialog(ui, vec![target.path]),
         "properties" => properties(ui, target.path),
+        "copy" => copy_files(ui, vec![target.path]),
         "show-in-folder" => show_in_folder(ui, target.path),
         "find-similar" => crate::review::find_similar(ui, &target.path),
         "set-cover" => match (target.face, with_state(|s| s.cover.clone()).flatten()) {
@@ -403,6 +405,24 @@ fn show_in_folder(ui: &AppWindow, path: PathBuf) {
         if let Err(e) = result {
             let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, false));
         }
+    });
+}
+
+/// Puts the files on the clipboard for a file manager (or a text field) to paste
+/// ([`crate::clipboard`]).
+fn copy_files(ui: &AppWindow, paths: Vec<PathBuf>) {
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        let result = crate::clipboard::copy_files(&paths);
+        let text = match &result {
+            Ok(()) if paths.len() == 1 => format!("Copied {}", file_name(&paths[0])),
+            Ok(()) => format!("Copied {} items", paths.len()),
+            Err(e) => {
+                log::warn!("copy {} files: {e}", paths.len());
+                format!("Can't copy: {e}")
+            }
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, text, result.is_err(), false));
     });
 }
 

@@ -9,10 +9,12 @@
 //! Every item can be opened on the Details page (`details.rs`, via `nav.rs`) and has a
 //! context menu (`actions.rs`). The status bar under every page opens the live log
 //! (`log_view.rs`). At the bottom of the sidebar: the pipeline's failures (`failures.rs`,
-//! while there are any) and the library's trash (`trash.rs`).
+//! while there are any) and the library's trash (`trash.rs`). ? or F1 lists the keyboard
+//! shortcuts (`shortcuts.rs`); the window and its views are kept across runs (`settings.rs`).
 
 mod acquire;
 mod actions;
+mod clipboard;
 mod details;
 mod failures;
 mod log_view;
@@ -21,6 +23,8 @@ mod people;
 mod pipeline;
 mod review;
 mod semantic;
+mod settings;
+mod shortcuts;
 mod tags;
 mod thumbs;
 mod trash;
@@ -56,15 +60,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tags::install(&ui, root.clone());
     trash::install(&ui, root.clone(), pipeline.clone());
     failures::install(&ui, root.clone(), pipeline.clone());
-    review::install(&ui, root, pipeline);
+    review::install(&ui, root.clone(), pipeline);
+    shortcuts::install(&ui);
+    // The window and its views as they were left (the last page too).
+    settings::install(&ui, &root);
     // Diagnostics: start on another page (1 Review, 2 People), as if picked in the sidebar.
     if let Some(page) = std::env::var("ARCHIVE_STUDIO_PAGE").ok().and_then(|p| p.parse().ok()) {
         log::info!("ARCHIVE_STUDIO_PAGE: starting on page {page}");
-        nav::go(&ui, page);
+        nav::start_on(&ui, page);
     }
     log::info!("window shown; entering the event loop");
     let result = ui.run();
     log::info!("event loop ended ({}); shutting down", if result.is_ok() { "window closed" } else { "error" });
+    settings::shutdown();
     pipeline::shutdown();
     review::shutdown();
     log::info!("exit");

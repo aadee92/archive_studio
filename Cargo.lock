@@ -258,6 +258,8 @@ dependencies = [
  "png",
  "quick-xml",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "x980",
 ]
@@ -284,6 +286,7 @@ dependencies = [
 name = "archive-studio-gui"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "archive-core",
  "archive-logging",
  "fast_image_resize",
@@ -297,6 +300,7 @@ dependencies = [
  "slint-build",
  "tempfile",
  "tiff",
+ "wl-clipboard-rs",
 ]
 
 [[package]]
