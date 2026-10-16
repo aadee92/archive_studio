@@ -10,7 +10,9 @@
 //! (how long the app runs before the shot, default 5), `--fullscreen`, `--info` (Details:
 //! full screen; the info panel open), `--steps N` and `--step-ms MS` (Details: steps to the
 //! next item N times, one every MS milliseconds (default 500) from a second in, as Right
-//! does: for timing steps in the log). The user's settings are neither read nor written.
+//! does: for timing steps in the log), `--similar N` (Details: once the similar strip is in,
+//! shows its Nth item as a click there does; 0 is the reference). The user's settings are
+//! neither read nor written.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
-use slint::{ComponentHandle, PhysicalSize};
+use slint::{ComponentHandle, Model, PhysicalSize};
 
 use crate::{nav, AppWindow, DetailsBridge};
 use archive_core::media::{classify, MediaKind};
@@ -39,6 +41,7 @@ pub struct Options {
     pub info: bool,
     pub steps: u32,
     pub step_every: Duration,
+    pub similar: Option<i32>,
 }
 
 /// `--shot OUT.png [options] [DIR]` from the arguments after the program's name: the options
@@ -61,6 +64,7 @@ pub fn parse(args: &[String]) -> Result<Option<(Options, Option<PathBuf>)>, Stri
         info: false,
         steps: 0,
         step_every: Duration::from_millis(500),
+        similar: None,
     };
     let mut dir = None;
     while let Some(arg) = it.next() {
@@ -79,6 +83,7 @@ pub fn parse(args: &[String]) -> Result<Option<(Options, Option<PathBuf>)>, Stri
             "--fullscreen" => options.fullscreen = true,
             "--info" => options.info = true,
             "--steps" => options.steps = value()?.parse().map_err(|_| "--steps: a number")?,
+            "--similar" => options.similar = Some(value()?.parse().map_err(|_| "--similar: a number")?),
             "--step-ms" => options.step_every = Duration::from_millis(value()?.parse().map_err(|_| "--step-ms: milliseconds")?),
             _ if !arg.starts_with("--") && dir.is_none() => dir = Some(arg.into()),
             _ => return Err(format!("--shot: unknown argument {arg}")),
@@ -127,7 +132,7 @@ pub fn show_page(ui: &AppWindow, root: &Path, options: &Options) {
         log::info!("shot: {} images under {}", paths.len(), root.display());
         let item = options.item.min(paths.len().saturating_sub(1));
         if let Some(path) = paths.get(item).cloned() {
-            let scope = nav::Scope::of("Review · Images".into(), paths, Some(item));
+            let scope = nav::Scope::of("Review · Images".into(), paths, Some(item)).filtered("Review", "Images".into());
             nav::open(ui, nav::Target::new(path, scope));
         } else {
             nav::start_on(ui, page);
@@ -137,6 +142,18 @@ pub fn show_page(ui: &AppWindow, root: &Path, options: &Options) {
     }
     if options.fullscreen {
         details.set_fullscreen(true);
+    }
+    if let Some(i) = options.similar.filter(|_| page == nav::DETAILS) {
+        let weak = ui.as_weak();
+        let timer = Box::leak(Box::new(slint::Timer::default()));
+        timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let details = ui.global::<DetailsBridge>();
+            if !details.get_similar_searching() && details.get_similar().row_count() > i as usize && details.get_similar_shown() != i {
+                log::info!("shot: show similar #{i}");
+                details.invoke_show_similar(i);
+            }
+        });
     }
     if page == nav::DETAILS && options.steps > 0 {
         let (weak, every, mut left) = (ui.as_weak(), options.step_every, options.steps);
@@ -280,6 +297,8 @@ mod tests {
         let (o, dir) = parse(&args("--shot out.png --size 800x600 --page details --item 3 --info /lib")).unwrap().unwrap();
         assert_eq!((o.out, o.width, o.height, o.page.as_str(), o.item, o.info), ("out.png".into(), 800, 600, "details", 3, true));
         assert_eq!(dir, Some("/lib".into()));
+        let (o, _) = parse(&args("--shot out.png --page details --similar 2 /lib")).unwrap().unwrap();
+        assert_eq!(o.similar, Some(2));
         assert!(parse(&args("--shot out.png --size big")).is_err());
         assert!(parse(&args("--shot")).is_err());
     }

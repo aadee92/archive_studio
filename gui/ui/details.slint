@@ -15,7 +15,8 @@ export struct DetailFace {
     suggestion: string,
 }
 
-// A highly similar item in the strip under the picture.
+// An item in the similar strip under the picture: the reference first, then the items
+// highly similar to it.
 export struct SimilarItem {
     thumb: image,
     name: string,
@@ -42,6 +43,11 @@ export global DetailsBridge {
     in property <bool> has-item;
     in property <string> name;
     in property <string> path;
+    // The item whose picture is shown: the item's own, or a similar item clicked in the
+    // similar strip, whose picture, faces, info panel, actions and menu are then shown in its
+    // place (the header, filmstrip and stepping stay with the item).
+    in property <string> shown-name;
+    in property <string> shown-path;
     in property <string> info;      // kind, size, dimensions once decoded
     in property <image> image;
     in property <bool> image-ready;
@@ -98,10 +104,16 @@ export global DetailsBridge {
     in property <bool> menu-ignored;
     in property <int> face-menu-serial;
 
-    // The view the item was opened from, and the items in it most like this one.
+    // The view the item was opened from, and the items in it most like this one: `similar[0]`
+    // is the item itself (the reference), under `similar-caption` ("Similar in Review: …");
+    // `similar-searching` while they are looked for, `similar-shown` the one whose picture is
+    // shown (0 the reference; -1 none of them: the other side of one).
     in property <string> scope-label;
     in property <int> scope-count;
     in property <[SimilarItem]> similar;
+    in property <string> similar-caption;
+    in property <bool> similar-searching;
+    in property <int> similar-shown;
     // The shown item's position in that view (-1 if it isn't one of its items), and the
     // filmstrip: the items around it, `film[0]` being item `film-start`.
     in property <int> scope-index: -1;
@@ -153,8 +165,9 @@ export global DetailsBridge {
     // Show the other side instead.
     callback flip();
     callback side-by-side-changed();
-    // The similar item at an index: double-click opens it, right-click its menu.
-    callback open-similar(int);
+    // The item at an index of the similar strip: a click shows its picture (0: the
+    // reference's again), right-click its menu.
+    callback show-similar(int);
     callback similar-menu(int);
     // Show another item of the view, in place of this one (no history): `step` by an offset
     // (Left / Right), `go-to` item i of the view (Home / End, a click in the filmstrip).
@@ -578,7 +591,7 @@ component InfoPanel inherits Rectangle {
             padding: 14px;
             spacing: 6px;
             Text {
-                text: DetailsBridge.name;
+                text: DetailsBridge.shown-name;
                 font-size: 14px;
                 font-weight: 600;
                 color: Theme.text;
@@ -586,7 +599,7 @@ component InfoPanel inherits Rectangle {
             }
             // Selectable, so it can be copied (Copy, or select and Ctrl+C).
             path-text := TextInput {
-                text: DetailsBridge.path;
+                text: DetailsBridge.shown-path;
                 read-only: true;
                 wrap: word-wrap;
                 font-size: 11px;
@@ -892,12 +905,14 @@ component FilmStrip inherits VerticalLayout {
     }
 }
 
-// The items most like this one in the view it was opened from, best first. Its own height,
-// like the filmstrip.
+// The item (the reference, masked) and the items most like it in the view it was opened
+// from, best first. Always there while an item is, with its own height, like the filmstrip,
+// so the picture doesn't move when they come in. A click shows that one's picture.
 component SimilarStrip inherits VerticalLayout {
     property <length> tile: 64px;
     property <length> gap: 8px;
     property <int> hover: ta.has-hover ? root.index-at(ta.mouse-x) : -1;
+    property <int> shown: DetailsBridge.similar-shown;
     pure function index-at(x: length) -> int {
         return x < 0 || Math.mod(x / 1px, (root.tile + root.gap) / 1px) > root.tile / 1px
             || Math.floor(x / (root.tile + root.gap)) >= DetailsBridge.similar.length
@@ -908,9 +923,11 @@ component SimilarStrip inherits VerticalLayout {
     spacing: 4px;
     Text {
         height: 16px;
-        text: root.hover >= 0
-            ? "\{DetailsBridge.similar[root.hover].name} · \{DetailsBridge.similar[root.hover].score}% similar"
-            : "Similar in \{DetailsBridge.scope-label}";
+        text: root.hover == 0 ? "\{DetailsBridge.similar[0].name} · Reference"
+            : root.hover > 0 ? "\{DetailsBridge.similar[root.hover].name} · \{DetailsBridge.similar[root.hover].score}% similar"
+            : root.shown > 0 && root.shown < DetailsBridge.similar.length
+            ? "\{DetailsBridge.similar-caption}  ·  showing \{DetailsBridge.similar[root.shown].name} (\{DetailsBridge.similar[root.shown].score}% similar)"
+            : DetailsBridge.similar-caption;
         color: Theme.text-muted;
         font-size: 12px;
         overflow: elide;
@@ -933,20 +950,35 @@ component SimilarStrip inherits VerticalLayout {
                     source: item.thumb;
                     image-fit: cover;
                 }
+                // The item the others are like.
+                if i == 0: Rectangle {
+                    background: #00000070;
+                    Text {
+                        text: "Reference";
+                        color: white;
+                        font-size: 10px;
+                        font-weight: 600;
+                    }
+                }
                 Rectangle {
                     border-radius: 6px;
-                    border-width: i == root.hover ? 2px : 1px;
-                    border-color: i == root.hover ? Theme.accent : Theme.border;
+                    border-width: i == root.shown ? 3px : i == root.hover ? 2px : 1px;
+                    border-color: i == root.shown || i == root.hover ? Theme.accent : Theme.border;
                 }
             }
+            if DetailsBridge.similar-searching || DetailsBridge.similar.length < 2: Text {
+                vertical-alignment: center;
+                text: DetailsBridge.similar-searching ? "Looking for similar…" : "No similar items";
+                color: Theme.text-muted;
+                font-size: 12px;
+            }
         }
-        // One TouchArea over the strip: its model is replaced per item shown, which would
-        // recreate per-tile TouchAreas between the clicks of a double-click.
+        // One TouchArea over the strip: its model is replaced per item shown.
         ta := TouchArea {
             mouse-cursor: root.hover >= 0 ? pointer : default;
-            double-clicked => {
+            clicked => {
                 if (root.index-at(self.mouse-x) >= 0) {
-                    DetailsBridge.open-similar(root.index-at(self.mouse-x));
+                    DetailsBridge.show-similar(root.index-at(self.mouse-x));
                 }
             }
             pointer-event(event) => {
@@ -998,7 +1030,7 @@ export component DetailsPage inherits Rectangle {
     property <string> zoom-label;
     property <string> zoom-now: pic.fitted ? "Fit · \{pic.percent}%" : "\{pic.percent}%";
     changed zoom-now => { self.zoom-label = self.zoom-now; }
-    property <string> shown-path: DetailsBridge.path;
+    property <string> shown-path: DetailsBridge.shown-path;
     changed shown-path => { self.fit(); }
 
     // Slideshow: the next item of the view every few seconds (after the last, the first);
@@ -1379,7 +1411,7 @@ export component DetailsPage inherits Rectangle {
             }
 
             // Highly similar items among those of the view this one was opened from.
-            if DetailsBridge.similar.length > 0: SimilarStrip { }
+            if DetailsBridge.has-item: SimilarStrip { }
 
             if !DetailsBridge.fullscreen: HorizontalLayout {
                 vertical-stretch: 0;

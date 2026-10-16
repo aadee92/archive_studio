@@ -14,8 +14,13 @@
 //! on the left, each with its own faces.
 //!
 //! Under the picture, the items most like it among those of the view it was opened from
-//! (its [`Scope`]): `Catalog::similar` over their assets, on a worker. Opening one keeps
-//! that scope, so the strip stays "similar in your filter".
+//! (its [`Scope`]): `Catalog::similar` over their assets, on a worker, after the item itself
+//! (the reference), under "Similar in Review: <the view's filter>". The strip is always
+//! there, so the picture doesn't move when they come in. A click on one shows its picture
+//! in place of the item's ([`peek`]) without leaving it: the header, the filmstrip, stepping
+//! and Back stay with the reference, and the strip isn't searched again; the picture's
+//! faces, info panel, actions and menu are the shown one's. A click on the reference shows
+//! it again, as does stepping (the item stepped to is the new reference).
 //!
 //! Left / Right (Home / End) step through that scope in its order, and a filmstrip above
 //! the picture shows the items around the shown one (small thumbnails from the cache, on a
@@ -103,6 +108,8 @@ const OTHER_EDGE: u32 = 2048;
 const FULL_PIXELS: u64 = 100_000_000;
 /// Items in the similar strip.
 const SIMILAR: usize = 12;
+/// The best of them whose pictures are decoded ahead, after the neighbours in the scope.
+const SIMILAR_AHEAD: usize = 3;
 /// Items in the filmstrip on either side of the shown one (more than fit a 4K screen).
 const FILM: usize = 24;
 /// The filmstrip's and the similar strip's tiles, in logical pixels (as on the page).
@@ -124,7 +131,10 @@ struct Shown {
     /// The other side of the photo, once known.
     other: Option<PathBuf>,
     other_generation: u64,
-    /// The items in the similar strip.
+    /// A similar item shown in place of the target's picture (clicked in the similar strip):
+    /// the picture, faces, info and actions are its; the target stays the reference.
+    peek: Option<PathBuf>,
+    /// The items in the similar strip, after the reference.
     similar: Vec<PathBuf>,
     similar_generation: u64,
     /// How good the picture up is.
@@ -156,8 +166,17 @@ enum Up {
 }
 
 impl Shown {
+    /// The item whose picture is shown: the one peeked at, else the target.
     fn path(&self) -> Option<&Path> {
-        self.target.as_ref().map(|t| t.path.as_path())
+        self.peek.as_deref().or_else(|| self.target.as_ref().map(|t| t.path.as_path()))
+    }
+
+    /// Where the item shown is in the similar strip: 0 the reference, -1 not in it.
+    fn similar_shown(&self) -> i32 {
+        match &self.peek {
+            None => 0,
+            Some(peek) => self.similar.iter().position(|p| p == peek).map_or(-1, |i| i as i32 + 1),
+        }
     }
 }
 
@@ -256,7 +275,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     let details = ui.global::<DetailsBridge>();
     let weak = ui.as_weak();
     details.on_item_action(move |action| {
-        let target = SHOWN.with_borrow(|shown| shown.target.clone()).map(|target| Target { face: None, ..target });
+        let target = shown_target();
         log::debug!("details: {action:?} on the item shown");
         if let (Some(ui), Some(target)) = (weak.upgrade(), target) {
             actions::act(&ui, &action, target);
@@ -271,13 +290,10 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     let weak = ui.as_weak();
     details.on_context_menu(move |side| {
         log::debug!("details: right-click on side {side}");
-        let target = SHOWN.with_borrow(|shown| {
-            let target = shown.target.clone()?;
-            match side {
-                0 => Some(Target { face: None, ..target }),
-                _ => Some(Target::new(shown.other.clone()?, target.scope)),
-            }
-        });
+        let target = match side {
+            0 => shown_target(),
+            _ => SHOWN.with_borrow(|shown| Some(Target::new(shown.other.clone()?, shown.target.clone()?.scope))),
+        };
         if let (Some(ui), Some(target)) = (weak.upgrade(), target) {
             nav::context_menu(&ui, target);
         }
@@ -298,10 +314,15 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         }
     });
     let weak = ui.as_weak();
-    details.on_open_similar(move |i| {
-        log::debug!("details: double-click on similar #{i}");
-        if let (Some(ui), Some(target)) = (weak.upgrade(), similar_target(i)) {
-            nav::open(&ui, target);
+    details.on_show_similar(move |i| {
+        log::debug!("details: click on similar #{i}");
+        let path = SHOWN.with_borrow(|shown| match usize::try_from(i) {
+            Ok(0) => Some(None),
+            Ok(i) => shown.similar.get(i - 1).cloned().map(Some),
+            Err(_) => None,
+        });
+        if let (Some(ui), Some(path)) = (weak.upgrade(), path) {
+            peek(&ui, path);
         }
     });
     let weak = ui.as_weak();
@@ -440,14 +461,62 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
 }
 
-/// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]).
+/// Shows `target` on the Details page (the caller switches to it: see [`nav::open`]); it is
+/// the reference of the similar strip, searched anew.
 pub fn show(ui: &AppWindow, mut target: Target) {
     let started = Instant::now();
     locate(&mut target);
     log::debug!("details: show {target:?}");
     let path = target.path.clone();
+    let details = ui.global::<DetailsBridge>();
+    details.set_scope_label(target.scope.label.as_str().into());
+    details.set_scope_count(target.scope.len as i32);
+    details.set_scope_index(target.scope.current.map_or(-1, |i| i as i32));
+    details.set_similar_caption(target.scope.similar_caption().into());
+    let flash = target.face;
+    SHOWN.with_borrow_mut(|shown| {
+        shown.target = Some(target);
+        shown.peek = None;
+        shown.similar.clear();
+    });
+    details.set_has_item(true);
+    details.set_name(file_name(&path));
+    details.set_path(path.display().to_string().into());
+    present(ui, started, flash);
+    load_film(ui);
+    load_similar(ui, true);
+}
+
+/// Shows `path`'s picture (a similar item of the strip) in place of the reference's, or the
+/// reference's again (`None`), leaving the reference, the filmstrip and the strip as they are.
+fn peek(ui: &AppWindow, path: Option<PathBuf>) {
+    let Some(path) = SHOWN.with_borrow(|shown| {
+        let reference = &shown.target.as_ref()?.path;
+        let path = path.filter(|p| p != reference);
+        (shown.peek != path).then_some(path)
+    }) else {
+        return;
+    };
+    log::debug!("details: peek at {:?} (reference {:?})", path, SHOWN.with_borrow(|s| s.target.as_ref().map(|t| t.path.clone())));
+    SHOWN.with_borrow_mut(|shown| shown.peek = path);
+    present(ui, Instant::now(), None);
+    // Larger than a strip's thumbnail, until the picture is decoded.
+    if let Some(path) = SHOWN.with_borrow(|shown| shown.path().filter(|_| shown.up < Up::Soft && shown.kind == Some(MediaKind::Image)).map(Path::to_path_buf)) {
+        let weak = ui.as_weak();
+        thread::spawn(move || load_stand_in(&weak, path));
+    }
+}
+
+/// Puts up the picture of the item shown ([`Shown::path`]: the reference, or the similar item
+/// peeked at) and reads what goes with it: its faces, other side, info. Up at once if decoded
+/// ahead, else a thumbnail of it until it is.
+fn present(ui: &AppWindow, started: Instant, flash: Option<FaceId>) {
+    let Some((path, similar_shown, target)) = SHOWN.with_borrow(|shown| {
+        Some((shown.path()?.to_path_buf(), shown.similar_shown(), shown.target.clone()?))
+    }) else {
+        return;
+    };
     let kind = classify(&path);
-    let name: SharedString = path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into());
     let size = std::fs::metadata(&path).map_or(0, |m| m.len());
     let label = match kind {
         Some(MediaKind::Image) => "Image",
@@ -457,25 +526,19 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     };
     let info = format!("{label} · {}", crate::review::human_size(size));
     let details = ui.global::<DetailsBridge>();
-    details.set_scope_label(target.scope.label.as_str().into());
-    details.set_scope_count(target.scope.len as i32);
-    details.set_scope_index(target.scope.current.map_or(-1, |i| i as i32));
-    let neighbours = neighbours(&target);
     SHOWN.with_borrow_mut(|shown| {
-        shown.flash = target.face;
-        shown.target = Some(target);
+        shown.flash = flash;
         shown.kind = kind;
         shown.info = info.clone();
         shown.other = None;
         shown.other_generation += 1;
-        shown.similar.clear();
         shown.up = Up::Nothing;
         shown.dims = None;
         shown.shown_at = Some(started);
     });
-    details.set_has_item(true);
-    details.set_name(name);
-    details.set_path(path.display().to_string().into());
+    details.set_shown_name(file_name(&path));
+    details.set_shown_path(path.display().to_string().into());
+    details.set_similar_shown(similar_shown);
     details.set_info(info.as_str().into());
     details.set_image(slint::Image::default());
     details.set_image_ready(false);
@@ -494,17 +557,17 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_other_image(slint::Image::default());
     details.set_other_ready(false);
     details.set_other_faces(ModelRc::default());
-    details.set_similar(ModelRc::default());
     details.set_info_tag_error(SharedString::default());
     details.set_info_tag_matches(ModelRc::default());
-    // Up at once if decoded ahead, else its thumbnail until it is.
     let image = kind == Some(MediaKind::Image);
     if image {
-        pictures::want(screen_edge(ui), [path.clone()].into_iter().chain(neighbours).collect());
+        want_pictures(ui, &target);
         if !show_picture(ui, &path) {
-            // Review's (opened from there; the larger), else the filmstrip's; a larger one
-            // is loaded with the filmstrip's.
-            let thumb = crate::review::thumbnail(&path).or_else(|| SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()));
+            // Review's (opened from there; the larger), else the filmstrip's or the similar
+            // strip's; a larger one is loaded with the filmstrip's (or by `peek`).
+            let thumb = crate::review::thumbnail(&path)
+                .or_else(|| SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()))
+                .or_else(|| similar_thumb(ui, similar_shown));
             if let Some(thumb) = thumb.filter(|t| t.size().width > 0) {
                 set_picture(ui, thumb, Up::Thumbnail);
             }
@@ -514,9 +577,37 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     details.set_loading(image && up < Up::Sharp);
     log::debug!("details: show: {up:?} up in {:?}", started.elapsed());
     load(ui);
-    load_similar(ui);
-    load_film(ui);
     load_info(ui);
+}
+
+/// The pictures to decode and keep: the one shown first, the reference (while a similar item
+/// is shown), the neighbours in the scope, then the best similar items.
+fn want_pictures(ui: &AppWindow, target: &Target) {
+    let (shown, similar) = SHOWN.with_borrow(|shown| (shown.path().map(Path::to_path_buf), shown.similar.clone()));
+    let mut paths: Vec<PathBuf> = shown.into_iter().collect();
+    for path in [target.path.clone()].into_iter().chain(neighbours(target)).chain(similar.into_iter().take(SIMILAR_AHEAD)) {
+        if !paths.contains(&path) && classify(&path) == Some(MediaKind::Image) {
+            paths.push(path);
+        }
+    }
+    pictures::want(screen_edge(ui), paths);
+}
+
+/// The thumbnail of item `i` of the similar strip, if it has one.
+fn similar_thumb(ui: &AppWindow, i: i32) -> Option<slint::Image> {
+    ui.global::<DetailsBridge>().get_similar().row_data(usize::try_from(i).ok()?).map(|item| item.thumb)
+}
+
+/// The item shown, as an item of the scope (the similar item peeked at, at its place there),
+/// for its actions and menu.
+fn shown_target() -> Option<Target> {
+    let mut target = SHOWN.with_borrow(|shown| Some(Target::new(shown.path()?.to_path_buf(), shown.target.as_ref()?.scope.clone())))?;
+    locate(&mut target);
+    Some(target)
+}
+
+fn file_name(path: &Path) -> SharedString {
+    path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into())
 }
 
 /// Points the scope at `target` if it is one of its items but not the one it says (opened
@@ -637,14 +728,7 @@ fn film_thumbs(ui: &AppWindow, missing: Vec<PathBuf>, stand_in: Option<PathBuf>)
     thread::spawn(move || {
         let pixels = |rgb: image::RgbImage| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height());
         if let Some(path) = stand_in {
-            let mut found = None;
-            thumbs::for_files(&[&path], thumbs::Tier::STAND_IN, thumbs::Accept::Any, |_, thumb| {
-                found = thumb;
-                false
-            });
-            if let Some(thumb) = found.filter(|_| FILM_GENERATION.load(Ordering::Relaxed) == generation).map(pixels) {
-                let _ = weak.upgrade_in_event_loop(move |ui| stand_in_up(&ui, &path, thumb));
-            }
+            load_stand_in(&weak, path);
         }
         thumbs::for_files(&missing, tier, thumbs::Accept::Sharp, |i, thumb| {
             if FILM_GENERATION.load(Ordering::Relaxed) != generation {
@@ -656,6 +740,20 @@ fn film_thumbs(ui: &AppWindow, missing: Vec<PathBuf>, stand_in: Option<PathBuf>)
             true
         });
     });
+}
+
+/// Loads a thumbnail of `path` to stand in for its picture until that is decoded (any the
+/// cache has, else decoded), on the calling worker.
+fn load_stand_in(weak: &slint::Weak<AppWindow>, path: PathBuf) {
+    let mut found = None;
+    thumbs::for_files(&[&path], thumbs::Tier::STAND_IN, thumbs::Accept::Any, |_, thumb| {
+        found = thumb;
+        false
+    });
+    if let Some(rgb) = found {
+        let thumb = Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height());
+        let _ = weak.upgrade_in_event_loop(move |ui| stand_in_up(&ui, &path, thumb));
+    }
 }
 
 /// A thumbnail to stand in for the picture of `path` came in: up if that is still shown, its
@@ -673,6 +771,7 @@ fn stand_in_up(ui: &AppWindow, path: &Path, pixels: Pixels) {
 /// in for the picture shown until that is decoded, if nothing does yet.
 fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
     let thumb = pixels.map(slint::Image::from_rgb8).unwrap_or_default();
+    let reference = SHOWN.with_borrow(|shown| shown.target.as_ref().is_some_and(|t| t.path == path));
     let placeholder = SHOWN.with_borrow_mut(|shown| {
         let placeholder = shown.path() == Some(path.as_path()) && shown.up == Up::Nothing && thumb.size().width > 0;
         if let Some(i) = shown.film_paths.iter().position(|p| *p == path) {
@@ -686,6 +785,12 @@ fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
         }
         placeholder
     });
+    // The reference's tile in the similar strip, until the strip's own thumbnails are in.
+    let similar = ui.global::<DetailsBridge>().get_similar();
+    if let Some(mut first) = similar.row_data(0).filter(|f| reference && f.thumb.size().width == 0 && thumb.size().width > 0) {
+        first.thumb = thumb.clone();
+        similar.set_row_data(0, first);
+    }
     if placeholder {
         log::debug!("details: thumbnail up {:?} after the show", SHOWN.with_borrow(|shown| shown.shown_at.map(|t| t.elapsed())));
         set_picture(ui, thumb, Up::Thumbnail);
@@ -696,7 +801,7 @@ fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
 pub fn scale_changed(ui: &AppWindow) {
     SHOWN.with_borrow_mut(|shown| shown.film_thumbs.clear());
     load_film(ui);
-    load_similar(ui);
+    load_similar(ui, false);
 }
 
 /// The longest edge of the window, in physical pixels: no picture on the page is shown larger.
@@ -765,6 +870,7 @@ fn clear(ui: &AppWindow) {
     log::debug!("details: cleared (item gone, nowhere to go back to)");
     SHOWN.with_borrow_mut(|shown| {
         shown.target = None;
+        shown.peek = None;
         shown.generation += 1;
         shown.other = None;
         shown.similar.clear();
@@ -783,10 +889,14 @@ fn clear(ui: &AppWindow) {
     details.set_adding(false);
     details.set_other_side(SharedString::default());
     details.set_other_ready(false);
+    details.set_shown_name(SharedString::default());
+    details.set_shown_path(SharedString::default());
     details.set_similar(ModelRc::default());
+    details.set_similar_searching(false);
 }
 
-/// The item shown, to show it again (Back); without its face, which only flashes on arrival.
+/// The item shown, to show it again (Back): the reference, not a similar item peeked at;
+/// without its face, which only flashes on arrival.
 pub fn snapshot() -> Option<Target> {
     SHOWN.with_borrow(|shown| shown.target.clone()).map(|target| Target { face: None, ..target })
 }
@@ -821,17 +931,21 @@ fn read_other_side(catalog: Option<&Catalog>, path: &Path) -> Option<(PathBuf, b
 }
 
 /// Shows the other side of the photo in place of this one (no history: Back still returns
-/// to where the photo was opened from).
+/// to where the photo was opened from). Of a similar item peeked at, it is peeked at too.
 fn flip(ui: &AppWindow) {
-    let Some(target) = SHOWN.with_borrow(|shown| Some(Target::new(shown.other.clone()?, shown.target.clone()?.scope))) else {
+    let Some((target, peeking)) = SHOWN.with_borrow(|shown| Some((Target::new(shown.other.clone()?, shown.target.clone()?.scope), shown.peek.is_some()))) else {
         return;
     };
-    show(ui, target);
+    if peeking {
+        peek(ui, Some(target.path));
+    } else {
+        show(ui, target);
+    }
 }
 
 /// The file at `path` changed on disk (e.g. it was rotated): reloads it if it is the one
 /// shown (keeping the old picture up until the new one is decoded), the other side, or in
-/// the similar strip.
+/// the similar strip (the reference too: its tile).
 pub fn file_changed(ui: &AppWindow, path: &Path) {
     let (this, other, similar) = SHOWN.with_borrow_mut(|shown| {
         let this = shown.path() == Some(path) && shown.kind.is_some();
@@ -841,7 +955,8 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
                 shown.info = format!("{label} · {}", crate::review::human_size(size));
             }
         }
-        (this, shown.other.as_deref() == Some(path), shown.similar.iter().any(|p| p == path))
+        let similar = shown.similar.iter().any(|p| p == path) || shown.target.as_ref().is_some_and(|t| t.path == path);
+        (this, shown.other.as_deref() == Some(path), similar)
     });
     if this || other || similar {
         log::debug!("details: {} changed (shown {this}, other side {other}, similar {similar})", path.display());
@@ -858,22 +973,23 @@ pub fn file_changed(ui: &AppWindow, path: &Path) {
         load_other(ui);
     }
     if similar {
-        load_similar(ui);
+        load_similar(ui, false);
     }
 }
 
 /// Files that left the library (e.g. to the trash): if it is the item shown, the page shows
 /// the next item of its scope still there (the previous one at the end), else goes back to
-/// where it was opened from (or shows nothing); the other side and the similar strip drop
-/// it.
+/// where it was opened from (or shows nothing); a similar item shown gives way to the
+/// reference; the other side and the similar strip drop it.
 pub fn files_gone(ui: &AppWindow, gone: &[PathBuf]) {
     if gone.is_empty() {
         return;
     }
     let is_gone = |p: &Path| gone.iter().any(|g| g == p);
-    let (this, other, similar) = SHOWN.with_borrow(|shown| {
+    let (this, peeked, other, similar) = SHOWN.with_borrow(|shown| {
         (
-            shown.path().is_some_and(is_gone),
+            shown.target.as_ref().is_some_and(|t| is_gone(&t.path)),
+            shown.peek.as_deref().is_some_and(is_gone),
             shown.other.as_deref().is_some_and(is_gone),
             shown.similar.iter().any(|p| is_gone(p)),
         )
@@ -896,13 +1012,19 @@ pub fn files_gone(ui: &AppWindow, gone: &[PathBuf]) {
         details.set_other_ready(false);
     }
     if similar {
+        // The reference first, kept.
         let keep: Vec<bool> = SHOWN.with_borrow_mut(|shown| {
-            let keep = shown.similar.iter().map(|p| !is_gone(p)).collect();
+            let keep = std::iter::once(true).chain(shown.similar.iter().map(|p| !is_gone(p))).collect();
             shown.similar.retain(|p| !is_gone(p));
             keep
         });
         let items: Vec<SimilarItem> = details.get_similar().iter().zip(keep).filter(|(_, k)| *k).map(|(item, _)| item).collect();
         details.set_similar(ModelRc::new(VecModel::from(items)));
+        details.set_similar_shown(SHOWN.with_borrow(Shown::similar_shown));
+    }
+    if peeked {
+        log::debug!("details: the similar item shown left the library: back to the reference");
+        peek(ui, None);
     }
 }
 
@@ -1321,23 +1443,36 @@ fn load_other(ui: &AppWindow) {
     });
 }
 
-/// Finds the items of the shown one's scope most like it, on a worker, and fills the strip.
-fn load_similar(ui: &AppWindow) {
+/// Finds the items of the reference's scope most like it, on a worker, and fills the strip
+/// after the reference. `fresh` (another reference): the strip shows only the reference and
+/// "Looking for similar…" meanwhile; else (thumbnails again, a file in it changed) it stays
+/// as it is until they are in.
+fn load_similar(ui: &AppWindow, fresh: bool) {
     let Some((path, scope, generation)) = SHOWN.with_borrow_mut(|shown| {
         shown.similar_generation += 1;
         let target = shown.target.as_ref()?;
-        (shown.kind == Some(MediaKind::Image)).then(|| (target.path.clone(), target.scope.clone(), shown.similar_generation))
+        Some((target.path.clone(), target.scope.clone(), shown.similar_generation))
     }) else {
         return;
     };
     let Some(root) = root() else { return };
+    let details = ui.global::<DetailsBridge>();
+    let image = classify(&path) == Some(MediaKind::Image);
+    if fresh {
+        let thumb = crate::review::thumbnail(&path).or_else(|| SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()));
+        let reference = SimilarItem { thumb: thumb.unwrap_or_default(), name: file_name(&path), score: 100 };
+        details.set_similar(ModelRc::new(VecModel::from(vec![reference])));
+        details.set_similar_shown(0);
+        details.set_similar_searching(image);
+    }
     // Listed here (once per scope): a scope may only be read on the UI thread.
     let candidates = scope.paths();
     let tier = thumbs::Tier::cover(FILM_TILE * ui.window().scale_factor());
     let weak = ui.as_weak();
     thread::spawn(move || {
-        let found = open_catalog(&root).map(|c| similar(&c, &path, &candidates)).unwrap_or_default();
+        let found = if image { open_catalog(&root).map(|c| similar(&c, &path, &candidates)).unwrap_or_default() } else { Vec::new() };
         log::debug!("details: {} similar among {} in {:?}", found.len(), candidates.len(), scope.label);
+        let found: Vec<(PathBuf, f32)> = std::iter::once((path, 1.0)).chain(found).collect();
         let paths: Vec<&PathBuf> = found.iter().map(|(path, _)| path).collect();
         let mut thumbs = vec![None; paths.len()];
         thumbs::for_files(&paths, tier, thumbs::Accept::Sharp, |i, thumb| {
@@ -1346,23 +1481,30 @@ fn load_similar(ui: &AppWindow) {
         });
         let items: Vec<(PathBuf, f32, Option<Pixels>)> = found.into_iter().zip(thumbs).map(|((path, score), thumb)| (path, score, thumb)).collect();
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let paths = SHOWN.with_borrow_mut(|shown| {
+            let Some((target, shown_at)) = SHOWN.with_borrow_mut(|shown| {
                 (shown.similar_generation == generation).then(|| {
-                    shown.similar = items.iter().map(|(p, _, _)| p.clone()).collect();
+                    shown.similar = items.iter().skip(1).map(|(p, _, _)| p.clone()).collect();
+                    (shown.target.clone(), shown.similar_shown())
                 })
-            });
-            if paths.is_none() {
+            }) else {
                 return;
-            }
+            };
             let model: Vec<SimilarItem> = items
                 .into_iter()
                 .map(|(path, score, thumb)| SimilarItem {
                     thumb: thumb.map(slint::Image::from_rgb8).unwrap_or_default(),
-                    name: path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().as_ref().into()),
+                    name: file_name(&path),
                     score: (score * 100.0).round() as i32,
                 })
                 .collect();
-            ui.global::<DetailsBridge>().set_similar(ModelRc::new(VecModel::from(model)));
+            let details = ui.global::<DetailsBridge>();
+            details.set_similar(ModelRc::new(VecModel::from(model)));
+            details.set_similar_shown(shown_at);
+            details.set_similar_searching(false);
+            // Their pictures ahead too, the best few, once the neighbours are.
+            if let Some(target) = target {
+                want_pictures(&ui, &target);
+            }
         });
     });
 }
@@ -1379,12 +1521,18 @@ fn similar(catalog: &Catalog, path: &Path, candidates: &[PathBuf]) -> Vec<(PathB
         .collect()
 }
 
-/// Similar item `i`, to open with the shown item's scope.
+/// Item `i` of the similar strip (0 the reference), with the reference's scope, for its menu.
 fn similar_target(i: i32) -> Option<Target> {
-    SHOWN.with_borrow(|shown| {
-        let path = shown.similar.get(usize::try_from(i).ok()?)?.clone();
-        Some(Target::new(path, shown.target.as_ref()?.scope.clone()))
-    })
+    let mut target = SHOWN.with_borrow(|shown| {
+        let target = shown.target.as_ref()?;
+        let path = match usize::try_from(i).ok()? {
+            0 => target.path.clone(),
+            i => shown.similar.get(i - 1)?.clone(),
+        };
+        Some(Target::new(path, target.scope.clone()))
+    })?;
+    locate(&mut target);
+    Some(target)
 }
 
 /// The view the shown item was opened from, as it was then.
@@ -1665,6 +1813,18 @@ mod tests {
         let mut target = Target::new("c-back".into(), Scope::of("Review".into(), paths, Some(1)));
         locate(&mut target);
         assert_eq!(target.scope.current, Some(1));
+    }
+
+    #[test]
+    fn a_similar_item_peeked_at_is_shown_in_place_of_the_reference() {
+        let paths: Vec<PathBuf> = ["a", "b", "c"].map(PathBuf::from).to_vec();
+        let mut shown = Shown { target: Some(Target::new("a".into(), Scope::of("Review".into(), paths, Some(0)))), ..Default::default() };
+        shown.similar = vec!["c".into(), "b".into()];
+        assert_eq!((shown.path(), shown.similar_shown()), (Some(Path::new("a")), 0));
+        shown.peek = Some("b".into());
+        assert_eq!((shown.path(), shown.similar_shown()), (Some(Path::new("b")), 2));
+        shown.peek = Some("b-back".into());
+        assert_eq!(shown.similar_shown(), -1, "the other side of one isn't in the strip");
     }
 
     #[test]

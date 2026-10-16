@@ -72,6 +72,11 @@ impl std::fmt::Debug for Target {
 pub struct Scope {
     /// Where it comes from, e.g. `Review · “beach” · Images`.
     pub label: String,
+    /// The view alone (`Review`), and its filter in words (`Scans OR Beaches · Images`; empty
+    /// for none), for the similar strip's "Similar in Review: …". Without
+    /// [`filtered`](Self::filtered), the label and nothing.
+    pub source: String,
+    pub filter: String,
     pub len: usize,
     /// The shown item's position among them, if it is one of them.
     pub current: Option<usize>,
@@ -81,7 +86,21 @@ pub struct Scope {
 
 impl Scope {
     pub fn new(label: String, len: usize, current: Option<usize>, items: impl Fn() -> Vec<PathBuf> + 'static) -> Self {
-        Self { label, len, current, items: Rc::new(items), listed: Rc::default() }
+        Self { source: label.clone(), filter: String::new(), label, len, current, items: Rc::new(items), listed: Rc::default() }
+    }
+
+    /// The same scope, from view `source` filtered by `filter` (in words; empty for none).
+    pub fn filtered(self, source: &str, filter: String) -> Self {
+        Self { source: source.to_owned(), filter, ..self }
+    }
+
+    /// What the similar strip is drawn from: `Similar in Review: Scans OR Beaches`, or
+    /// `Similar in People · Ann` without a filter.
+    pub fn similar_caption(&self) -> String {
+        match self.filter.as_str() {
+            "" => format!("Similar in {}", self.source),
+            filter => format!("Similar in {}: {filter}", self.source),
+        }
     }
 
     /// A fixed list.
@@ -288,5 +307,15 @@ mod tests {
         assert_eq!(at.paths().len(), 3);
         assert!(scope.at(3).is_none());
         assert_eq!(calls.get(), 1, "clones share the listing");
+    }
+
+    #[test]
+    fn similar_caption_names_the_view_and_its_filter() {
+        let scope = Scope::of("People · Ann".into(), Vec::new(), None);
+        assert_eq!(scope.similar_caption(), "Similar in People · Ann");
+        let scope = Scope::of("Review · “x”".into(), Vec::new(), None).filtered("Review", "Scans OR Beaches".into());
+        assert_eq!(scope.similar_caption(), "Similar in Review: Scans OR Beaches");
+        assert_eq!(scope.label, "Review · “x”", "the label stays");
+        assert_eq!(scope.clone().filtered("Review", String::new()).similar_caption(), "Similar in Review");
     }
 }

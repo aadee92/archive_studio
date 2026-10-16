@@ -396,13 +396,37 @@ impl Filters {
     fn query(&self, ranking: Option<Arc<HashMap<u64, u32>>>) -> Query {
         // In description mode the text describes; it isn't matched against names.
         let text = if self.mode == 1 { String::new() } else { self.text.clone() };
-        let described = match self.want() {
+        Query::new(text, self.tag.clone(), self.kind, Sort::from_index(self.sort)).needing(&self.attention).ranked(ranking, self.described())
+    }
+
+    /// What a search by description looks for, in words ("“dog on a beach”", "like
+    /// IMG_1.jpg"); empty for none.
+    fn described(&self) -> String {
+        match self.want() {
             Some(Want::Text(text)) => format!("“{text}”"),
             Some(Want::Like(path)) => format!("like {}", file_name(&path)),
             None => String::new(),
-        };
-        Query::new(text, self.tag.clone(), self.kind, Sort::from_index(self.sort)).needing(&self.attention).ranked(ranking, described)
+        }
     }
+}
+
+/// The filters in words, as typed and picked (`Scans OR Beaches · People / Ann · Images ·
+/// Untagged`; empty for none): the search (or what a description search looks for), the tag
+/// picked, the kind and the "Needs attention" chips.
+fn filter_words(f: &Filters) -> String {
+    let search = if f.mode == 1 { f.described() } else { f.text.trim().to_owned() };
+    let tag = match picked_path(f.tag.trim()) {
+        Some(path) => path.replace('|', " / "),
+        None => f.tag.trim().to_owned(),
+    };
+    let kind = match f.kind {
+        1 => "Images",
+        2 => "Video",
+        3 => "Audio",
+        _ => "",
+    };
+    let parts = [search, tag, kind.to_owned(), attention_label(&f.attention)];
+    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
 }
 
 fn file_name(path: &Path) -> String {
@@ -2086,9 +2110,11 @@ impl GridModel {
         if !attention.is_empty() {
             label += &format!(" · {attention}");
         }
+        let filter = filter_words(&self.filters.borrow());
         Scope::new(label, visible.len(), current, move || {
             visible.iter().filter_map(|&id| index.get(id).map(|e| e.path.clone())).collect()
         })
+        .filtered("Review", filter)
     }
 
     /// Back to a view left earlier: its filters (re-filtering if they changed since), its
@@ -2674,6 +2700,19 @@ mod tests {
     use super::*;
     use crate::thumbs::Pixels;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn filters_in_words() {
+        let words = |f: Filters| filter_words(&f);
+        assert_eq!(words(Filters::default()), "");
+        assert_eq!(words(Filters { text: " Scans OR Beaches ".into(), ..Default::default() }), "Scans OR Beaches");
+        let attention = Attention { untagged: true, ..Default::default() };
+        let f = Filters { text: "beach".into(), tag: tag_query("People|Ann"), kind: 1, attention, ..Default::default() };
+        assert_eq!(words(f), "beach · People / Ann · Images · Untagged");
+        assert_eq!(words(Filters { text: "dog".into(), mode: 1, ..Default::default() }), "“dog”");
+        assert_eq!(words(Filters { text: "dog".into(), mode: 1, similar: "/l/IMG_1.jpg".into(), ..Default::default() }), "like IMG_1.jpg");
+        assert_eq!(words(Filters { tag: "Holidays OR Trips".into(), ..Default::default() }), "Holidays OR Trips");
+    }
 
     fn grid(sync_limit: usize, columns: usize, deliver: impl Fn(Filtered) + Send + 'static) -> GridModel {
         let thumbs = ThumbCache::new(None, Threads { decode: 1, io: 1 }, |_, _, _| {});
