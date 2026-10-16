@@ -12,12 +12,15 @@
 //!   a copy of files puts on the clipboard).
 //! - [`settings`]: per-user settings a front end keeps across runs.
 //! - [`exif`]: the basic EXIF fields.
+//! - [`dates`]: the date a picture is shown and sorted by (taken, else modified), in
+//!   wall-clock seconds, and calendar months of it.
 //! - [`pipeline`]: what happens to files in the library (orient, faces, identify, sidecars),
 //!   run by an [`Engine`](pipeline::Engine) thread while a front end is open.
 //!
 //! See `ARCHITECTURE.md` at the repository root for the layering rule.
 
 pub mod catalog;
+pub mod dates;
 pub mod desktop;
 pub mod device;
 pub mod devices;

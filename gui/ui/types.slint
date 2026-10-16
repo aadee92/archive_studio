@@ -41,5 +41,12 @@ export struct MediaTile {
     failed: bool,        // a pipeline stage failed on it
 }
 
-// The review grid is a ListView of rows; each row carries `columns` tiles.
-export struct MediaRow { tiles: [MediaTile] }
+// A row of the review grid: up to `columns` tiles, or (sorted by date) the header of a
+// month's items, "October 2026" with "42 items". `row` is its index in the grid.
+export struct MediaRow {
+    row: int,
+    header: bool,
+    label: string,
+    detail: string,
+    tiles: [MediaTile],
+}

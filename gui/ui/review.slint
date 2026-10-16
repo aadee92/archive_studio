@@ -1,4 +1,4 @@
-import { ListView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
+import { ListView, ScrollView, LineEdit, ComboBox, Slider } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { MediaRow, MediaTile, MediaKind } from "types.slint";
 import { ScrollRestore, UiLog } from "nav.slint";
@@ -27,8 +27,13 @@ export struct Attention {
 }
 
 export global ReviewBridge {
-    // Virtual model: rows are produced on demand by Rust, only for what is on screen.
+    // Virtual model: rows are produced on demand by Rust, only those in view and a couple
+    // either side; the page places them itself (header rows are lower than tile rows).
     in property <[MediaRow]> rows;
+    // All the grid's rows, and a serial bumped whenever their layout changes (bindings that
+    // ask for geometry pass it, so they are re-evaluated).
+    in property <int> row-total;
+    in property <int> layout-serial;
     in property <string> root-path;
     in property <string> status-text;
     in property <bool> indexing;
@@ -67,6 +72,12 @@ export global ReviewBridge {
     // How many items are selected.
     in property <int> selection-count;
 
+    // Grid geometry, for rows `row-height` and headers `header-height` high: where a row
+    // starts, the row at a height (-1 above the first, row-total and on past the last),
+    // whether a row is a date header.
+    pure callback row-y(/* serial */ int, /* row */ int, length, length) -> length;
+    pure callback row-at-y(/* serial */ int, length, length, length) -> int;
+    pure callback is-header(/* serial */ int, /* row */ int) -> bool;
     callback columns-changed(int);
     // First and last (inclusive) grid row in view; drives thumbnail priority and prefetch.
     callback viewport-changed(int, int);
@@ -74,7 +85,8 @@ export global ReviewBridge {
     // 4 relevance), the "Needs attention" filters, search mode, the picture to look like
     callback filter-changed(string, string, int, int, Attention, int, string);
     // Pointer input on the grid, by (row, column); -1 for neither when it missed every tile.
-    // A click with Shift (range from the anchor) / Ctrl (toggle).
+    // A click with Shift (range from the anchor) / Ctrl (toggle); on a date header, it picks
+    // the month's items (Ctrl / Shift: adds them).
     callback click(int, int, /* shift */ bool, /* ctrl */ bool);
     // A rubber band starts: `keep` (Shift / Ctrl held) adds to the selection.
     callback drag-begin(bool);
@@ -244,6 +256,7 @@ export component ReviewPage inherits Rectangle {
         || ReviewBridge.attention.untagged || ReviewBridge.attention.unknown-faces || ReviewBridge.attention.has-back;
     property <length> gap: 14px;
     property <length> row-height: ReviewBridge.tile-size + 44px;
+    property <length> header-height: 44px;
     property <length> pitch: ReviewBridge.tile-size + root.gap;
     property <int> columns: Math.max(1, Math.floor((list.visible-width - root.gap) / root.pitch));
 
@@ -269,30 +282,38 @@ export component ReviewPage inherits Rectangle {
         ReviewBridge.viewport-changed(self.first-row, self.last-row);
     }
 
+    // Where a row starts, and the row at a height, in content coordinates.
+    pure function y-of(row: int) -> length {
+        return ReviewBridge.row-y(ReviewBridge.layout-serial, row, root.row-height, root.header-height);
+    }
+    pure function row-of-y(y: length) -> int {
+        return ReviewBridge.row-at-y(ReviewBridge.layout-serial, y, root.row-height, root.header-height);
+    }
+
     // Visible row range, as ints so scrolling within a row costs nothing on the Rust side.
-    property <int> first-row: Math.max(0, Math.floor(-list.content-y / root.row-height));
-    property <int> last-row: Math.max(0, Math.floor((-list.content-y + list.visible-height - 1px) / root.row-height));
+    property <int> first-row: Math.max(0, root.row-of-y(-list.content-y));
+    property <int> last-row: Math.max(0, root.row-of-y(-list.content-y + list.visible-height - 1px));
     changed first-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
     changed last-row => { ReviewBridge.viewport-changed(self.first-row, self.last-row); }
 
     // Scroll position for snapshots, and scrolling back to one.
     property <length> scrolled: -list.content-y;
     changed scrolled => {
-        ReviewBridge.scroll-row = Math.floor(self.scrolled / root.row-height);
-        ReviewBridge.scroll-offset = self.scrolled - ReviewBridge.scroll-row * root.row-height;
+        ReviewBridge.scroll-row = Math.max(0, root.row-of-y(self.scrolled));
+        ReviewBridge.scroll-offset = self.scrolled - root.y-of(ReviewBridge.scroll-row);
     }
     property <ScrollRestore> restore: ReviewBridge.restore;
     changed restore => {
         list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
-            Math.min(0px, -(self.restore.row * root.row-height + self.restore.offset)));
+            Math.min(0px, -(root.y-of(self.restore.row) + self.restore.offset)));
     }
     property <ScrollRestore> reveal: ReviewBridge.reveal;
     changed reveal => {
-        if (self.reveal.row * root.row-height < -list.content-y) {
-            list.content-y = -self.reveal.row * root.row-height;
-        } else if ((self.reveal.row + 1) * root.row-height > -list.content-y + list.visible-height) {
+        if (root.y-of(self.reveal.row) < -list.content-y) {
+            list.content-y = -root.y-of(self.reveal.row);
+        } else if (root.y-of(self.reveal.row + 1) > -list.content-y + list.visible-height) {
             list.content-y = Math.max(Math.min(0px, list.visible-height - list.content-height),
-                list.visible-height - (self.reveal.row + 1) * root.row-height);
+                list.visible-height - root.y-of(self.reveal.row + 1));
         }
     }
 
@@ -304,9 +325,13 @@ export component ReviewPage inherits Rectangle {
     }
 
     // Grid geometry: the row / column of the tile at a point in content coordinates
-    // (-1: between tiles).
+    // (-1: between tiles). Anywhere on a date header is its row.
     pure function row-at(y: length) -> int {
-        return y < 0 || Math.mod(y / 1px, root.row-height / 1px) < root.gap / 1px ? -1 : Math.floor(y / root.row-height);
+        if (y < 0) {
+            return -1;
+        }
+        let row = root.row-of-y(y);
+        return !ReviewBridge.is-header(ReviewBridge.layout-serial, row) && y - root.y-of(row) < root.gap ? -1 : row;
     }
     pure function col-at(x: length) -> int {
         return x < root.gap || Math.floor((x - root.gap) / root.pitch) >= root.columns
@@ -321,8 +346,8 @@ export component ReviewPage inherits Rectangle {
     function drag-update() {
         // Pointer in content coordinates.
         ReviewBridge.drag-to(
-            Math.floor(Math.min(root.press-y, overlay.mouse-y - list.content-y) / root.row-height),
-            Math.floor((Math.max(root.press-y, overlay.mouse-y - list.content-y) - root.gap) / root.row-height),
+            root.row-of-y(Math.min(root.press-y, overlay.mouse-y - list.content-y)),
+            root.row-of-y(Math.max(root.press-y, overlay.mouse-y - list.content-y) - root.gap),
             Math.ceil((Math.min(root.press-x, overlay.mouse-x) - root.gap - ReviewBridge.tile-size) / root.pitch),
             Math.floor((Math.max(root.press-x, overlay.mouse-x) - root.gap) / root.pitch));
     }
@@ -731,8 +756,8 @@ export component ReviewPage inherits Rectangle {
                         sort := ComboBox {
                             current-index <=> ReviewBridge.sort-index;
                             width: 140px;
-                            model: ReviewBridge.search-mode == 1 ? ["Name", "Date modified", "Size", "Type", "Relevance"]
-                                : ["Name", "Date modified", "Size", "Type"];
+                            model: ReviewBridge.search-mode == 1 ? ["Name", "Date", "Size", "Type", "Relevance"]
+                                : ["Name", "Date", "Size", "Type"];
                             selected => { root.apply(); }
                         }
                     }
@@ -746,10 +771,37 @@ export component ReviewPage inherits Rectangle {
                     border-color: Theme.border;
                     clip: true;
 
-                    list := ListView {
-                        for row[r] in ReviewBridge.rows: Rectangle {
-                            height: root.row-height;
-                            HorizontalLayout {
+                    // Not a ListView: that places rows by an average height, and date headers
+                    // are lower than tile rows. Rust hands over the rows in view (`rows`) and
+                    // the page puts each where the layout says.
+                    list := ScrollView {
+                        content-width: self.visible-width;
+                        content-height: root.y-of(ReviewBridge.row-total);
+                        for row in ReviewBridge.rows: Rectangle {
+                            x: 0;
+                            y: root.y-of(row.row);
+                            width: list.visible-width;
+                            height: row.header ? root.header-height : root.row-height;
+                            if row.header: HorizontalLayout {
+                                padding-left: root.gap + 2px;
+                                padding-top: 12px;
+                                spacing: 10px;
+                                alignment: start;
+                                Text {
+                                    text: row.label;
+                                    font-size: 15px;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.detail;
+                                    font-size: 12px;
+                                    color: Theme.text-muted;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if !row.header: HorizontalLayout {
                                 padding-left: root.gap;
                                 padding-top: root.gap;
                                 spacing: root.gap;
@@ -757,7 +809,7 @@ export component ReviewPage inherits Rectangle {
                                 for t[c] in row.tiles: MediaCell {
                                     tile: t;
                                     size: ReviewBridge.tile-size;
-                                    hover: r == root.hover-row && c == root.hover-col;
+                                    hover: row.row == root.hover-row && c == root.hover-col;
                                 }
                             }
                         }

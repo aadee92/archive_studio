@@ -439,3 +439,19 @@ fn a_new_catalog_opens_from_many_threads_at_once() {
         });
     }
 }
+
+#[test]
+fn dates_taken() {
+    let lib = Lib::new();
+    let (a, b, c) = (lib.asset("a.jpg"), lib.asset("b.jpg"), lib.asset("c.jpg"));
+    assert_eq!(lib.cat.taken(a).unwrap(), None);
+    assert!(lib.cat.set_taken(a, Some(549_864_182)).unwrap());
+    assert!(!lib.cat.set_taken(a, Some(549_864_182)).unwrap(), "the same date: nothing changed");
+    assert!(lib.cat.set_taken(b, Some(-126_165_600)).unwrap(), "before 1970");
+    assert!(!lib.cat.set_taken(c, None).unwrap());
+    assert_eq!(lib.cat.taken(a).unwrap(), Some(549_864_182));
+    let found = lib.cat.taken_of(&[a, b, c]).unwrap();
+    assert_eq!(found, HashMap::from([(a, 549_864_182), (b, -126_165_600)]));
+    assert!(lib.cat.set_taken(a, None).unwrap());
+    assert_eq!(lib.cat.taken_of(&[a]).unwrap(), HashMap::new());
+}

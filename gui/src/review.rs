@@ -4,8 +4,9 @@
 //! - The index is append-only: one shared chunk (`Arc<[Entry]>`) per indexer batch, with
 //!   sort keys precomputed on the indexer thread. Filtering and sorting produce a
 //!   `Vec<u32>` of entry ids. No per-file UI objects ever exist.
-//! - The grid is a `ListView` of rows backed by [`GridModel`], which slices the id list
-//!   on demand. Slint only asks for rows in the viewport, so scrolling is O(visible).
+//! - The grid is rows backed by [`GridModel`], which slices the id list on demand (laid out
+//!   by [`Layout`]: month headers when sorted by date). The page is only handed the rows in
+//!   the viewport ([`Window`]), so scrolling is O(visible).
 //! - While indexing, each batch is filtered, sorted on its own and merged into the shown
 //!   order (no re-sort), and the view is told exactly which rows changed or were added,
 //!   so on-screen rows are updated in place and the scroll position holds.
@@ -64,6 +65,7 @@ use archive_core::catalog::query::{self, Expr};
 use archive_core::catalog::flags::AssetFlags;
 use archive_core::catalog::tags::{TagCounter, TagNode};
 use archive_core::catalog::{AssetId, Catalog, TagKind};
+use archive_core::dates;
 use archive_core::media::{classify, MediaKind};
 
 use crate::actions;
@@ -85,6 +87,9 @@ pub(crate) struct Entry {
     size: u64,
     /// Modification time in ns since the epoch (0 if earlier or unknown).
     mtime: u64,
+    /// The date it is sorted and grouped by ([`dates::shown`]): when it was taken if the
+    /// catalog knows, else when it was modified; wall-clock seconds.
+    date: i64,
     tags: Arc<[(String, Option<TagKind>)]>,
     /// What the catalog says about it at a glance (faces, back side, review, failure, the
     /// user's tags), read in bulk off the UI thread; for the tile's badges and the
@@ -120,6 +125,7 @@ impl Entry {
             kind,
             size,
             mtime,
+            date: dates::local(modified),
             tags: tags.into(),
             flags: AssetFlags::NONE,
         }
@@ -192,7 +198,7 @@ impl Index {
 enum Sort {
     #[default]
     Name,
-    /// Newest first.
+    /// Newest first, by [`Entry::date`]; shown in a month's group each ([`Layout`]).
     Date,
     /// Largest first.
     Size,
@@ -206,7 +212,7 @@ enum Sort {
 type Keyed<'a> = (u128, u32, &'a Entry);
 
 impl Sort {
-    /// From the UI's sort combo index (0 name, 1 date modified, 2 size, 3 type, 4 relevance).
+    /// From the UI's sort combo index (0 name, 1 date, 2 size, 3 type, 4 relevance).
     fn from_index(index: i32) -> Self {
         match index {
             1 => Self::Date,
@@ -222,7 +228,7 @@ impl Sort {
     fn key(self, e: &Entry, rank: u32) -> u128 {
         match self {
             Self::Name => e.name_prefix,
-            Self::Date => (!e.mtime).into(),
+            Self::Date => date_key(e.date),
             Self::Size => (!e.size).into(),
             Self::Type => ((e.kind as u128) << 126) | (e.name_prefix >> 2),
             Self::Relevance => ((rank as u128) << 96) | (e.name_prefix >> 32),
@@ -414,6 +420,9 @@ const SYNC_FILTER_LIMIT: usize = 20_000;
 /// UI-thread time one drain of finished thumbnails may take; the rest waits for the next
 /// turn of the event loop, so a burst never holds up a frame.
 const DRAIN_BUDGET: Duration = Duration::from_millis(4);
+/// Rows the page instantiates above and below those in view ([`Window`]), so a scroll by a
+/// row or two shows rows that are there already.
+const WINDOW_MARGIN: usize = 2;
 
 /// A filter + sort of the whole index.
 struct Filtered {
@@ -425,6 +434,8 @@ struct Filtered {
     visible: Vec<u32>,
     keys: Vec<u128>,
     slot_of: Vec<u32>,
+    /// What `keys` are keys of.
+    sort: Sort,
 }
 
 impl Filtered {
@@ -434,7 +445,7 @@ impl Filtered {
         for (slot, &id) in visible.iter().enumerate() {
             slot_of[id as usize] = slot as u32;
         }
-        Self { generation, upto: index.len(), gone: index.gone.len(), visible, keys, slot_of }
+        Self { generation, upto: index.len(), gone: index.gone.len(), visible, keys, slot_of, sort: query.sort }
     }
 }
 
@@ -504,12 +515,74 @@ impl<T> Mailbox<T> {
 /// A finished thumbnail job on its way to the UI thread.
 type Ready = (u32, Tier, Delivery);
 
-/// [`ModelNotify`], recording what it sends in tests.
+/// [`ModelNotify`], recording what it sends in tests; it passes what concerns the rows the
+/// page has instantiated on to them ([`Window`]).
 #[derive(Default)]
 struct Notify {
     inner: ModelNotify,
+    window: Window,
     #[cfg(test)]
     log: RefCell<Vec<Change>>,
+}
+
+/// The rows the page instantiates: those in view and [`WINDOW_MARGIN`] either side. The page
+/// places them itself (a header row is lower than a row of tiles, and `ListView` can only
+/// place rows of one height exactly), so the grid's rows reach it through this window
+/// ([`WindowRows`]), which follows the viewport ([`GridModel::sync_window`]).
+#[derive(Default)]
+struct Window {
+    /// The grid's rows `start..end` are the window's rows `0..`.
+    range: Cell<(usize, usize)>,
+    notify: ModelNotify,
+    #[cfg(test)]
+    log: RefCell<Vec<Change>>,
+}
+
+impl Window {
+    fn row_changed(&self, row: usize) {
+        #[cfg(test)]
+        self.log.borrow_mut().push(Change::Changed(row));
+        self.notify.row_changed(row);
+    }
+
+    fn row_added(&self, index: usize, count: usize) {
+        #[cfg(test)]
+        self.log.borrow_mut().push(Change::Added(index, count));
+        self.notify.row_added(index, count);
+    }
+
+    fn row_removed(&self, index: usize, count: usize) {
+        #[cfg(test)]
+        self.log.borrow_mut().push(Change::Removed(index, count));
+        self.notify.row_removed(index, count);
+    }
+
+    fn reset(&self) {
+        #[cfg(test)]
+        self.log.borrow_mut().push(Change::Reset);
+        self.notify.reset();
+    }
+}
+
+/// The page's view of the grid: the rows of its [`Window`].
+struct WindowRows(Rc<GridModel>);
+
+impl Model for WindowRows {
+    type Data = MediaRow;
+
+    fn row_count(&self) -> usize {
+        let (start, end) = self.0.notify.window.range.get();
+        end - start
+    }
+
+    fn row_data(&self, row: usize) -> Option<MediaRow> {
+        let (start, end) = self.0.notify.window.range.get();
+        (start + row < end).then(|| self.0.row_data(start + row)).flatten()
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.0.notify.window.notify
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +599,10 @@ impl Notify {
         #[cfg(test)]
         self.log.borrow_mut().push(Change::Changed(row));
         self.inner.row_changed(row);
+        let (start, end) = self.window.range.get();
+        if (start..end).contains(&row) {
+            self.window.row_changed(row - start);
+        }
     }
 
     fn row_added(&self, index: usize, count: usize) {
@@ -557,6 +634,11 @@ struct GridModel {
     keys: RefCell<Vec<u128>>,
     /// Entry id -> position in `visible`, or `HIDDEN`.
     slot_of: RefCell<Vec<u32>>,
+    /// What `keys` are keys of: the query's sort once its refilter landed.
+    shown_sort: Cell<Sort>,
+    /// `visible` in rows, with date headers when sorted by date; rebuilt ([`relayout`](Self::relayout))
+    /// whenever `visible` or the column count changes.
+    layout: RefCell<Layout>,
     columns: Cell<usize>,
     tier: Cell<Tier>,
     /// First and last (inclusive) row in view.
@@ -655,12 +737,24 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     GRID.set(Some(grid.clone()));
 
     let bridge = ui.global::<ReviewBridge>();
-    bridge.set_rows(ModelRc::from(grid.clone()));
+    bridge.set_rows(ModelRc::new(WindowRows(grid.clone())));
     bridge.set_root_path(root.display().to_string().into());
     bridge.on_columns_changed(|n| with_grid(|g| g.set_columns(n.max(1) as usize)));
     bridge.on_viewport_changed(|first, last| with_grid(|g| g.set_viewport(first, last)));
+    // Geometry for the page, which places the rows itself (`Layout`); `_serial` is the
+    // layout's, so bindings calling these re-read when it changes.
+    bridge.on_row_y(|_serial, row, row_h, header_h| {
+        GRID.with_borrow(|grid| grid.as_ref().map_or(0.0, |g| g.layout().row_y(row.max(0) as usize, row_h, header_h)))
+    });
+    bridge.on_row_at_y(|_serial, y, row_h, header_h| {
+        GRID.with_borrow(|grid| grid.as_ref().map_or(-1, |g| g.layout().row_at_y(y, row_h, header_h).clamp(-1, i32::MAX as i64) as i32))
+    });
+    bridge.on_is_header(|_serial, row| GRID.with_borrow(|grid| grid.as_ref().is_some_and(|g| g.header_at(row).is_some())));
     bridge.on_click(|row, col, extend, toggle| {
         with_grid(|g| {
+            if let Some(group) = g.header_at(row) {
+                return g.select_group(group, toggle || extend);
+            }
             let id = g.id_at(row, col);
             log::debug!("review click at row {row} col {col} -> entry {id:?} (shift {extend}, ctrl {toggle})");
             g.click(id, extend, toggle)
@@ -807,9 +901,10 @@ pub fn find_similar(ui: &AppWindow, path: &Path) {
     with_grid(|g| g.set_filters(filters));
 }
 
-/// Where [`GridModel::apply_restore`] scrolls: the first tile that was in view, how far its
-/// row was scrolled past, and a tile to keep in view.
-type ScrollBack = (Option<PathBuf>, f32, Option<PathBuf>);
+/// Where [`GridModel::apply_restore`] scrolls: the first tile that was in view (`true`: the
+/// date header over it was the first row in view), how far that row was scrolled past, and
+/// a tile to keep in view.
+type ScrollBack = (Option<PathBuf>, bool, f32, Option<PathBuf>);
 
 /// The Review view as it was left, for Back (see `nav`): the filter controls, the selection
 /// and the scroll position.
@@ -829,8 +924,10 @@ pub(crate) struct Snapshot {
     /// The keyboard cursor.
     focus: Option<PathBuf>,
     /// The first tile in view, and how far its row was scrolled past: restored by tile
-    /// rather than pixels, so it holds if the column count changed meanwhile.
+    /// rather than pixels, so it holds if the column count changed meanwhile. `on_header`:
+    /// the row in view was the date header over it.
     anchor: Option<PathBuf>,
+    on_header: bool,
     offset: f32,
     /// The selection (and focus) was moved to the item last shown on Details ([`follow`](Self::follow)):
     /// scroll to it if it is out of view.
@@ -878,8 +975,12 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
         let ui = g.ui.upgrade()?;
         let bridge = ui.global::<ReviewBridge>();
         let path_of = |id: u32| g.entries.borrow().get(id).map(|e| e.path.clone());
-        let first = bridge.get_scroll_row().max(0) as usize * g.columns.get();
-        let anchor = g.visible.borrow().get(first).copied().and_then(path_of);
+        let row = bridge.get_scroll_row().max(0) as usize;
+        let (first, on_header) = {
+            let layout = g.layout();
+            (layout.first_slot_from(row), matches!(layout.at(row), Some(RowAt::Header(_))))
+        };
+        let anchor = first.and_then(|first| g.visible.borrow().get(first).copied()).and_then(path_of);
         Some(Snapshot {
             search: bridge.get_search_text(),
             tag: bridge.get_tag_text(),
@@ -892,6 +993,7 @@ pub(crate) fn snapshot() -> Option<Snapshot> {
             selected: g.selection.borrow().iter().filter_map(|&id| g.entries.borrow().get(id).map(|e| e.path_hash)).collect(),
             focus: g.focus.get().and_then(path_of),
             anchor,
+            on_header,
             offset: bridge.get_scroll_offset(),
             followed: false,
         })
@@ -984,13 +1086,15 @@ fn entry_for(path: PathBuf, kind: MediaKind, meta: Option<fs::Metadata>, root: &
     (Entry::with_tags(path, name, kind, size, modified, tags), asset)
 }
 
-/// Fills in the flags of `entries` (whose catalog assets are `assets`, in the same order)
-/// with one bulk read for the lot (`Catalog::flags_of`). Blocking: indexer and relay threads.
+/// Fills in the flags of `entries` (whose catalog assets are `assets`, in the same order),
+/// and the date they were taken where the catalog knows it, with one bulk read each for the
+/// lot (`Catalog::flags_of`, `taken_of`). Blocking: indexer and relay threads.
 fn read_flags<'a>(entries: impl Iterator<Item = &'a mut Entry>, assets: &[Option<AssetId>], catalog: Option<&Catalog>) {
     let Some(catalog) = catalog else { return };
     let ids: Vec<AssetId> = assets.iter().flatten().copied().collect();
-    let flags = match catalog.flags_of(&ids) {
-        Ok(flags) => flags,
+    let read = catalog.flags_of(&ids).and_then(|flags| Ok((flags, catalog.taken_of(&ids)?)));
+    let (flags, taken) = match read {
+        Ok(read) => read,
         Err(e) => {
             log::warn!("review: reading the flags of {} files: {e}", ids.len());
             return;
@@ -998,6 +1102,9 @@ fn read_flags<'a>(entries: impl Iterator<Item = &'a mut Entry>, assets: &[Option
     };
     for (entry, asset) in entries.zip(assets) {
         entry.flags = asset.and_then(|a| flags.get(&a).copied()).unwrap_or_default();
+        if let Some(&when) = asset.as_ref().and_then(|a| taken.get(a)) {
+            entry.date = when;
+        }
     }
 }
 
@@ -1098,6 +1205,8 @@ impl GridModel {
             visible: RefCell::default(),
             keys: RefCell::default(),
             slot_of: RefCell::default(),
+            shown_sort: Cell::new(Sort::default()),
+            layout: RefCell::default(),
             columns: Cell::new(1),
             tier: Cell::new(Tier::Small),
             viewport: Cell::new((0, 0)),
@@ -1134,7 +1243,7 @@ impl GridModel {
 
     /// A batch from the indexer: merged into the shown order, notifying only the rows that
     /// changed (from the first insertion on) and the rows added at the end. `row_changed`
-    /// re-reads a row only if the `ListView` has it instantiated (on screen) and is a no-op
+    /// re-reads a row only if the page has it instantiated (on screen) and is a no-op
     /// otherwise, so on-screen rows are updated in place; `reset` would drop and re-create
     /// them all. A batch too big to sort within a frame goes to the filter thread instead.
     fn append(&self, batch: Arc<[Entry]>, done: bool) {
@@ -1164,16 +1273,10 @@ impl GridModel {
             // A huge batch (fast disk): sorting it would stall a frame, so re-filter off-thread.
             self.refilter();
         } else {
-            let old_rows = self.row_count();
+            let old = self.layout().clone();
             if let Some(first) = self.merge_from(from) {
-                let first_row = first / self.columns.get();
-                let new_rows = self.row_count();
-                for row in first_row..old_rows {
-                    self.notify.row_changed(row);
-                }
-                if new_rows > old_rows {
-                    self.notify.row_added(old_rows, new_rows - old_rows);
-                }
+                self.relayout();
+                let first_row = self.rows_changed(&old, first);
                 let (first_shown, last_shown) = self.viewport.get();
                 if first_row <= last_shown + (last_shown - first_shown + 1) * PREFETCH_AHEAD_SCREENS {
                     self.reschedule();
@@ -1218,7 +1321,7 @@ impl GridModel {
                     FileUpdate::Present(entry, changed) => {
                         if let Some(id) = current {
                             let old = index.get(id).expect("mapped ids are indexed");
-                            if !changed && (old.size, old.mtime, &old.tags, old.flags) == (entry.size, entry.mtime, &entry.tags, entry.flags) {
+                            if !changed && (old.size, old.mtime, old.date, &old.tags, old.flags) == (entry.size, entry.mtime, entry.date, &entry.tags, entry.flags) {
                                 continue;
                             }
                             if !old.tags.is_empty() {
@@ -1300,8 +1403,9 @@ impl GridModel {
             // The refilter in flight leaves them out when it lands.
             return;
         }
-        let old_rows = self.row_count();
+        let old = self.layout().clone();
         let Some(first) = self.hide(ids.iter().copied()) else { return };
+        self.relayout();
         if let Some(Some(next)) = next {
             self.focus.set(Some(next));
             self.anchor.set(Some(next));
@@ -1309,14 +1413,87 @@ impl GridModel {
                 self.selection.borrow_mut().insert(next);
             }
         }
-        let (first_row, new_rows) = (first / self.columns.get(), self.row_count());
-        for row in first_row..new_rows {
+        self.rows_changed(&old, first);
+        self.reschedule();
+    }
+
+    /// The shown order changed from `slot` on (it was laid out as `old`): the view re-reads
+    /// the rows from the first that may differ, and is told of rows added or removed at the
+    /// end. Returns that first row.
+    fn rows_changed(&self, old: &Layout, slot: usize) -> usize {
+        let (old_rows, new_rows) = (old.row_count(), self.row_count());
+        let first_row = old.changed_from(slot).min(self.layout().changed_from(slot));
+        for row in first_row..old_rows.min(new_rows) {
             self.notify.row_changed(row);
         }
-        if old_rows > new_rows {
+        if new_rows > old_rows {
+            self.notify.row_added(old_rows, new_rows - old_rows);
+        } else if new_rows < old_rows {
             self.notify.row_removed(new_rows, old_rows - new_rows);
         }
-        self.reschedule();
+        self.sync_window(false);
+        first_row
+    }
+
+    /// Lays `visible` out in rows anew (after it changed, or the column count did), and tells
+    /// the page if that changed its geometry.
+    fn relayout(&self) {
+        let layout = Layout::new(&self.keys.borrow(), self.columns.get(), self.shown_sort.get() == Sort::Date);
+        if *self.layout.borrow() == layout {
+            return;
+        }
+        let rows = layout.row_count();
+        *self.layout.borrow_mut() = layout;
+        if let Some(ui) = self.ui.upgrade() {
+            let bridge = ui.global::<ReviewBridge>();
+            bridge.set_row_total(rows as i32);
+            bridge.set_layout_serial(bridge.get_layout_serial().wrapping_add(1));
+        }
+    }
+
+    /// The rows as laid out now. (Tests may change the column count without a relayout.)
+    fn layout(&self) -> std::cell::Ref<'_, Layout> {
+        if self.layout.borrow().columns != self.columns.get() {
+            *self.layout.borrow_mut() = Layout::new(&self.keys.borrow(), self.columns.get(), self.shown_sort.get() == Sort::Date);
+        }
+        self.layout.borrow()
+    }
+
+    /// Moves the page's [`Window`] to the rows in view (`reset`: its rows all changed).
+    fn sync_window(&self, reset: bool) {
+        let (first, last) = self.viewport.get();
+        let rows = self.row_count();
+        let (a1, b1) = (first.saturating_sub(WINDOW_MARGIN).min(rows), (last + 1 + WINDOW_MARGIN).min(rows));
+        let window = &self.notify.window;
+        let (a0, b0) = window.range.get();
+        if reset || b0 <= a1 || b1 <= a0 {
+            window.range.set((a1, b1));
+            window.reset();
+            return;
+        }
+        // Overlapping: rows come and go at the edges, those in both stay instantiated.
+        if a1 != a0 {
+            window.range.set((a1, b0));
+            if a1 > a0 {
+                window.row_removed(0, a1 - a0);
+            } else {
+                window.row_added(0, a0 - a1);
+            }
+        }
+        if b1 != b0 {
+            window.range.set((a1, b1));
+            if b1 > b0 {
+                window.row_added(b0 - a1, b1 - b0);
+            } else {
+                window.row_removed(b1 - a1, b0 - b1);
+            }
+        }
+    }
+
+    /// The view's rows all changed (a new filter, column count or tile size).
+    fn reset_view(&self) {
+        self.notify.reset();
+        self.sync_window(true);
     }
 
     /// Takes `ids` out of the shown order; returns the first slot that changed, if any.
@@ -1475,6 +1652,7 @@ impl GridModel {
         *self.visible.borrow_mut() = result.visible;
         *self.keys.borrow_mut() = result.keys;
         *self.slot_of.borrow_mut() = result.slot_of;
+        self.shown_sort.set(result.sort);
         // Entries retired since the snapshot.
         if self.entries.borrow().gone.len() != result.gone {
             let gone = self.entries.borrow().gone.clone();
@@ -1488,7 +1666,8 @@ impl GridModel {
         }
         // Items the new filter hides leave the selection.
         self.prune_selection();
-        self.notify.reset();
+        self.relayout();
+        self.reset_view();
         self.reschedule();
         self.publish_status();
         self.publish_selection();
@@ -1504,7 +1683,8 @@ impl GridModel {
         });
         let columns_changed = self.columns.replace(columns) != columns;
         if self.tier.replace(tier) != tier || columns_changed {
-            self.notify.reset();
+            self.relayout();
+            self.reset_view();
             self.reschedule();
         }
     }
@@ -1520,6 +1700,7 @@ impl GridModel {
         if first != previous.0 {
             self.scrolling_down.set(first > previous.0);
         }
+        self.sync_window(false);
         self.schedule_window(true);
         self.settle.start(TimerMode::SingleShot, SCROLL_SETTLE, || with_grid(|g| g.reschedule()));
     }
@@ -1544,9 +1725,9 @@ impl GridModel {
             screen * PREFETCH_AHEAD_SCREENS,
             (screen / 2).max(1),
         );
-        let (columns, tier) = (self.columns.get(), self.tier.get());
-        let (visible, entries) = (self.visible.borrow(), self.entries.borrow());
-        let ids = rows.iter().flat_map(|&row| visible.get(row * columns..((row + 1) * columns).min(visible.len())).unwrap_or_default());
+        let tier = self.tier.get();
+        let (visible, entries, layout) = (self.visible.borrow(), self.entries.borrow(), self.layout());
+        let ids = rows.iter().flat_map(|&row| visible.get(layout.slots(row)).unwrap_or_default());
         self.thumbs.schedule(ids.map(|&id| (id, tier)), |id| entries.get(id).map(|e| (e.path.clone(), e.kind)));
     }
 
@@ -1625,13 +1806,15 @@ impl GridModel {
     /// The rubber band covers rows `r0..=r1`, columns `c0..=c1` (not clamped to the grid):
     /// those tiles are selected, with what was selected when it started.
     fn drag_to(&self, r0: i32, r1: i32, c0: i32, c1: i32) {
-        let (columns, n) = (self.columns.get(), self.visible.borrow().len());
+        let columns = self.columns.get();
         let (r1, c1) = (r1.min(self.row_count() as i32 - 1), c1.min(columns as i32 - 1));
         let mut covered = HashSet::new();
         if r1 >= 0 && c1 >= 0 && r0 <= r1 && c0 <= c1 {
-            let visible = self.visible.borrow();
+            let (visible, layout) = (self.visible.borrow(), self.layout());
             for row in r0.max(0) as usize..=r1 as usize {
-                covered.extend((c0.max(0) as usize..=c1 as usize).map(|c| row * columns + c).filter(|&i| i < n).map(|i| visible[i]));
+                // Header rows have no tiles.
+                let slots = layout.slots(row);
+                covered.extend((c0.max(0) as usize..=c1 as usize).map(|c| slots.start + c).filter(|i| slots.contains(i)).map(|i| visible[i]));
             }
         }
         let mut changed = Vec::new();
@@ -1659,23 +1842,31 @@ impl GridModel {
     /// A key on the grid (lowercase: `left`, `pageup`, `a`, …); returns whether it was used.
     fn key(&self, key: &str, shift: bool, ctrl: bool) -> bool {
         let len = self.visible.borrow().len();
-        let columns = self.columns.get();
         let (first, last) = self.viewport.get();
-        let page = (last - first).max(1) * columns;
+        let page = (last - first).max(1) as isize;
         let at = self.focus.get().and_then(|id| self.slot(id));
+        let layout = self.layout().clone();
         let step = |delta: isize| match at {
             Some(at) => Some(at.saturating_add_signed(delta).min(len.saturating_sub(1))),
             // Nothing focused yet: the first tile in view.
-            None => Some((first * columns).min(len.saturating_sub(1))),
+            None => Some(layout.first_slot_from(first).unwrap_or(0).min(len.saturating_sub(1))),
+        };
+        // Within the column, across date headers; down from the row above a shorter last row
+        // goes to its end. A page past the first or last row goes to the first or last item.
+        let rows = |delta: isize, page: bool| match at {
+            Some(at) => match layout.vertical(at, delta) {
+                (_, false) if page => Some(if delta < 0 { 0 } else { len.saturating_sub(1) }),
+                (to, _) => Some(to),
+            },
+            None => step(0),
         };
         let to = match key {
             "left" => step(-1),
             "right" => step(1),
-            // Within the column; down from the row above a shorter last row goes to its end.
-            "up" => at.map_or(step(0), |at| Some(if at >= columns { at - columns } else { at })),
-            "down" => at.map_or(step(0), |at| Some(if at / columns + 1 < self.row_count() { (at + columns).min(len - 1) } else { at })),
-            "pageup" => step(-(page as isize)),
-            "pagedown" => step(page as isize),
+            "up" => rows(-1, false),
+            "down" => rows(1, false),
+            "pageup" => rows(-page, true),
+            "pagedown" => rows(page, true),
             "home" => Some(0),
             "end" => Some(len.saturating_sub(1)),
             "a" if ctrl => {
@@ -1742,7 +1933,7 @@ impl GridModel {
         let Some(ui) = self.ui.upgrade() else { return };
         let bridge = ui.global::<ReviewBridge>();
         let serial = bridge.get_reveal().serial + 1;
-        bridge.set_reveal(ScrollRestore { serial, row: (slot / self.columns.get()) as i32, offset: 0.0 });
+        bridge.set_reveal(ScrollRestore { serial, row: self.layout().row_of(slot) as i32, offset: 0.0 });
     }
 
     /// Where entry `id` is shown, if it is.
@@ -1757,11 +1948,35 @@ impl GridModel {
 
     /// The entry shown at grid `row`, `column`.
     fn id_at(&self, row: i32, column: i32) -> Option<u32> {
-        let columns = self.columns.get();
-        if row < 0 || column < 0 || column as usize >= columns {
+        if row < 0 || column < 0 {
             return None;
         }
-        self.visible.borrow().get(row as usize * columns + column as usize).copied()
+        let slots = self.layout().slots(row as usize);
+        let slot = slots.start + column as usize;
+        slots.contains(&slot).then(|| self.visible.borrow()[slot])
+    }
+
+    /// The date group whose header is at grid `row`, if one is.
+    fn header_at(&self, row: i32) -> Option<usize> {
+        match self.layout().at(usize::try_from(row).ok()?)? {
+            RowAt::Header(g) => Some(g),
+            RowAt::Tiles(_) => None,
+        }
+    }
+
+    /// A click on a date header: selects the month's items (`add`: Ctrl, to the selection),
+    /// the first of them focused, as the anchor of a Shift range.
+    fn select_group(&self, g: usize, add: bool) {
+        let slots = self.layout().group(g);
+        let ids: Vec<u32> = self.visible.borrow()[slots].to_vec();
+        log::debug!("review: header {g} picks its {} items (add {add})", ids.len());
+        let mut selection = if add { self.selection.borrow().clone() } else { HashSet::new() };
+        selection.extend(ids.iter().copied());
+        if let Some(&first) = ids.first() {
+            self.focus_on(first);
+            self.anchor.set(Some(first));
+        }
+        self.set_selection(selection);
     }
 
     /// The live entry of the path with [`path_hash`] `hash`.
@@ -1860,7 +2075,7 @@ impl GridModel {
         self.anchor.set(focus);
         let ids = s.selected.iter().filter_map(|&hash| self.id_of_hash(hash)).collect();
         self.set_selection(ids);
-        *self.restore.borrow_mut() = Some((s.anchor, s.offset, reveal));
+        *self.restore.borrow_mut() = Some((s.anchor, s.on_header, s.offset, reveal));
         if refilter {
             self.set_filters(filters);
         }
@@ -1873,14 +2088,19 @@ impl GridModel {
         if self.pending.get() || self.searching.get() {
             return;
         }
-        let Some((anchor, offset, reveal)) = self.restore.take() else { return };
-        let columns = self.columns.get();
+        let Some((anchor, on_header, offset, reveal)) = self.restore.take() else { return };
+        let layout = self.layout().clone();
         let row_of = |path: &PathBuf| {
             let id = self.id_of(path)?;
             let slot = self.slot_of.borrow().get(id as usize).copied().filter(|&slot| slot != HIDDEN)?;
-            Some(slot as usize / columns)
+            Some(layout.row_of(slot as usize))
         };
-        let mut to = anchor.as_ref().and_then(row_of).map(|row| (row, offset));
+        // The header over the anchor, if that was in view and still heads its row.
+        let header_over = |row: usize| match layout.at(row.wrapping_sub(1)) {
+            Some(RowAt::Header(_)) if on_header => row - 1,
+            _ => row,
+        };
+        let mut to = anchor.as_ref().and_then(row_of).map(|row| (header_over(row), offset));
         if to.is_none() {
             log::debug!("review restore: scroll anchor {anchor:?} not shown - scroll left as is");
         }
@@ -1922,10 +2142,10 @@ impl GridModel {
             self.drain_later();
         }
 
-        let (slot_of, columns) = (self.slot_of.borrow(), self.columns.get());
+        let (slot_of, layout) = (self.slot_of.borrow(), self.layout());
         let mut rows: Vec<usize> =
-            changed.iter().filter_map(|&id| slot_of.get(id as usize).filter(|&&slot| slot != HIDDEN)).map(|&slot| slot as usize / columns).collect();
-        drop(slot_of);
+            changed.iter().filter_map(|&id| slot_of.get(id as usize).filter(|&&slot| slot != HIDDEN)).map(|&slot| layout.row_of(slot as usize)).collect();
+        drop((slot_of, layout));
         rows.sort_unstable();
         rows.dedup();
         for row in rows {
@@ -1943,8 +2163,8 @@ impl GridModel {
 
     /// Re-delivers each row holding one of `ids` that is shown, once.
     fn refresh_entries(&self, ids: Vec<u32>) {
-        let columns = self.columns.get();
-        let mut rows: Vec<usize> = ids.into_iter().filter_map(|id| self.slot(id)).map(|slot| slot / columns).collect();
+        let layout = self.layout().clone();
+        let mut rows: Vec<usize> = ids.into_iter().filter_map(|id| self.slot(id)).map(|slot| layout.row_of(slot)).collect();
         rows.sort_unstable();
         rows.dedup();
         for row in rows {
@@ -1956,7 +2176,8 @@ impl GridModel {
     fn refresh_entry(&self, id: u32) {
         let slot = self.slot_of.borrow().get(id as usize).copied().unwrap_or(HIDDEN);
         if slot != HIDDEN {
-            self.notify.row_changed(slot as usize / self.columns.get());
+            let row = self.layout().row_of(slot as usize);
+            self.notify.row_changed(row);
         }
     }
 
@@ -2032,6 +2253,197 @@ impl GridModel {
     }
 }
 
+/// [`Sort::Date`]'s key of a date: newest first, so smaller for later dates.
+fn date_key(date: i64) -> u128 {
+    (!((date as u64) ^ (1 << 63))).into()
+}
+
+/// The date a [`date_key`] was made from.
+fn key_date(key: u128) -> i64 {
+    (!(key as u64) ^ (1 << 63)) as i64
+}
+
+/// What a grid row shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowAt {
+    /// The header of a group (by its index).
+    Header(usize),
+    /// The tiles in these slots of the shown order.
+    Tiles(std::ops::Range<usize>),
+}
+
+/// How the shown order is laid out in rows of `columns` tiles. Sorted by date, each month's
+/// items are a group that starts on a row of its own under a header row; otherwise there is
+/// one group without a header. Groups are found by binary search on the sort keys (months ·
+/// log n), so the layout is simply rebuilt whenever the order changes; looking up a row's
+/// slots, a slot's row or a row's position is a binary search over the groups. Selection
+/// ranges, the keyboard, the rubber band, thumbnail scheduling, scroll positions and the
+/// rows the view re-reads all go through it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Layout {
+    columns: usize,
+    /// Slots shown.
+    len: usize,
+    /// Groups have a header row (sorted by date).
+    headers: bool,
+    /// Each group's first slot, ascending (the first is 0); none when nothing is shown.
+    starts: Vec<usize>,
+    /// Each group's first row (its header if it has one).
+    rows: Vec<usize>,
+    /// Each group's month, `(year, month)` (headers only).
+    months: Vec<(i64, u32)>,
+    total_rows: usize,
+}
+
+impl Layout {
+    /// For `keys`, the shown order's sort keys; `by_date`: they are [`date_key`]s, newest first.
+    fn new(keys: &[u128], columns: usize, by_date: bool) -> Self {
+        let columns = columns.max(1);
+        let mut layout = Self { columns, len: keys.len(), headers: by_date, ..Self::default() };
+        let (mut start, mut row) = (0, 0);
+        while start < keys.len() {
+            let (end, month) = if by_date {
+                let (year, month) = dates::month_of(key_date(keys[start]));
+                // Newest first: the month's items are those up to its first second's key.
+                let limit = date_key(dates::month_start(year, month));
+                (start + keys[start..].partition_point(|&k| k <= limit).max(1), (year, month))
+            } else {
+                (keys.len(), (0, 0))
+            };
+            layout.starts.push(start);
+            layout.rows.push(row);
+            layout.months.push(month);
+            row += usize::from(by_date) + (end - start).div_ceil(columns);
+            start = end;
+        }
+        layout.total_rows = row;
+        layout
+    }
+
+    fn row_count(&self) -> usize {
+        self.total_rows
+    }
+
+    fn header_rows(&self) -> usize {
+        usize::from(self.headers)
+    }
+
+    /// The group holding `slot` (the last one for slots past the end).
+    fn group_of(&self, slot: usize) -> usize {
+        self.starts.partition_point(|&s| s <= slot).saturating_sub(1)
+    }
+
+    /// The slots of group `g`.
+    fn group(&self, g: usize) -> std::ops::Range<usize> {
+        self.starts[g]..self.starts.get(g + 1).copied().unwrap_or(self.len)
+    }
+
+    /// The row showing `slot`.
+    fn row_of(&self, slot: usize) -> usize {
+        if self.starts.is_empty() {
+            return slot / self.columns;
+        }
+        let g = self.group_of(slot);
+        self.rows[g] + self.header_rows() + (slot - self.starts[g]) / self.columns
+    }
+
+    /// The first row that may show `slot` or a later one, or whose header may have changed
+    /// with it: where re-reading starts after the order changed from `slot` on.
+    fn changed_from(&self, slot: usize) -> usize {
+        if self.headers && !self.starts.is_empty() {
+            self.rows[self.group_of(slot)]
+        } else {
+            slot / self.columns
+        }
+    }
+
+    fn at(&self, row: usize) -> Option<RowAt> {
+        if row >= self.total_rows {
+            return None;
+        }
+        let g = self.rows.partition_point(|&r| r <= row) - 1;
+        if self.headers && row == self.rows[g] {
+            return Some(RowAt::Header(g));
+        }
+        let group = self.group(g);
+        let start = group.start + (row - self.rows[g] - self.header_rows()) * self.columns;
+        Some(RowAt::Tiles(start..(start + self.columns).min(group.end)))
+    }
+
+    /// The slots of tile row `row` (empty for a header or past the end).
+    fn slots(&self, row: usize) -> std::ops::Range<usize> {
+        match self.at(row) {
+            Some(RowAt::Tiles(slots)) => slots,
+            _ => 0..0,
+        }
+    }
+
+    /// The first slot shown at `row` or after it, if any.
+    fn first_slot_from(&self, row: usize) -> Option<usize> {
+        match self.at(row)? {
+            RowAt::Header(g) => Some(self.starts[g]),
+            RowAt::Tiles(slots) => Some(slots.start),
+        }
+    }
+
+    /// The slot `rows` tile rows up (negative) or down from `slot`, in its column as far as
+    /// the row reaches, headers skipped; and whether there were that many rows to go.
+    fn vertical(&self, slot: usize, rows: isize) -> (usize, bool) {
+        let from = self.row_of(slot);
+        let column = slot - self.slots(from).start;
+        let (mut row, mut best, mut left) = (from, from, rows.unsigned_abs());
+        while left > 0 {
+            match row.checked_add_signed(rows.signum()).filter(|&r| r < self.total_rows) {
+                Some(next) => row = next,
+                None => break,
+            }
+            if matches!(self.at(row), Some(RowAt::Tiles(_))) {
+                best = row;
+                left -= 1;
+            }
+        }
+        let slots = self.slots(best);
+        (slots.start + column.min(slots.len().saturating_sub(1)), left == 0)
+    }
+
+    /// Header rows before `row`.
+    fn headers_before(&self, row: usize) -> usize {
+        if self.headers { self.rows.partition_point(|&r| r < row) } else { 0 }
+    }
+
+    /// Where `row` starts, for rows `row_h` and headers `header_h` high (both as the page
+    /// draws them).
+    fn row_y(&self, row: usize, row_h: f32, header_h: f32) -> f32 {
+        let headers = self.headers_before(row);
+        (row - headers) as f32 * row_h + headers as f32 * header_h
+    }
+
+    /// The row at height `y` (-1 above the first; `row_count` and on past the last).
+    fn row_at_y(&self, y: f32, row_h: f32, header_h: f32) -> i64 {
+        if y < 0.0 || row_h <= 0.0 {
+            return -1;
+        }
+        if !self.headers || self.starts.is_empty() {
+            return (y / row_h) as i64;
+        }
+        let g = self.rows.partition_point(|&r| self.row_y(r, row_h, header_h) <= y).saturating_sub(1);
+        let into = y - self.row_y(self.rows[g], row_h, header_h);
+        if into < header_h {
+            return self.rows[g] as i64;
+        }
+        (self.rows[g] + 1) as i64 + ((into - header_h) / row_h) as i64
+    }
+
+    /// A header's label and count ("October 2026", "42 items").
+    fn header(&self, g: usize) -> (String, String) {
+        const MONTHS: [&str; 12] =
+            ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        let (year, month) = self.months[g];
+        let n = self.group(g).len();
+        (format!("{} {year}", MONTHS[(month as usize).clamp(1, 12) - 1]), format!("{} {}", grouped(n), if n == 1 { "item" } else { "items" }))
+    }
+}
+
 /// How many of the positions `0..len` satisfy `before` (true, then false), by exponential
 /// search: O(log answer), so merging k sorted items into n takes O(k log(n/k)) comparisons.
 fn gallop(len: usize, before: impl Fn(usize) -> bool) -> usize {
@@ -2056,17 +2468,25 @@ impl Model for GridModel {
     type Data = MediaRow;
 
     fn row_count(&self) -> usize {
-        self.visible.borrow().len().div_ceil(self.columns.get())
+        self.layout().row_count()
     }
 
     fn row_data(&self, row: usize) -> Option<MediaRow> {
-        let columns = self.columns.get();
-        let visible = self.visible.borrow();
-        let start = row * columns;
-        let ids = visible.get(start..(start + columns).min(visible.len()))?;
-        let entries = self.entries.borrow();
-        let tiles: Vec<MediaTile> = ids.iter().filter_map(|&id| Some(self.tile(id, entries.get(id)?))).collect();
-        Some(MediaRow { tiles: ModelRc::new(VecModel::from(tiles)) })
+        let layout = self.layout();
+        match layout.at(row)? {
+            RowAt::Header(g) => {
+                let (label, detail) = layout.header(g);
+                Some(MediaRow { row: row as i32, header: true, label: label.into(), detail: detail.into(), tiles: ModelRc::default() })
+            }
+            RowAt::Tiles(slots) => {
+                drop(layout);
+                let visible = self.visible.borrow();
+                let ids = visible.get(slots)?;
+                let entries = self.entries.borrow();
+                let tiles: Vec<MediaTile> = ids.iter().filter_map(|&id| Some(self.tile(id, entries.get(id)?))).collect();
+                Some(MediaRow { row: row as i32, tiles: ModelRc::new(VecModel::from(tiles)), ..MediaRow::default() })
+            }
+        }
     }
 
     fn model_tracker(&self) -> &dyn ModelTracker {
@@ -2237,9 +2657,19 @@ mod tests {
             .collect()
     }
 
+    /// The grid's rows as the view would show them: the ids of a row's tiles, or for a date
+    /// header `[HEADER, month]`.
     fn rows(g: &GridModel) -> Vec<Vec<u32>> {
-        g.visible.borrow().chunks(g.columns.get()).map(<[u32]>::to_vec).collect()
+        let (layout, visible) = (g.layout(), g.visible.borrow());
+        (0..layout.row_count())
+            .map(|row| match layout.at(row).unwrap() {
+                RowAt::Header(group) => vec![HEADER, layout.months[group].0 as u32 * 12 + layout.months[group].1],
+                RowAt::Tiles(slots) => visible[slots].to_vec(),
+            })
+            .collect()
     }
+
+    const HEADER: u32 = u32::MAX;
 
     /// Applies the logged notifications to `mirror` the way a view would (re-reading rows
     /// it is told about) and checks it ends up showing what the model holds.
@@ -2272,7 +2702,7 @@ mod tests {
         let e = |id: &u32| index.get(*id).unwrap();
         match query.sort {
             Sort::Name => ids.sort_by(|a, b| e(a).name_lc.cmp(&e(b).name_lc)),
-            Sort::Date => ids.sort_by(|a, b| e(b).mtime.cmp(&e(a).mtime)),
+            Sort::Date => ids.sort_by(|a, b| e(b).date.cmp(&e(a).date)),
             Sort::Size => ids.sort_by(|a, b| e(b).size.cmp(&e(a).size)),
             Sort::Type => ids.sort_by(|a, b| (e(a).kind as i32, &e(a).name_lc).cmp(&(e(b).kind as i32, &e(b).name_lc))),
             Sort::Relevance => {
@@ -2571,6 +3001,165 @@ mod tests {
         g.click(Some(5), false, true);
         g.update_files(vec![FileUpdate::Gone("/x/4.png".into()), FileUpdate::Gone("/x/5.png".into())]);
         assert_eq!((g.focus.get(), selected(&g)), (Some(6), vec![6]), "next item selected once nothing is");
+    }
+
+    /// An entry dated `date` (wall-clock seconds).
+    fn dated(name: &str, date: i64) -> Entry {
+        let mut e = Entry::new(format!("/x/{name}").into(), name.into(), MediaKind::Image, 1, SystemTime::UNIX_EPOCH);
+        e.date = date;
+        e
+    }
+
+    /// Like `replay`, for the page's window: rows it was told changed (or that are new) are
+    /// read when it draws, the others must still show what they showed.
+    fn replay_window(g: &GridModel, mirror: &mut Vec<Option<Vec<u32>>>) {
+        let (start, end) = g.notify.window.range.get();
+        let now = rows(g)[start..end].to_vec();
+        for change in g.notify.window.log.take() {
+            match change {
+                Change::Changed(row) => mirror[row] = None,
+                Change::Added(index, count) => drop(mirror.splice(index..index, std::iter::repeat_n(None, count))),
+                Change::Removed(index, count) => drop(mirror.drain(index..index + count)),
+                Change::Reset => *mirror = vec![None; end - start],
+            }
+        }
+        assert_eq!(mirror.len(), end - start, "window rows");
+        for (row, shown) in mirror.iter_mut().enumerate() {
+            let shown = shown.get_or_insert_with(|| now[row].clone());
+            assert_eq!(*shown, now[row], "window row {row} (grid row {}) not re-read", start + row);
+        }
+    }
+
+    /// Sorted by date, each month gets a header row and starts a row of its own, kept right
+    /// through incremental merges and removals, in the view and in the page's window.
+    #[test]
+    fn date_headers_group_months() {
+        let mut rng = Rng(0x2545_f491);
+        let month = 31 * 86_400;
+        for columns in [1, 3, 7] {
+            let g = grid(usize::MAX, columns, |_| {});
+            g.viewport.set((3, 9));
+            g.set_query(Query { sort: Sort::Date, ..Default::default() });
+            let (mut mirror, mut window) = (Vec::new(), Vec::new());
+            replay(&g, &mut mirror);
+            replay_window(&g, &mut window);
+            let mut n = 0;
+            for _ in 0..40 {
+                let batch: Vec<Entry> = (0..rng.below(30))
+                    .map(|_| {
+                        n += 1;
+                        // A dozen months around 1970, some before it.
+                        dated(&format!("{n}.jpg"), rng.below(12 * month) as i64 - 3 * month as i64)
+                    })
+                    .collect();
+                g.append(batch.into(), false);
+                replay(&g, &mut mirror);
+                if rng.below(3) == 0 {
+                    let gone: Vec<FileUpdate> = (0..3).map(|_| FileUpdate::Gone(format!("/x/{}.jpg", rng.below(n.max(1) as u64) + 1).into())).collect();
+                    g.indexing.set(false);
+                    g.update_files(gone);
+                }
+                if rng.below(4) == 0 {
+                    let first = rng.below(g.row_count() as u64) as usize;
+                    g.set_viewport(first as i32, first as i32 + 5);
+                }
+
+                // The layout is what a fresh one of the order would be; each month's items
+                // come under its header, newest first, columns at a time.
+                assert_eq!(*g.layout(), Layout::new(&g.keys.borrow(), columns, true));
+                let (index, visible) = (g.entries.borrow(), g.visible.borrow().clone());
+                let month_of = |id: u32| dates::month_of(index.get(id).unwrap().date);
+                let mut expected = Vec::new();
+                for group in visible.chunk_by(|&a, &b| month_of(a) == month_of(b)) {
+                    let (year, m) = month_of(group[0]);
+                    expected.push(vec![HEADER, year as u32 * 12 + m]);
+                    expected.extend(group.chunks(columns).map(<[u32]>::to_vec));
+                }
+                drop(index);
+                assert_eq!(rows(&g), expected);
+                // Every slot's row holds it.
+                let layout = g.layout().clone();
+                for slot in 0..visible.len() {
+                    assert!(layout.slots(layout.row_of(slot)).contains(&slot));
+                }
+                replay(&g, &mut mirror);
+                replay_window(&g, &mut window);
+            }
+            // A refilter by name drops the headers.
+            g.set_query(Query::default());
+            assert!(!g.layout().headers && rows(&g).iter().all(|r| r.first() != Some(&HEADER)));
+            replay_window(&g, &mut window);
+        }
+    }
+
+    /// Keys, clicks, the rubber band and the page's geometry across date headers.
+    #[test]
+    fn date_headers_navigation_and_geometry() {
+        let g = grid(usize::MAX, 3, |_| {});
+        g.set_query(Query { sort: Sort::Date, ..Default::default() });
+        let at = |y: i64, m: i64| dates::month_start(y, m as u32) + 86_400;
+        // Newest first: 5 in March (ids 0..5), 2 in February (5, 6), 4 in January (7..11).
+        let mut files: Vec<Entry> = (0..5).map(|i| dated(&format!("m{i}"), at(2026, 3) - i)).collect();
+        files.extend((0..2).map(|i| dated(&format!("f{i}"), at(2026, 2) - i)));
+        files.extend((0..4).map(|i| dated(&format!("j{i}"), at(2026, 1) - i)));
+        g.append(files.into(), true);
+        let m = |month: u32| vec![HEADER, 2026 * 12 + month];
+        assert_eq!(rows(&g), [m(3), vec![0, 1, 2], vec![3, 4], m(2), vec![5, 6], m(1), vec![7, 8, 9], vec![10]]);
+        assert_eq!(g.layout().header(0), ("March 2026".into(), "5 items".into()));
+        assert_eq!(g.layout().header(1).1, "2 items");
+        assert_eq!(g.id_at(0, 0), None, "a header has no tiles");
+        assert_eq!((g.id_at(2, 1), g.id_at(2, 2)), (Some(4), None));
+        assert_eq!(g.header_at(3), Some(1));
+        let row = g.row_data(5).unwrap();
+        assert!(row.header && row.label == "January 2026" && row.row == 5 && row.tiles.row_count() == 0);
+
+        let selected = |g: &GridModel| {
+            let mut ids: Vec<u32> = g.selection.borrow().iter().copied().collect();
+            ids.sort();
+            ids
+        };
+        // Up / Down keep the column across headers, as far as the row reaches.
+        g.click(Some(2), false, false);
+        assert!(g.key("down", false, false) && g.focus.get() == Some(4), "a shorter row: its end");
+        assert!(g.key("down", false, false) && g.focus.get() == Some(6), "past February's header");
+        assert!(g.key("down", false, false) && g.focus.get() == Some(8));
+        assert!(g.key("down", false, false) && g.focus.get() == Some(10));
+        assert!(g.key("down", false, false) && g.focus.get() == Some(10), "no row below");
+        assert!(g.key("up", false, false) && g.focus.get() == Some(7));
+        assert!(g.key("up", true, false) && g.focus.get() == Some(5));
+        assert_eq!(selected(&g), [5, 6, 7], "Shift: the range in the shown order");
+        assert!(g.key("left", false, false) && g.focus.get() == Some(4), "left / right run on through months");
+        g.viewport.set((0, 2));
+        assert!(g.key("pagedown", false, false) && g.focus.get() == Some(8), "two rows down: February's, then January's first");
+        assert!(g.key("pagedown", false, false) && g.focus.get() == Some(10), "past the end: the last item");
+        assert!(g.key("pageup", false, false) && g.focus.get() == Some(5));
+        assert!(g.key("pageup", false, false) && g.focus.get() == Some(0), "past the start: the first item");
+
+        // A header click picks its month; Ctrl adds.
+        g.select_group(1, false);
+        assert_eq!((selected(&g), g.focus.get()), (vec![5, 6], Some(5)));
+        g.select_group(2, true);
+        assert_eq!(selected(&g), [5, 6, 7, 8, 9, 10]);
+        // The rubber band skips headers.
+        g.drag_begin(false);
+        g.drag_to(2, 4, 0, 0);
+        assert_eq!(selected(&g), [3, 5]);
+
+        // Geometry: rows 100 high, headers 40.
+        let layout = g.layout().clone();
+        let tops: Vec<f32> = (0..=layout.row_count()).map(|r| layout.row_y(r, 100.0, 40.0)).collect();
+        assert_eq!(tops, [0.0, 40.0, 140.0, 240.0, 280.0, 380.0, 420.0, 520.0, 620.0]);
+        for (row, &top) in tops.iter().enumerate() {
+            assert_eq!(layout.row_at_y(top, 100.0, 40.0), row as i64);
+            if row > 0 {
+                assert_eq!(layout.row_at_y(top - 0.5, 100.0, 40.0), row as i64 - 1);
+            }
+        }
+        assert_eq!(layout.row_at_y(-1.0, 100.0, 40.0), -1);
+        assert_eq!(layout.first_slot_from(3), Some(5));
+        // Without headers, rows are all one height.
+        let plain = Layout::new(&g.keys.borrow(), 3, false);
+        assert_eq!((plain.row_count(), plain.row_y(2, 100.0, 40.0), plain.row_at_y(250.0, 100.0, 40.0)), (4, 200.0, 2));
     }
 
     /// Naming someone in People (or adding a tag) reaches the grid as a file update: the

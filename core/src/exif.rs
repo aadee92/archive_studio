@@ -135,12 +135,12 @@ pub fn parse(exif: &[u8]) -> Exif {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Little-endian TIFF: IFD0 with Make, Orientation and a pointer to an EXIF IFD holding
     /// DateTimeOriginal and FNumber.
-    fn sample() -> Vec<u8> {
+    pub(crate) fn sample() -> Vec<u8> {
         let mut d = b"Exif\0\0II*\0".to_vec();
         let base = 6;
         let push16 = |d: &mut Vec<u8>, v: u16| d.extend(v.to_le_bytes());

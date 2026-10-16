@@ -240,6 +240,41 @@ fn the_engine_signs_images_and_finds_near_duplicates() {
     assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), [all[1]]);
 }
 
+#[test]
+fn the_engine_reads_when_pictures_were_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // A PNG whose eXIf chunk says 1987:06:05 04:03:02, and one without.
+    let dated = root.join("dated.png");
+    let mut png = png::Encoder::new(std::io::BufWriter::new(File::create(&dated).unwrap()), 4, 2);
+    png.set_color(png::ColorType::Rgb);
+    let mut writer = png.write_header().unwrap();
+    writer.write_chunk(png::chunk::eXIf, &crate::exif::tests::sample()[6..]).unwrap();
+    writer.write_image_data(&[128; 4 * 2 * 3]).unwrap();
+    writer.finish().unwrap();
+    write_png(&root.join("plain.png"), 4, 2);
+    assert_eq!(read_taken(&dated).unwrap(), Some(549_864_182));
+    assert_eq!(read_taken(&root.join("plain.png")).unwrap(), None);
+
+    let (send, events) = mpsc::channel();
+    let send = Mutex::new(send);
+    let engine =
+        Engine::start(&root, Config { threads: 2, models: Models::default() }, move |e| send.lock().unwrap().send(e).unwrap()).unwrap();
+    // Front ends hear of the date (an update of the file).
+    expect(&events, "dated", |e| matches!(e, Event::Updated(p) if *p == dated));
+    expect(&events, "idle", |e| matches!(e, Event::Idle));
+    drop(engine);
+
+    let catalog = open(&root);
+    let id = |name: &str| catalog.find_asset(&root.join(name)).unwrap().unwrap();
+    assert_eq!(catalog.taken(id("dated.png")).unwrap(), Some(549_864_182));
+    assert_eq!(catalog.taken(id("plain.png")).unwrap(), None);
+    let counts = date_status(&catalog).unwrap();
+    assert_eq!((counts.done, counts.pending, counts.failed), (2, 0, 0));
+    let run = catalog.run_of(id("dated.png"), DATE).unwrap().unwrap();
+    assert_eq!((run.0, run.1, run.2.as_str()), (RunStatus::Done, Some(549_864_182), "taken 1987-06-05 04:03"));
+}
+
 impl Event {
     fn clone_ready(&self) -> Availability {
         match self {

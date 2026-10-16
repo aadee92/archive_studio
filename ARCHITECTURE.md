@@ -53,8 +53,8 @@ is used by core as a path dependency.
 
 ## Pipeline (`archive_core::pipeline`)
 
-What happens to a file once it is in the library: register → orient → faces, signature and
-describe, then, once the per-file stages are quiet, identify (suggestions and clusters) and
+What happens to a file once it is in the library: register → date (when an image was taken,
+from its EXIF) and orient → faces, signature and describe, then, once the per-file stages are quiet, identify (suggestions and clusters) and
 XMP sidecar sync.
 
 - **Hosted, not a daemon**: a front end starts an `Engine` when it opens a library and drops
@@ -191,6 +191,14 @@ XMP sidecar sync.
   error, so the next undo goes on. Purging from the trash isn't undoable and drops the changes
   that touched what was purged. Changes other connections make (the pipeline's) aren't
   recorded: an undo restores the user's rows as they were, whatever the pipeline wrote since.
+- **Dates** (`dates`, schema 9): the pipeline's `date` stage (no model, header only, before
+  orient) reads an image's EXIF `DateTimeOriginal` into `assets.taken` as wall-clock seconds
+  (the camera's clock counted as UTC, since EXIF has no time zone; before 1970 negative);
+  `set_taken`, `taken`, `taken_of(assets)` (bulk, for a batch of files). Front ends sort and
+  group by `dates::shown(taken, modified)`: the date taken if known, else the modification
+  time in local wall-clock seconds, so both compare and fall in calendar months
+  (`dates::month_of` / `month_start`) alike. Videos and pictures without a date use their
+  modification time. The stage reports a file (`Event::Updated`) only when its date is news.
 - **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
   computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
   candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).

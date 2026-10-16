@@ -14,7 +14,7 @@ use archive_core::catalog::flags::AssetFlags;
 use archive_core::catalog::{AssetId, Catalog, Region, TagKind};
 use archive_core::ops;
 use archive_core::pipeline::describe;
-use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, DESCRIBE, FACES, ORIENT, SIGNATURE};
+use archive_core::pipeline::{self, Availability, Config, Engine, Event, Mode, Models, DATE, DESCRIBE, FACES, ORIENT, SIGNATURE};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
 
@@ -401,6 +401,8 @@ impl Shell {
                 println!("{name:<9} no model");
             }
         };
+        let dated = pipeline::date_status(&self.catalog).map_err(|e| e.to_string())?;
+        line(DATE, true, dated);
         line(ORIENT, available.orient, status.orient);
         line(FACES, available.faces, status.faces);
         match status.faces_since_identify {
@@ -469,7 +471,7 @@ impl Shell {
     }
 
     fn retry(&self, args: &[&str]) -> Result<(), String> {
-        let stages = [ORIENT, FACES, SIGNATURE, DESCRIBE];
+        let stages = [DATE, ORIENT, FACES, SIGNATURE, DESCRIBE];
         let which = match args {
             [] => Retry::All,
             [stage] if stages.contains(stage) => Retry::Stage((*stage).to_owned()),

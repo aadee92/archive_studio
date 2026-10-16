@@ -1,9 +1,10 @@
 //! The processing pipeline: what happens to a file once it is in the library.
 //!
 //! ```text
-//! file appears ─ register ─ orient ─┬─ faces ─────┬─ identify (library-wide, when quiet)
-//!                                    ├─ signature └─ sync sidecars (when quiet)
-//!                                    └─ describe
+//! file appears ─ register ─┬─ date
+//!                            └─ orient ─┬─ faces ─────┬─ identify (library-wide, when quiet)
+//!                                       ├─ signature └─ sync sidecars (when quiet)
+//!                                       └─ describe
 //! ```
 //!
 //! An [`Engine`] runs the pipeline on a thread for as long as its host (the GUI, the
@@ -15,6 +16,9 @@
 //!
 //! - **register**: new, changed and deleted files update the catalog (deleted assets are
 //!   kept, marked missing, as they hold the user's tags and faces).
+//! - **date**: when the picture was taken (EXIF `DateTimeOriginal`) into the catalog
+//!   (`Catalog::set_taken`), what front ends sort and group by ([`crate::dates`]). Cheap
+//!   (no pixels are decoded), so it runs first.
 //! - **orient**: the orientation model's 90°-step prediction. A confident one rotates the
 //!   file itself (see [`rotate`]), along with any face and tag regions; an unsure one, or one
 //!   for a format that can't be rewritten losslessly yet, waits for the user's review.
@@ -63,6 +67,10 @@ pub const FACES: &str = "faces";
 pub const SIGNATURE: &str = "signature";
 /// Changing how signatures are computed makes every signature run due again.
 pub const SIGNATURE_VERSION: &str = "dhash-hist-v1";
+/// When each picture was taken, from its EXIF ([`crate::dates`]).
+pub const DATE: &str = "date";
+/// Changing how dates are read makes every date run due again.
+pub const DATE_VERSION: &str = "exif-taken-v1";
 /// CLIP embeddings and the tags they suggest ([`describe`]).
 pub const DESCRIBE: &str = "describe";
 /// Confidence from which a predicted rotation is applied without asking.
@@ -197,6 +205,25 @@ fn signature_query(availability: Availability) -> StageQuery<'static> {
 /// keep compiling).
 pub fn signature_status(catalog: &Catalog, availability: Availability) -> crate::catalog::Result<RunCounts> {
     catalog.run_counts(&signature_query(availability))
+}
+
+fn date_query() -> StageQuery<'static> {
+    StageQuery { stage: DATE, version: DATE_VERSION, kind: MediaKind::Image, after: None }
+}
+
+/// How the date stage stands (kept out of [`Status`], like [`signature_status`]); it needs
+/// no model.
+pub fn date_status(catalog: &Catalog) -> crate::catalog::Result<RunCounts> {
+    catalog.run_counts(&date_query())
+}
+
+/// When the picture in the image file at `path` was taken (EXIF `DateTimeOriginal`, in
+/// wall-clock seconds); `None` if it doesn't say. Reads the header only, no pixels.
+pub fn read_taken(path: &Path) -> Result<Option<i64>, String> {
+    let reader = ImageReader::open(path).map_err(|e| format!("open: {e}"))?.with_guessed_format().map_err(|e| format!("read: {e}"))?;
+    let mut decoder = reader.into_decoder().map_err(|e| format!("decode: {e}"))?;
+    let raw = decoder.exif_metadata().map_err(|e| format!("EXIF: {e}"))?;
+    Ok(raw.and_then(|raw| crate::exif::parse(&raw).taken).and_then(|taken| crate::dates::parse_exif(&taken)))
 }
 
 fn describe_query(availability: Availability) -> StageQuery<'static> {
@@ -431,6 +458,7 @@ impl Lock {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Stage {
+    Date,
     Orient,
     Faces,
     Signature,
@@ -440,6 +468,7 @@ enum Stage {
 impl Stage {
     fn name(self) -> &'static str {
         match self {
+            Self::Date => DATE,
             Self::Orient => ORIENT,
             Self::Faces => FACES,
             Self::Signature => SIGNATURE,
@@ -459,6 +488,7 @@ struct Prediction {
 }
 
 enum Outcome {
+    Date(Due, Result<Option<i64>, String>),
     /// The prediction, and the rotated file written next to the original if it applies.
     Orient(Due, Result<(Prediction, Option<PathBuf>), String>),
     Faces(Due, Result<Vec<NewFace>, String>),
@@ -526,6 +556,10 @@ impl Workers {
 fn work(job: Job, models: &Loaded) -> Outcome {
     let Job { stage, due } = job;
     match stage {
+        Stage::Date => {
+            let result = read_taken(&due.path);
+            Outcome::Date(due, result)
+        }
         Stage::Orient => {
             let result = orient(&due.path, models);
             Outcome::Orient(due, result)
@@ -677,6 +711,7 @@ impl Pipeline {
 
     fn stage_query(&self, stage: Stage) -> StageQuery<'static> {
         match stage {
+            Stage::Date => date_query(),
             Stage::Orient => orient_query(),
             Stage::Faces => faces_query(self.workers.availability),
             Stage::Signature => signature_query(self.workers.availability),
@@ -698,6 +733,7 @@ impl Pipeline {
         };
         let availability = self.workers.availability;
         let stages = [
+            (Stage::Date, true),
             (Stage::Orient, availability.orient),
             (Stage::Faces, availability.faces),
             (Stage::Signature, true),
@@ -763,6 +799,30 @@ impl Pipeline {
         // Faces may now be due after orient; either may have new work after a failure.
         self.changed();
         match outcome {
+            Outcome::Date(due, result) => {
+                self.known.remove(&(due.asset, Stage::Date));
+                match &result {
+                    Ok(taken) => log::trace!("date {}: {taken:?}", due.path.display()),
+                    Err(e) => log::debug!("date {}: error {e}", due.path.display()),
+                }
+                if !self.still_current(&due) {
+                    log::debug!("date {}: file changed meanwhile, result dropped", due.path.display());
+                    return;
+                }
+                let stored = result.and_then(|taken| Ok((taken, self.catalog.set_taken(due.asset, taken).map_err(|e| e.to_string())?)));
+                match stored {
+                    Ok((taken, changed)) => {
+                        let detail = taken.map_or_else(|| "no date in the file".to_owned(), |t| format!("taken {}", crate::dates::format(t)));
+                        let run = Run { stage: DATE, version: DATE_VERSION, input: &due.input, status: RunStatus::Done, value: taken, detail: &detail };
+                        self.record(due.asset, &run);
+                        // Front ends re-read the file only if its date is news.
+                        if changed {
+                            self.emit(Event::Updated(due.path));
+                        }
+                    }
+                    Err(e) => self.fail(&due, Stage::Date, e),
+                }
+            }
             Outcome::Orient(due, result) => {
                 self.known.remove(&(due.asset, Stage::Orient));
                 match &result {
@@ -941,6 +1001,7 @@ impl Pipeline {
 
     fn fail(&self, due: &Due, stage: Stage, error: String) {
         let version = match stage {
+            Stage::Date => DATE_VERSION,
             Stage::Orient => ORIENT_VERSION,
             Stage::Faces => catalog_faces::MODEL,
             Stage::Signature => SIGNATURE_VERSION,

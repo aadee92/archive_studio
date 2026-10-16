@@ -33,6 +33,7 @@ pub mod trash;
 pub mod undo;
 pub mod xmp;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -42,8 +43,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// 1: assets and tags. 2: faces. 3: file states and pipeline runs. 4: front/back pairs,
 /// image signatures, the trash, and person tags backfilled from confirmed faces. 5: image
 /// embeddings for search by description. 6: faces boxed by hand. 7: people's cover faces,
-/// and when each face was named. 8: the undo journal.
-const SCHEMA_VERSION: i32 = 8;
+/// and when each face was named. 8: the undo journal. 9: when each picture was taken.
+const SCHEMA_VERSION: i32 = 9;
+
+const SCHEMA_9: &str = "
+-- When the picture was taken (EXIF DateTimeOriginal), in wall-clock seconds: the date and
+-- time on the camera's clock counted as if it were UTC (see `dates`). NULL if the file has
+-- none, or the pipeline's date stage hasn't read it yet.
+ALTER TABLE assets ADD COLUMN taken INTEGER;
+";
 
 const SCHEMA_4: &str = "
 -- While the asset is in the trash: where it was (relative to the root) and when it was
@@ -352,6 +360,9 @@ impl Catalog {
         if version < 8 {
             tx.execute_batch(undo::SCHEMA_8)?;
         }
+        if version < 9 {
+            tx.execute_batch(SCHEMA_9)?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -402,6 +413,36 @@ impl Catalog {
         let rel = self.relative(path)?;
         self.conn.prepare_cached("DELETE FROM assets WHERE path = ?1")?.execute([rel])?;
         Ok(())
+    }
+
+    /// Records when the asset's picture was taken (wall-clock seconds, see [`crate::dates`];
+    /// `None`: the file has no date). Returns whether that changed what the catalog had.
+    pub fn set_taken(&self, asset: AssetId, taken: Option<i64>) -> Result<bool> {
+        let changed = self.conn.prepare_cached("UPDATE assets SET taken = ?2 WHERE id = ?1 AND taken IS NOT ?2")?.execute(params![asset.0, taken])?;
+        log::trace!("set_taken {asset:?} {taken:?}: {}", if changed > 0 { "changed" } else { "as it was" });
+        Ok(changed > 0)
+    }
+
+    /// When the asset's picture was taken, if known (see [`set_taken`](Self::set_taken)).
+    pub fn taken(&self, asset: AssetId) -> Result<Option<i64>> {
+        Ok(self.conn.prepare_cached("SELECT taken FROM assets WHERE id = ?1")?.query_row([asset.0], |row| row.get(0)).optional()?.flatten())
+    }
+
+    /// When each of `assets` was taken, for those whose date is known: one indexed lookup per
+    /// few hundred, for front ends reading a batch of files ([`crate::dates::shown`]).
+    pub fn taken_of(&self, assets: &[AssetId]) -> Result<HashMap<AssetId, i64>> {
+        let mut out = HashMap::new();
+        for chunk in assets.chunks(500) {
+            let ids: Vec<String> = chunk.iter().map(|a| a.0.to_string()).collect();
+            let sql = format!("SELECT id, taken FROM assets WHERE taken IS NOT NULL AND id IN ({})", ids.join(","));
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| Ok((AssetId(row.get(0)?), row.get(1)?)))?;
+            for row in rows {
+                let (asset, taken) = row?;
+                out.insert(asset, taken);
+            }
+        }
+        Ok(out)
     }
 
     /// The id of the tag at `path` (`People|Family|Alice`; segments are trimmed), creating
