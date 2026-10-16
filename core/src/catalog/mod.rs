@@ -14,7 +14,8 @@
 //!   can move as a whole. The database belongs inside the library
 //!   ([`Catalog::default_path`]), unlike the thumbnail cache: it holds user data.
 //!
-//! Faces found in the images, and the review that names them, are in [`faces`].
+//! Faces found in the images, and the review that names them, are in [`faces`]. What the
+//! user changes is kept for undo and redo in the journal ([`undo`]).
 //!
 //! See [`query`] for the search syntax. Each thread opens its own [`Catalog`]; WAL lets
 //! readers run alongside a writer.
@@ -29,6 +30,7 @@ pub mod semantic;
 pub mod similar;
 pub mod tags;
 pub mod trash;
+pub mod undo;
 pub mod xmp;
 
 use std::fmt;
@@ -40,8 +42,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// 1: assets and tags. 2: faces. 3: file states and pipeline runs. 4: front/back pairs,
 /// image signatures, the trash, and person tags backfilled from confirmed faces. 5: image
 /// embeddings for search by description. 6: faces boxed by hand. 7: people's cover faces,
-/// and when each face was named.
-const SCHEMA_VERSION: i32 = 7;
+/// and when each face was named. 8: the undo journal.
+const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA_4: &str = "
 -- While the asset is in the trash: where it was (relative to the root) and when it was
@@ -240,6 +242,8 @@ pub struct Catalog {
     /// The root made absolute, and canonicalized: asset paths are accepted under either.
     root: PathBuf,
     canonical_root: PathBuf,
+    /// This connection's recording of changes for the undo journal.
+    capture: undo::Capture,
 }
 
 /// Logs a change to the catalog with its outcome (debug; a failure at warn) and passes the
@@ -345,6 +349,9 @@ impl Catalog {
         if version < 7 {
             tx.execute_batch(people::SCHEMA_7)?;
         }
+        if version < 8 {
+            tx.execute_batch(undo::SCHEMA_8)?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -355,7 +362,7 @@ impl Catalog {
     fn opened(conn: Connection, root: &Path) -> Result<Self> {
         let root = std::path::absolute(root).map_err(|_| Error::Path(root.to_owned()))?;
         let canonical_root = root.canonicalize().map_err(|_| Error::Path(root.clone()))?;
-        Ok(Self { conn, root, canonical_root })
+        Ok(Self { conn, root, canonical_root, capture: undo::Capture::default() })
     }
 
     /// The id of the asset at `path` (absolute, or relative to the current directory, like

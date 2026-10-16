@@ -24,6 +24,7 @@ mod semantic;
 mod tags;
 mod thumbs;
 mod trash;
+mod undo;
 
 use std::path::PathBuf;
 
@@ -49,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = pipeline::install(&ui, root.clone());
     let _acquire = acquire::install(&ui, &root, pipeline.clone());
     actions::install(&ui, root.clone(), pipeline.clone());
+    undo::install(&ui, root.clone(), pipeline.clone());
     details::install(&ui, root.clone(), pipeline.clone());
     people::install(&ui, root.clone());
     tags::install(&ui, root.clone());

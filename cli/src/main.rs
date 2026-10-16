@@ -76,6 +76,11 @@ trash                      what is in the trash: when it was deleted, size, tota
 restore PATH...            put trashed files back (their original paths)
 purge PATH...              delete trashed files for good (with their backs)
 empty-trash [DAYS]         delete for good what was trashed DAYS (default 0) ago
+undo                       undo the last change (rotate, tag, name, delete, …; any front
+                           end's, kept across restarts; purge and empty-trash can't be)
+redo                       redo the change undone last
+history [N]                the last N changes (default 20), latest first; undone ones
+                           can be redone
 pause | resume | background   stop starting work / full speed / one thread
 help | quit";
 
@@ -299,8 +304,8 @@ impl Shell {
             }
             "status" => self.status(),
             "review" => self.review(),
-            "accept" => self.each_review(rest, |engine, path| engine.accept(path)),
-            "keep" => self.each_review(rest, |engine, path| engine.keep(path)),
+            "accept" => self.each_review(rest, |shell, asset| ops::accept(&shell.catalog, shell.engine.as_ref(), asset).map(|_| ())),
+            "keep" => self.each_review(rest, |shell, asset| ops::keep(&shell.catalog, shell.engine.as_ref(), asset)),
             "rotate" => self.rotate(rest),
             "failed" => self.failed(),
             "list" => self.list(rest),
@@ -313,19 +318,19 @@ impl Shell {
             "faces" if rest.is_empty() => self.faces(),
             "faces" => self.faces_in(rest),
             "name" => self.name(rest),
-            "not" => self.each_face(rest, "not", Catalog::not_person),
-            "ignore" => self.each_face(rest, "ignore", Catalog::ignore_faces),
-            "unignore" => self.each_face(rest, "unignore", Catalog::unignore_faces),
+            "not" => self.each_face(rest, "not", ops::not_person),
+            "ignore" => self.each_face(rest, "ignore", ops::ignore_faces),
+            "unignore" => self.each_face(rest, "unignore", ops::unignore_faces),
             "reject" => self.reject(rest, false),
             "unreject" => self.reject(rest, true),
             "ignored" => self.list_faces(archive_core::catalog::faces::FaceFilter::Ignored),
             "rejected" => existing_person(&self.catalog, &rest.join(" "))
                 .and_then(|person| self.list_faces(archive_core::catalog::faces::FaceFilter::Rejected(person))),
-            "delete-face" => self.each_face(rest, "delete-face", Catalog::delete_faces),
+            "delete-face" => self.each_face(rest, "delete-face", ops::delete_faces),
             "add-face" => self.add_face(rest),
             "person" => self.person(rest),
             "people" => self.people(rest),
-            "sync-people" => self.catalog.sync_person_tags().map(|n| println!("added {n} person tags")).map_err(|e| e.to_string()),
+            "sync-people" => ops::sync_person_tags(&mut self.catalog).map(|n| println!("added {n} person tags")).map_err(|e| e.to_string()),
             "tags" if rest.is_empty() => self.tag_tree(),
             "tags" => self.tags(rest),
             "rename-tag" => self.rename_tag(rest),
@@ -347,6 +352,9 @@ impl Shell {
             "restore" => self.restore(rest),
             "purge" => self.purge(rest),
             "empty-trash" => self.empty_trash(rest),
+            "undo" => self.step(true),
+            "redo" => self.step(false),
+            "history" => self.history(rest),
             "pause" => self.engine().map(|e| e.set_mode(Mode::Paused)),
             "resume" => self.engine().map(|e| e.set_mode(Mode::Normal)),
             "background" => self.engine().map(|e| e.set_mode(Mode::Background)),
@@ -422,8 +430,7 @@ impl Shell {
     }
 
     /// Runs `action` on the file named in `args`, or on every file in review with `all`.
-    fn each_review(&self, args: &[&str], action: impl Fn(&Engine, &Path) -> Result<(), String>) -> Result<(), String> {
-        let engine = self.engine()?;
+    fn each_review(&self, args: &[&str], action: impl Fn(&Self, AssetId) -> Result<(), String>) -> Result<(), String> {
         let paths: Vec<PathBuf> = match args {
             ["all"] => self
                 .catalog
@@ -436,8 +443,9 @@ impl Shell {
             _ => return Err("give one path, or all".into()),
         };
         for path in paths {
-            if let Err(e) = action(engine, &path) {
-                println!("{}: {e}", show(&self.root, &path));
+            let shown = show(&self.root, &path);
+            if let Err(e) = self.asset(&path.to_string_lossy()).and_then(|asset| action(self, asset)) {
+                println!("{shown}: {e}");
             }
         }
         Ok(())
@@ -446,10 +454,7 @@ impl Shell {
     fn rotate(&self, args: &[&str]) -> Result<(), String> {
         let [path, degrees] = args else { return Err("rotate PATH 90|180|270".into()) };
         let cw: u16 = degrees.parse().map_err(|_| "rotate by 90, 180 or 270".to_owned())?;
-        match &self.engine {
-            Some(engine) => engine.rotate(self.resolve(path), cw),
-            None => ops::rotate(&self.catalog, self.asset(path)?, cw),
-        }
+        ops::rotate(&self.catalog, self.engine.as_ref(), self.asset(path)?, cw)
     }
 
     fn failed(&self) -> Result<(), String> {
@@ -577,7 +582,7 @@ impl Shell {
         if ids.is_empty() || name.is_empty() {
             return Err("name FACE_ID... NAME".into());
         }
-        let person = self.catalog.name_faces(&ids, &name).map_err(err)?;
+        let person = ops::name_faces(&mut self.catalog, &ids, &name).map_err(err)?;
         let path = self.catalog.people_with_faces().map_err(err)?.into_iter().find(|p| p.tag == person).map(|p| p.path);
         println!("named {} faces {}", ids.len(), path.unwrap_or(name));
         Ok(())
@@ -593,9 +598,9 @@ impl Shell {
         }
         let person = existing_person(&self.catalog, &name)?;
         if undo {
-            self.catalog.clear_rejections(&ids, person).map_err(err)?;
+            ops::clear_rejections(&mut self.catalog, &ids, person).map_err(err)?;
         } else {
-            self.catalog.reject_person(&ids, person).map_err(err)?;
+            ops::reject_person(&mut self.catalog, &ids, person).map_err(err)?;
         }
         println!("{command}: {} faces", ids.len());
         Ok(())
@@ -664,16 +669,16 @@ impl Shell {
             "rename" => {
                 let (old, new) = two()?;
                 let person = existing(&self.catalog, &old)?;
-                self.catalog.rename_person(person, &new).map_err(err)?;
+                ops::rename_person(&mut self.catalog, person, &new).map_err(err)?;
             }
             "merge" => {
                 let (from, into) = two()?;
                 let (from, into) = (existing(&self.catalog, &from)?, existing(&self.catalog, &into)?);
-                self.catalog.merge_people(from, into).map_err(err)?;
+                ops::merge_people(&mut self.catalog, from, into).map_err(err)?;
             }
             "delete" => {
                 let person = existing(&self.catalog, &rest.join(" "))?;
-                self.catalog.delete_person(person).map_err(err)?;
+                ops::delete_person(&mut self.catalog, person).map_err(err)?;
             }
             "cover" => {
                 let [name @ .., face] = rest else { return Err(usage.into()) };
@@ -682,7 +687,7 @@ impl Shell {
                     id => Some(FaceId(id.parse().map_err(|_| usage.to_owned())?)),
                 };
                 let person = existing(&self.catalog, &name.join(" "))?;
-                self.catalog.set_person_cover(person, face).map_err(err)?;
+                ops::set_person_cover(&mut self.catalog, person, face).map_err(err)?;
                 let cover = self.catalog.person_cover(person).map_err(err)?;
                 println!("cover: {}", cover.map_or_else(|| "none (no face named as them)".to_owned(), |f| format!("face {}", f.0)));
                 return Ok(());
@@ -984,7 +989,7 @@ impl Shell {
             let item = trashed.iter().find(|t| t.original == path || t.in_trash == path);
             assets.push(item.ok_or_else(|| format!("{} is not in the trash", show(&self.root, &path)))?.asset);
         }
-        let n = self.catalog.purge(&assets).map_err(err)?;
+        let n = ops::purge(&mut self.catalog, &assets).map_err(err)?;
         println!("deleted {n} files for good");
         Ok(())
     }
@@ -1022,8 +1027,35 @@ impl Shell {
             [days] => days.parse().map_err(|_| "empty-trash [DAYS]".to_owned())?,
             _ => return Err("empty-trash [DAYS]".into()),
         };
-        let n = self.catalog.empty_trash(std::time::Duration::from_secs(days * 86_400)).map_err(err)?;
+        let n = ops::empty_trash(&mut self.catalog, std::time::Duration::from_secs(days * 86_400)).map_err(err)?;
         println!("deleted {n} files for good");
+        Ok(())
+    }
+
+    /// `undo` / `redo`.
+    fn step(&mut self, undo: bool) -> Result<(), String> {
+        let step = if undo { ops::undo(&mut self.catalog, self.engine.as_ref()) } else { ops::redo(&mut self.catalog, self.engine.as_ref()) }?;
+        match step {
+            Some(step) => println!("{}: {} ({} file{})", if undo { "undid" } else { "redid" }, step.change.description, step.paths.len(), if step.paths.len() == 1 { "" } else { "s" }),
+            None => println!("nothing to {}", if undo { "undo" } else { "redo" }),
+        }
+        Ok(())
+    }
+
+    /// `history [N]`.
+    fn history(&self, args: &[&str]) -> Result<(), String> {
+        let limit = match args {
+            [] => 20,
+            [n] => n.parse().map_err(|_| "history [N]".to_owned())?,
+            _ => return Err("history [N]".into()),
+        };
+        let changes = ops::history(&self.catalog, limit).map_err(err)?;
+        if changes.is_empty() {
+            println!("no changes yet");
+        }
+        for change in changes {
+            println!("{:>5}  {:<10} {}{}", change.id.0, ago(change.at / 1000), change.description, if change.undone { "  (undone)" } else { "" });
+        }
         Ok(())
     }
 }

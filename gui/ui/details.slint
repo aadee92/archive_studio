@@ -1,6 +1,5 @@
 import { Button, CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { PipelineBridge } from "pipeline.slint";
 import { NavBridge, UiLog } from "nav.slint";
 import { ItemMenu, PropRow } from "menu.slint";
 
@@ -1133,7 +1132,7 @@ export component DetailsPage inherits Rectangle {
                     return accept;
                 }
                 // Enter accepts the rotation the pipeline proposes.
-                if (event.text == Key.Return && DetailsBridge.review-cw != 0 && PipelineBridge.running) {
+                if (event.text == Key.Return && DetailsBridge.review-cw != 0) {
                     if (!DetailsBridge.working) {
                         DetailsBridge.accept();
                     }
@@ -1396,13 +1395,13 @@ export component DetailsPage inherits Rectangle {
                         color: Theme.text;
                         font-size: 12px;
                     }
-                    if PipelineBridge.running: Button {
+                    Button {
                         text: "Accept";
                         primary: true;
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.accept(); }
                     }
-                    if PipelineBridge.running: Button {
+                    Button {
                         text: "Keep";
                         enabled: !DetailsBridge.working;
                         clicked => { DetailsBridge.keep(); }

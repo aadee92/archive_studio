@@ -2,13 +2,14 @@
 //! newest first, each with its thumbnail (drawn from the file where it lies in the trash),
 //! the folder it was in, when it was deleted and its size. Select with click, Shift-click
 //! (a range), Ctrl-click, Ctrl+A, Esc; then Restore (back where it was, [`ops::restore_all`],
-//! with its back if that is in the trash too), or Delete permanently ([`Catalog::purge`],
-//! confirmed). Empty trash deletes everything, or only what was deleted more than some days
-//! ago ([`Catalog::empty_trash`]), confirmed with how many items that is.
+//! with its back if that is in the trash too; undoable from the notice), or Delete
+//! permanently ([`ops::purge`], confirmed: it can't be undone). Empty trash deletes
+//! everything, or only what was deleted more than some days ago ([`ops::empty_trash`]),
+//! confirmed with how many items that is.
 //!
 //! The list is read on a worker when the page is shown, and again when the trash's totals
-//! change while it is ([`totals`], from the pipeline relay's counts: deletes from anywhere,
-//! restores from a notice's Undo). Thumbnails are loaded on a worker for the whole list
+//! change while it is ([`totals`], from the pipeline relay's counts: deletes, restores and
+//! undo from anywhere). Thumbnails are loaded on a worker for the whole list
 //! (small tier, `thumbs::small_for_files`), dropped if the list is read again meanwhile.
 //! Every change runs on a worker; restored files are reported with [`pipeline::changed`],
 //! so they come back to Review, and the totals are recounted.
@@ -203,7 +204,7 @@ fn loaded(ui: &AppWindow, result: Result<(Vec<Trashed>, TrashTotals), String>) {
         Err(e) => {
             log::warn!("trash: can't read it: {e}");
             with_state(|s| s.loading = false);
-            return notify(ui, format!("Can't read the trash: {e}"), true, Vec::new());
+            return notify(ui, format!("Can't read the trash: {e}"), true, false);
         }
     };
     log::debug!("trash: {} items, {} bytes", items.len(), totals.bytes);
@@ -404,12 +405,12 @@ fn restore(ui: &AppWindow) {
                         paths => format!("{} items", grouped(paths.len())),
                     };
                     match errors.first() {
-                        None => notify(&ui, format!("Restored {what}"), false, Vec::new()),
-                        Some(e) if paths.is_empty() => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
-                        Some(e) => notify(&ui, format!("Restored {what}; {} not ({e})", errors.len()), true, Vec::new()),
+                        None => notify(&ui, format!("Restored {what}"), false, true),
+                        Some(e) if paths.is_empty() => notify(&ui, format!("Can't restore: {e}"), true, false),
+                        Some(e) => notify(&ui, format!("Restored {what}; {} not ({e})", errors.len()), true, true),
                     }
                 }
-                Err(e) => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
+                Err(e) => notify(&ui, format!("Can't restore: {e}"), true, false),
             }
             load(&ui);
         });
@@ -483,8 +484,8 @@ fn confirmed(ui: &AppWindow) {
     thread::spawn(move || {
         let result = actions::open_catalog(&root).and_then(|mut catalog| {
             match &which {
-                Some(assets) => catalog.purge(assets),
-                None => catalog.empty_trash(Duration::from_secs(older.unwrap_or(0) * 86_400)),
+                Some(assets) => ops::purge(&mut catalog, assets),
+                None => ops::empty_trash(&mut catalog, Duration::from_secs(older.unwrap_or(0) * 86_400)),
             }
             .map_err(|e| e.to_string())
         });
@@ -498,7 +499,7 @@ fn confirmed(ui: &AppWindow) {
                     with_state(|s| s.confirming = None);
                     close_confirm(&ui);
                     let what = if n == 1 { "1 item".to_owned() } else { format!("{} items", grouped(n)) };
-                    notify(&ui, format!("Deleted {what} for good"), false, Vec::new());
+                    notify(&ui, format!("Deleted {what} for good"), false, false);
                 }
                 Err(e) => {
                     log::warn!("trash: delete for good: {e}");

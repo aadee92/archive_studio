@@ -52,8 +52,9 @@
 //! shown item is deleted, the next item of the scope is shown ([`files_gone`]).
 //!
 //! For an image it also offers the pipeline's say on it: a rotation the orient stage
-//! proposed for review (Accept / Keep), and turning it by hand ([`actions::rotate`]: the
-//! engine if it runs here, else the core directly). That can take a second (the file is
+//! proposed for review (Accept / Keep: `ops::accept` / `ops::keep`), and turning it by hand
+//! ([`actions::rotate`]), each by the engine if it runs here, else by the core directly, and
+//! each undoable from the notice like the face changes. That can take a second (the file is
 //! rewritten), so it runs on a worker; the turned file comes back through the pipeline
 //! relay and is reloaded here (faces too: their regions are turned with the file).
 
@@ -1518,6 +1519,8 @@ fn change_face(ui: &AppWindow, change: FaceChange) {
             None => Err("can't open the catalog".to_owned()),
         };
         let faces = catalog.as_ref().map(|c| read_faces(c, &path)).unwrap_or_default();
+        // What was saved, as the journal has it, for the notice (with Undo).
+        let saved = result.is_ok().then(|| catalog.as_ref()?.next_undo().ok().flatten().map(|(c, _)| c.description)).flatten();
         match &result {
             Ok(face) => log::info!("details: {change:?} on {} done in {:?} (face {})", path.display(), started.elapsed(), face.0),
             Err(e) => log::warn!("details: {change:?} on {}: {e}", path.display()),
@@ -1533,6 +1536,9 @@ fn change_face(ui: &AppWindow, change: FaceChange) {
             if reply.is_ok() {
                 crate::people::faces_changed(&ui);
             }
+            if let Some(saved) = saved {
+                actions::notify(&ui, saved, false, true);
+            }
             if SHOWN.with_borrow(|s| s.path() != Some(shown.as_path())) {
                 return;
             }
@@ -1544,11 +1550,8 @@ fn change_face(ui: &AppWindow, change: FaceChange) {
                             edit_face(&ui, i as i32);
                         }
                     }
-                    if matches!(change, FaceChange::Delete(_)) {
-                        actions::notify(&ui, "Face box deleted".to_owned(), false, Vec::new());
-                    }
                 }
-                Err(e) => actions::notify(&ui, format!("Can't change the face: {e}"), true, Vec::new()),
+                Err(e) => actions::notify(&ui, format!("Can't change the face: {e}"), true, false),
             }
         });
         // Faces like the ones just named are suggested as them (as People does).
@@ -1565,11 +1568,11 @@ fn change_face(ui: &AppWindow, change: FaceChange) {
 fn apply(catalog: &mut Catalog, path: &Path, change: &FaceChange, engine: Option<&archive_core::pipeline::Engine>) -> Result<FaceId, String> {
     let err = |e: archive_core::catalog::Error| e.to_string();
     match change {
-        FaceChange::Name(face, name) => catalog.name_faces(&[*face], name).map(|_| *face).map_err(err),
-        FaceChange::Confirm(face, person) => catalog.confirm_faces(&[*face], *person).map(|()| *face).map_err(err),
-        FaceChange::Not(face) => catalog.not_person(&[*face]).map(|()| *face).map_err(err),
-        FaceChange::Ignore(face) => catalog.ignore_faces(&[*face]).map(|()| *face).map_err(err),
-        FaceChange::Delete(face) => catalog.delete_faces(&[*face]).map(|()| *face).map_err(err),
+        FaceChange::Name(face, name) => ops::name_faces(catalog, &[*face], name).map(|_| *face).map_err(err),
+        FaceChange::Confirm(face, person) => ops::confirm_faces(catalog, &[*face], *person).map(|()| *face).map_err(err),
+        FaceChange::Not(face) => ops::not_person(catalog, &[*face]).map(|()| *face).map_err(err),
+        FaceChange::Ignore(face) => ops::ignore_faces(catalog, &[*face]).map(|()| *face).map_err(err),
+        FaceChange::Delete(face) => ops::delete_faces(catalog, &[*face]).map(|()| *face).map_err(err),
         FaceChange::Add(region) => {
             let asset = catalog.asset(path).map_err(err)?;
             let models = engine.and_then(|e| e.face_models()).or_else(own_face_models);
@@ -1595,20 +1598,20 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
     let Some((root, pipeline)) = CONTEXT.with_borrow(|c| c.as_ref().map(|c| (c.root.clone(), c.pipeline.clone()))) else { return };
     let engine = pipeline.engine();
     log::debug!("details: {action:?} on {} (engine here: {})", path.display(), engine.is_some());
-    if engine.is_none() && !matches!(action, Action::Rotate(_)) {
-        ui.global::<DetailsBridge>().set_message("The pipeline isn't running in this window".into());
-        return;
-    }
     let details = ui.global::<DetailsBridge>();
     details.set_working(true);
     details.set_message(SharedString::default());
     let weak = weak.clone();
     thread::spawn(move || {
-        let result = match (action, engine) {
-            (Action::Rotate(cw), _) => actions::rotate(&root, &pipeline, &path, cw),
-            (Action::Accept, Some(engine)) => engine.accept(&path),
-            (Action::Keep, Some(engine)) => engine.keep(&path),
-            (_, None) => Err("The pipeline isn't running in this window".to_owned()),
+        let result = match action {
+            Action::Rotate(cw) => actions::rotate(&root, &pipeline, &path, cw),
+            Action::Accept | Action::Keep => actions::open_catalog(&root).and_then(|catalog| {
+                let asset = catalog.asset(&path).map_err(|e| e.to_string())?;
+                match action {
+                    Action::Accept => ops::accept(&catalog, engine.as_deref(), asset).map(|_| ()),
+                    _ => ops::keep(&catalog, engine.as_deref(), asset),
+                }
+            }),
         };
         match &result {
             Ok(()) => log::info!("details: {action:?} {} done", path.display()),
@@ -1616,8 +1619,8 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
         }
         if result.is_ok() {
             // "N rotations to review" and Review's badge (a rotation is reported, a kept
-            // file isn't).
-            pipeline::changed(&path, false);
+            // file isn't); without an engine, the turned picture itself.
+            pipeline::changed(&path, engine.is_none() && matches!(action, Action::Accept));
         }
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SHOWN.with_borrow(|shown| shown.path() != Some(path.as_path())) {
@@ -1627,7 +1630,15 @@ fn ask(weak: &slint::Weak<AppWindow>, action: Action) {
             details.set_working(false);
             match result {
                 // The picture itself is reloaded when the rotated file is reported.
-                Ok(()) => details.set_review_cw(0),
+                Ok(()) => {
+                    details.set_review_cw(0);
+                    let what = match action {
+                        Action::Rotate(cw) => format!("Rotated {cw}°"),
+                        Action::Accept => "Rotation accepted".to_owned(),
+                        Action::Keep => "Kept as it is".to_owned(),
+                    };
+                    actions::notify(&ui, what, false, true);
+                }
                 Err(e) => {
                     details.set_message(e.into());
                 }
@@ -1727,8 +1738,8 @@ mod tests {
         image::RgbImage::new(30, 20).save(&path).unwrap();
         let mut catalog = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
         let a = catalog.asset(&path).unwrap();
-        ops::add_tag(&catalog, a, "Holidays|1998").unwrap();
-        ops::add_tag(&catalog, a, "People|Alice").unwrap();
+        ops::add_tag(&mut catalog, a, "Holidays|1998").unwrap();
+        ops::add_tag(&mut catalog, a, "People|Alice").unwrap();
         let beach = catalog.tag("Scenes|Beach", TagKind::Scene).unwrap();
         let dog = catalog.tag("Objects|Dog", TagKind::Object).unwrap();
         let found = |tag, confidence| archive_core::catalog::Detection { tag, confidence, region: None };

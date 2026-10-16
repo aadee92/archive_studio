@@ -11,18 +11,20 @@
 //! keyboard shortcuts (Delete, T) go through [`act`] too.
 //!
 //! Right-clicked in a multi-selection (Review), the menu acts on all of its items
-//! ([`show_menu_for`], [`act_on`]): rotating turns each in turn, Add tag tags them all in one
-//! transaction ([`ops::add_tag_all`]), Delete trashes them all ([`ops::delete_all`]) with
-//! one notice whose Undo restores every one ([`ops::restore_all`]). Pairing, Show in folder
-//! and Properties are for one item and disabled then.
+//! ([`show_menu_for`], [`act_on`]): rotating turns each in turn ([`ops::rotate_all`]), Add
+//! tag tags them all in one transaction ([`ops::add_tag_all`]), Delete trashes them all
+//! ([`ops::delete_all`]); each is one change, with one notice whose Undo undoes all of it.
+//! Pairing, Show in folder and Properties are for one item and disabled then.
 //!
 //! Every action is an [`archive_core::ops`] call, run on a worker: rotating goes to the
 //! pipeline's engine if it runs in this window (else straight to the core), deleting moves
-//! to the library's trash (undoable from the notice), tagging takes what the user typed
+//! to the library's trash, tagging takes what the user typed
 //! ([`ops::add_tag`]), pairing goes through [`ops::pair`] / [`ops::swap_sides`] /
 //! [`ops::unpair`]; showing in the file manager is [`desktop::show_in_folder`]. What changed
 //! is reported with [`pipeline::changed`], which refreshes every view showing it, as for the
 //! engine's own reports (Details' dog-ear and "Front & back" follow a pairing that way).
+//! Each is recorded in the catalog's undo journal; the notice after it offers Undo
+//! ([`crate::undo`], also Ctrl+Z).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -59,8 +61,8 @@ struct State {
     tagging: Vec<PathBuf>,
     /// Every tag in the catalog, for the tag dialog's matches.
     tags: Vec<String>,
-    /// What the notice's Undo restores from the trash.
-    undo: Vec<AssetId>,
+    /// What the notice's button does: undo (`Some(true)`) or redo the last change.
+    step: Option<bool>,
     notice_timer: Timer,
     /// Retires the reply for a properties dialog closed meanwhile.
     props_generation: u64,
@@ -83,7 +85,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         cover: None,
         tagging: Vec::new(),
         tags: Vec::new(),
-        undo: Vec::new(),
+        step: None,
         notice_timer: Timer::default(),
         props_generation: 0,
     }));
@@ -131,9 +133,10 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
     let weak = ui.as_weak();
     menu.on_notice_clicked(move || {
-        log::debug!("notice action clicked (undo)");
-        if let Some(ui) = weak.upgrade() {
-            undo(&ui);
+        let step = with_state(|s| s.step).flatten();
+        log::debug!("notice action clicked ({})", if step == Some(false) { "redo" } else { "undo" });
+        if let (Some(ui), Some(undo)) = (weak.upgrade(), step) {
+            crate::undo::step(&ui, undo);
         }
     });
 }
@@ -188,15 +191,14 @@ fn rotatable(path: &Path) -> bool {
 /// window (it reports the rotation itself), else by the core here. Blocks for as long as
 /// the file takes to rewrite: call it on a worker.
 pub fn rotate(root: &Path, pipeline: &Handle, path: &Path, cw: u16) -> Result<(), String> {
-    if let Some(engine) = pipeline.engine() {
-        log::debug!("rotate {} {cw}° by the engine", path.display());
-        return engine.rotate(path, cw);
-    }
-    log::debug!("rotate {} {cw}° by the core (no engine here)", path.display());
+    let engine = pipeline.engine();
+    log::debug!("rotate {} {cw}° by the {}", path.display(), if engine.is_some() { "engine" } else { "core (no engine here)" });
     let catalog = open(root)?;
     let asset = catalog.asset(path).map_err(|e| e.to_string())?;
-    ops::rotate(&catalog, asset, cw)?;
-    pipeline::changed(path, true);
+    ops::rotate(&catalog, engine.as_deref(), asset, cw)?;
+    if engine.is_none() {
+        pipeline::changed(path, true);
+    }
     Ok(())
 }
 
@@ -266,10 +268,11 @@ fn rotate_item(ui: &AppWindow, path: PathBuf, cw: u16) {
             log::info!("rotated {} {cw}°", path.display());
             pipeline.recount();
         }
-        let _ = weak.upgrade_in_event_loop(move |ui| {
-            if let Err(e) = result {
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(()) => notify(&ui, format!("Rotated {} {cw}°", file_name(&path)), false, true),
+            Err(e) => {
                 log::warn!("rotate {}: {e}", path.display());
-                notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, Vec::new());
+                notify(&ui, format!("Can't rotate {}: {e}", file_name(&path)), true, false);
             }
         });
     });
@@ -283,22 +286,43 @@ fn rotate_items(ui: &AppWindow, paths: Vec<PathBuf>, cw: u16) {
     log::debug!("rotate {} items {cw}°", paths.len());
     thread::spawn(move || {
         let (mut done, mut failed, mut first_error) = (0, 0, None);
-        for path in &paths {
-            let result = if rotatable(path) { rotate(&root, &pipeline, path, cw) } else { Err("can't be rotated losslessly".to_owned()) };
-            match result {
-                Ok(()) => done += 1,
-                Err(e) => {
-                    log::warn!("rotate {}: {e}", path.display());
-                    failed += 1;
-                    first_error.get_or_insert_with(|| format!("{}: {e}", file_name(path)));
+        let mut fail = |path: &Path, e: String| {
+            log::warn!("rotate {}: {e}", path.display());
+            failed += 1;
+            first_error.get_or_insert_with(|| format!("{}: {e}", file_name(path)));
+        };
+        // All in one go (one change to undo), those that can be turned.
+        let engine = pipeline.engine();
+        match open(&root) {
+            Ok(catalog) => {
+                let mut assets = Vec::new();
+                for path in &paths {
+                    match catalog.asset(path) {
+                        Ok(asset) if rotatable(path) => assets.push(asset),
+                        Ok(_) => fail(path, "can't be rotated losslessly".to_owned()),
+                        Err(e) => fail(path, e.to_string()),
+                    }
+                }
+                for (asset, result) in ops::rotate_all(&catalog, engine.as_deref(), &assets, cw) {
+                    let path = catalog.asset_path(asset).unwrap_or_default();
+                    match result {
+                        Ok(()) => {
+                            done += 1;
+                            if engine.is_none() {
+                                pipeline::changed(&path, true);
+                            }
+                        }
+                        Err(e) => fail(&path, e),
+                    }
                 }
             }
+            Err(e) => paths.iter().for_each(|p| fail(p, e.clone())),
         }
         log::info!("rotated {done} of {} items {cw}° ({failed} failed)", paths.len());
         pipeline.recount();
         let _ = weak.upgrade_in_event_loop(move |ui| match first_error {
-            None => notify(&ui, format!("Rotated {} items", done), false, Vec::new()),
-            Some(e) => notify(&ui, format!("Rotated {done} of {} items; can't rotate {failed} ({e})", done + failed), done == 0, Vec::new()),
+            None => notify(&ui, format!("Rotated {} items", done), false, true),
+            Some(e) => notify(&ui, format!("Rotated {done} of {} items; can't rotate {failed} ({e})", done + failed), done == 0, done > 0),
         });
     });
 }
@@ -320,7 +344,7 @@ fn pair_with_neighbour(ui: &AppWindow, target: Target, delta: isize) {
     let at = target.scope.current.filter(|&i| paths.get(i) == Some(&target.path));
     let Some(front) = at.and_then(|i| i.checked_add_signed(delta)).and_then(|i| paths.get(i)).cloned() else {
         log::debug!("pair with item {delta:+}: {:?} has no such neighbour in its view", target.path);
-        notify(ui, format!("{} has no {} item in this view", file_name(&target.path), if delta < 0 { "previous" } else { "next" }), true, Vec::new());
+        notify(ui, format!("{} has no {} item in this view", file_name(&target.path), if delta < 0 { "previous" } else { "next" }), true, false);
         return;
     };
     change_pair(ui, target.path, PairChange::BackOf(front));
@@ -363,8 +387,8 @@ fn change_pair(ui: &AppWindow, path: PathBuf, change: PairChange) {
             Err(e) => log::warn!("{change:?} on {}: {e}", path.display()),
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(done) => notify(&ui, done, false, Vec::new()),
-            Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, Vec::new()),
+            Ok(done) => notify(&ui, done, false, true),
+            Err(e) => notify(&ui, format!("Can't change the sides of {}: {e}", file_name(&path)), true, false),
         });
     });
 }
@@ -377,7 +401,7 @@ fn show_in_folder(ui: &AppWindow, path: PathBuf) {
         let result = desktop::show_in_folder(&path);
         log::debug!("show in folder {}: {result:?}", path.display());
         if let Err(e) = result {
-            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, Vec::new()));
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {}: {e}", file_name(&path)), true, false));
         }
     });
 }
@@ -387,13 +411,13 @@ fn open_externally(ui: &AppWindow, path: PathBuf) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         if let Err(e) = desktop::open(&path) {
-            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't open {}: {e}", file_name(&path)), true, Vec::new()));
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't open {}: {e}", file_name(&path)), true, false));
         }
     });
 }
 
 /// Moves the items (and their backs, if they are fronts) to the library's trash; one notice
-/// whose Undo restores all of them.
+/// whose Undo restores all of them (one change in the journal).
 fn delete(ui: &AppWindow, paths: Vec<PathBuf>) {
     let Some((root, pipeline)) = context() else { return };
     let weak = ui.as_weak();
@@ -433,7 +457,7 @@ fn delete(ui: &AppWindow, paths: Vec<PathBuf>) {
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let (trashed, files, errors) = match result {
                 Ok(done) => done,
-                Err(e) => return notify(&ui, format!("Can't delete: {e}"), true, Vec::new()),
+                Err(e) => return notify(&ui, format!("Can't delete: {e}"), true, false),
             };
             let what = match (paths.as_slice(), trashed.len()) {
                 ([path], _) if files > 1 => format!("{} and its back", file_name(path)),
@@ -442,74 +466,37 @@ fn delete(ui: &AppWindow, paths: Vec<PathBuf>) {
                 (_, n) => format!("{n} items"),
             };
             match errors.first() {
-                None => notify(&ui, format!("Moved {what} to the trash"), false, trashed),
-                Some(e) if trashed.is_empty() => notify(&ui, format!("Can't delete {e}"), true, Vec::new()),
-                Some(e) => notify(&ui, format!("Moved {what} to the trash; {} not ({e})", errors.len()), false, trashed),
+                None => notify(&ui, format!("Moved {what} to the trash"), false, true),
+                Some(e) if trashed.is_empty() => notify(&ui, format!("Can't delete {e}"), true, false),
+                Some(e) => notify(&ui, format!("Moved {what} to the trash; {} not ({e})", errors.len()), false, true),
             }
         });
     });
 }
 
-/// Restores what the notice's Undo refers to.
-fn undo(ui: &AppWindow) {
-    let Some((assets, (root, _))) = with_state(|s| std::mem::take(&mut s.undo)).zip(context()) else { return };
-    if assets.is_empty() {
-        return;
-    }
-    hide_notice(ui);
-    let weak = ui.as_weak();
-    thread::spawn(move || {
-        let result = open(&root).map(|mut catalog| {
-            let (mut restored, mut errors) = (Vec::new(), Vec::new());
-            for (asset, result) in ops::restore_all(&mut catalog, &assets) {
-                match result {
-                    Ok(paths) => restored.extend(paths),
-                    Err(e) => {
-                        log::warn!("undo: restore asset {}: {e}", asset.0);
-                        errors.push(e.to_string());
-                    }
-                }
-            }
-            (restored, errors)
-        });
-        match &result {
-            Ok((paths, errors)) => log::info!("undo: restored {} assets ({} files), {} failed", assets.len() - errors.len(), paths.len(), errors.len()),
-            Err(e) => log::warn!("undo: restore {} assets: {e}", assets.len()),
-        }
-        if let Ok((paths, _)) = &result {
-            for path in paths {
-                pipeline::changed(path, false);
-            }
-        }
-        let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok((paths, errors)) => {
-                let what = match assets.len() - errors.len() {
-                    1 => paths.first().map(|p| file_name(p)).unwrap_or_default(),
-                    n => format!("{n} items"),
-                };
-                match errors.first() {
-                    None => notify(&ui, format!("Restored {what}"), false, Vec::new()),
-                    Some(e) if paths.is_empty() => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
-                    Some(e) => notify(&ui, format!("Restored {what}; {} not ({e})", errors.len()), true, Vec::new()),
-                }
-            }
-            Err(e) => notify(&ui, format!("Can't restore: {e}"), true, Vec::new()),
-        });
-    });
+/// Shows `text` in the notice at the bottom of the window, with Undo if `undo` (the change
+/// just made: the journal's latest, see [`crate::undo`]).
+pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: bool) {
+    notice(ui, text, error, undo.then_some(true));
 }
 
-/// Shows `text` in the notice at the bottom of the window, with Undo restoring `undo` (if
-/// any) from the trash.
-pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: Vec<AssetId>) {
-    log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if undo.is_empty() { String::new() } else { format!(" [Undo: {} assets]", undo.len()) });
+/// Shows `text` in the notice, with a button that undoes (`Some(true)`) or redoes the last
+/// change.
+pub(crate) fn notice(ui: &AppWindow, text: String, error: bool, step: Option<bool>) {
+    let label = match step {
+        Some(true) => "Undo",
+        Some(false) => "Redo",
+        None => "",
+    };
+    log::debug!("notice{}: {text}{}", if error { " (error)" } else { "" }, if label.is_empty() { String::new() } else { format!(" [{label}]") });
     let menu = ui.global::<ItemMenu>();
     menu.set_notice(text.into());
     menu.set_notice_error(error);
-    menu.set_notice_action(if undo.is_empty() { SharedString::default() } else { "Undo".into() });
+    menu.set_notice_action(label.into());
     let weak = ui.as_weak();
-    let stay = if undo.is_empty() { NOTICE_FOR } else { UNDO_FOR };
+    let stay = if step.is_none() { NOTICE_FOR } else { UNDO_FOR };
     with_state(|s| {
-        s.undo = undo;
+        s.step = step;
         s.notice_timer.start(TimerMode::SingleShot, stay, move || {
             if let Some(ui) = weak.upgrade() {
                 hide_notice(&ui);
@@ -518,12 +505,12 @@ pub(crate) fn notify(ui: &AppWindow, text: String, error: bool, undo: Vec<AssetI
     });
 }
 
-fn hide_notice(ui: &AppWindow) {
+pub(crate) fn hide_notice(ui: &AppWindow) {
     let menu = ui.global::<ItemMenu>();
     menu.set_notice(SharedString::default());
     menu.set_notice_action(SharedString::default());
     with_state(|s| {
-        s.undo.clear();
+        s.step = None;
         s.notice_timer.stop();
     });
 }
@@ -599,7 +586,7 @@ fn add_tag(ui: &AppWindow, text: &str) {
         let result = open(&root).and_then(|mut catalog| {
             let assets = paths.iter().map(|p| catalog.asset(p)).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
             match assets.as_slice() {
-                [asset] => ops::add_tag(&catalog, *asset, &text),
+                [asset] => ops::add_tag(&mut catalog, *asset, &text),
                 _ => ops::add_tag_all(&mut catalog, &assets, &text),
             }
             .map_err(|e| e.to_string())
@@ -625,7 +612,7 @@ fn add_tag(ui: &AppWindow, text: &str) {
                         [path] => file_name(path),
                         _ => format!("{} items", paths.len()),
                     };
-                    notify(&ui, format!("Tagged {what}: {}", shown.replace('|', " / ")), false, Vec::new());
+                    notify(&ui, format!("Tagged {what}: {}", shown.replace('|', " / ")), false, true);
                 }
                 Err(e) => menu.set_tag_error(e.into()),
             }

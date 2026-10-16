@@ -1,17 +1,27 @@
-//! What a front end does to one asset from a context menu: rotate, delete (to the trash),
-//! tag, and show its properties. Each works on a [`Catalog`] alone, with or without a
-//! pipeline [`Engine`](crate::pipeline::Engine) running on the library.
+//! What a front end does to the library on the user's behalf: rotate, delete (to the
+//! trash), tag, name faces, and show properties. Each works on a [`Catalog`] alone, with or
+//! without a pipeline [`Engine`](crate::pipeline::Engine) running on the library.
+//!
+//! Every change the user makes goes through here and is recorded in the catalog's undo
+//! journal ([`catalog::undo`](crate::catalog::undo)) as one change with a description:
+//! [`undo`] / [`redo`] step through it (any front end, after a restart too), [`history`]
+//! lists it. Deleting from the trash for good ([`purge`], [`empty_trash`]) is the exception.
 //!
 //! - [`rotate`]: the user's rotation, final like every user decision (the orientation model
-//!   never redoes it). With an engine at hand, [`Engine::rotate`](crate::pipeline::Engine::rotate)
-//!   does the same on the engine thread.
-//! - [`delete`]: to the library's trash, reversible with [`Catalog::restore`] (see
+//!   never redoes it); [`accept`] / [`keep`] settle a rotation the model proposed. With an
+//!   engine at hand, [`Engine::rotate`](crate::pipeline::Engine::rotate) and the rest do it
+//!   on the engine thread. Undone by turning back (lossless; a JPEG's partial edge blocks
+//!   are trimmed by the first turn only) and putting the orient run back as it was.
+//! - [`delete`]: to the library's trash, undone by restoring (see
 //!   [`catalog::trash`](crate::catalog::trash)); a front takes its back with it.
-//! - Tags: [`add_tag`] and [`remove_tag`] for what a user typed (see [`parse_tag`]),
-//!   [`Catalog::add_tag_path`], [`Catalog::remove_tag_path`]; people:
-//!   [`Catalog::name_faces`] and the rest of [`catalog::people`](crate::catalog::people).
+//! - Tags: [`add_tag`] and [`remove_tag`] for what a user typed (see [`parse_tag`]).
 //!   Taking a person tag off a picture un-names that person's faces on it (they go back to
 //!   the unknown faces), rather than being refused: the tag is what says they are there.
+//! - People and faces: [`name_faces`], [`confirm_faces`], [`not_person`], [`ignore_faces`],
+//!   [`unignore_faces`], [`delete_faces`], [`reject_person`], [`clear_rejections`],
+//!   [`set_person_cover`], [`rename_person`], [`merge_people`], [`delete_person`],
+//!   [`sync_person_tags`] (see [`catalog::people`](crate::catalog::people) and
+//!   [`catalog::faces`](crate::catalog::faces)).
 //! - Tags as a whole: [`tag_tree`] (with how many pictures each is on), [`rename_tag`]
 //!   (asks before merging onto a taken path), [`merge_tags`], [`delete_tag`], with their
 //!   subtrees; people go through the person operations so their faces follow (see
@@ -19,9 +29,7 @@
 //! - Front and back: [`pair`] a back scan with its front by hand, [`unpair`],
 //!   [`swap_sides`] when they were paired the wrong way round (see
 //!   [`catalog::pairs`](crate::catalog::pairs)).
-//! - Faces on one picture: [`add_face`] for one the detector missed (boxed by the user);
-//!   [`Catalog::not_person`], [`Catalog::ignore_faces`] and [`Catalog::delete_faces`] for the
-//!   ones there.
+//! - Faces on one picture: [`add_face`] for one the detector missed (boxed by the user).
 //! - [`properties`]: everything known about the asset, for a properties dialog.
 //! - Search by description: [`text_search`] gives the text model (the engine's, else one
 //!   loaded once per process) for [`TextSearch::search`]; [`similar_images`](pipeline::describe::similar_images) finds
@@ -30,12 +38,13 @@
 //! - Many at once (a multi-selection): [`delete_all`] / [`restore_all`] (one Undo for all
 //!   of them), [`add_tag_all`]. Each returns what happened to every asset, or is all or
 //!   nothing, as documented.
-//! - The trash as a whole: [`Catalog::trashed`], [`Catalog::trash_totals`],
-//!   [`Catalog::purge`] (chosen items for good), [`Catalog::empty_trash`].
+//! - The trash as a whole: [`Catalog::trashed`], [`Catalog::trash_totals`], [`restore_all`],
+//!   [`purge`] (chosen items for good), [`empty_trash`]; neither of the last two can be
+//!   undone.
 //! - Failures: [`Catalog::failures`] lists them; [`retry`] runs them again, through the
 //!   engine when one runs here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -43,8 +52,9 @@ use image::{ImageDecoder, ImageReader};
 
 use crate::catalog::faces::{self as catalog_faces, FaceId};
 use crate::catalog::people::FaceBox;
-use crate::catalog::runs::{Retry, RunStatus, StageRun};
+use crate::catalog::runs::{Retry, Run, RunStatus, StageRun};
 use crate::catalog::trash::Trashed;
+use crate::catalog::undo::{Change, FileAction, Turned};
 use crate::catalog::people::{display_name, person_path, PEOPLE};
 use crate::catalog::tags::{self, TagNode};
 use crate::catalog::{AppliedTag, AssetId, Catalog, Region, TagId, TagKind};
@@ -54,21 +64,148 @@ use crate::pipeline::describe::TextSearch;
 use crate::pipeline::{self, Engine, Models, ORIENT};
 
 /// Turns the asset's image `cw` degrees clockwise (90, 180 or 270), rewriting the file
-/// losslessly; see [`pipeline::rotate_file`].
-pub fn rotate(catalog: &Catalog, asset: AssetId, cw: u16) -> Result<(), String> {
+/// losslessly ([`pipeline::rotate_file`]; by `engine` on its thread if it runs here).
+pub fn rotate(catalog: &Catalog, engine: Option<&Engine>, asset: AssetId, cw: u16) -> Result<(), String> {
+    let mut done = rotate_all(catalog, engine, &[asset], cw);
+    done.pop().map_or(Ok(()), |(_, result)| result)
+}
+
+/// Turns each of `assets` as [`rotate`] does, one after the other: one failing (a format
+/// that can't be turned losslessly) doesn't stop the others. One change in the journal for
+/// all that turned.
+pub fn rotate_all(catalog: &Catalog, engine: Option<&Engine>, assets: &[AssetId], cw: u16) -> Vec<(AssetId, Result<(), String>)> {
+    let mut turned = Vec::new();
+    let done = assets
+        .iter()
+        .map(|&asset| {
+            let result = (|| {
+                let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
+                let before = catalog.run_state(asset, ORIENT).map_err(|e| e.to_string())?;
+                let result = turn(catalog, engine, &path, cw);
+                match &result {
+                    Ok(()) => log::debug!("rotate asset {} ({}) {cw}°: done", asset.0, path.display()),
+                    Err(e) => log::warn!("rotate asset {} ({}) {cw}°: {e}", asset.0, path.display()),
+                }
+                result?;
+                turned.push(Turned { asset, before, after: catalog.run_state(asset, ORIENT).map_err(|e| e.to_string())? });
+                Ok(())
+            })();
+            (asset, result)
+        })
+        .collect();
+    if !turned.is_empty() {
+        let assets: Vec<AssetId> = turned.iter().map(|t| t.asset).collect();
+        let description = format!("Rotate {} {}°", items(catalog, &assets), cw % 360);
+        record_orient(catalog, &description, cw % 360, turned);
+    }
+    done
+}
+
+/// Applies the rotation the orientation model proposed for the asset (waiting for review).
+/// Returns it, clockwise degrees.
+pub fn accept(catalog: &Catalog, engine: Option<&Engine>, asset: AssetId) -> Result<u16, String> {
     let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
-    let result = pipeline::rotate_file(catalog, &path, cw);
-    match &result {
-        Ok(()) => log::debug!("rotate asset {} ({}) {cw}°: done", asset.0, path.display()),
-        Err(e) => log::warn!("rotate asset {} ({}) {cw}°: {e}", asset.0, path.display()),
+    let cw = match catalog.run_of(asset, ORIENT).map_err(|e| e.to_string())? {
+        Some((RunStatus::Review, Some(cw), _)) => cw as u16 % 360,
+        _ => return Err("no rotation to review for this file".into()),
+    };
+    let description = format!("Accept the rotation of {}", file_name(&path));
+    let result = oriented(catalog, asset, cw, &description, || match engine {
+        Some(engine) => engine.accept(&path),
+        None => pipeline::rotate_file(catalog, &path, cw),
+    });
+    crate::catalog::logged(format_args!("accept asset {} ({}) {cw}°", asset.0, path.display()), result.map_err(crate::catalog::Error::Invalid))
+        .map_err(|e| e.to_string())
+        .map(|()| cw)
+}
+
+/// Settles a rotation the orientation model proposed: the picture is upright as it is.
+pub fn keep(catalog: &Catalog, engine: Option<&Engine>, asset: AssetId) -> Result<(), String> {
+    let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
+    if !matches!(catalog.run_of(asset, ORIENT).map_err(|e| e.to_string())?, Some((RunStatus::Review, ..))) {
+        return Err("no rotation to review for this file".into());
+    }
+    let description = format!("Keep {} as it is", file_name(&path));
+    let result = oriented(catalog, asset, 0, &description, || match engine {
+        Some(engine) => engine.keep(&path),
+        None => {
+            let input = catalog.current_input(asset).map_err(|e| e.to_string())?.ok_or("file not seen yet")?;
+            let run = Run { stage: ORIENT, version: pipeline::ORIENT_VERSION, input: &input, status: RunStatus::User, value: Some(0), detail: "kept as is" };
+            catalog.set_run(asset, &run).map_err(|e| e.to_string())
+        }
+    });
+    crate::catalog::logged(format_args!("keep asset {} ({})", asset.0, path.display()), result.map_err(crate::catalog::Error::Invalid)).map_err(|e| e.to_string())
+}
+
+/// Runs `change` to the asset's orientation (turning it `cw`), recording it in the journal
+/// with the orient run before and after.
+fn oriented(catalog: &Catalog, asset: AssetId, cw: u16, description: &str, change: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let before = catalog.run_state(asset, ORIENT).map_err(|e| e.to_string())?;
+    change()?;
+    let after = catalog.run_state(asset, ORIENT).map_err(|e| e.to_string())?;
+    record_orient(catalog, description, cw, vec![Turned { asset, before, after }]);
+    Ok(())
+}
+
+fn record_orient(catalog: &Catalog, description: &str, cw: u16, turned: Vec<Turned>) {
+    if let Err(e) = catalog.record_action(description, &FileAction::Orient { cw, turned }, &[]) {
+        log::warn!("journal: recording {description:?}: {e}");
+    }
+}
+
+/// Turns the file `cw` degrees: by `engine` if it runs here, else in place.
+fn turn(catalog: &Catalog, engine: Option<&Engine>, path: &Path, cw: u16) -> Result<(), String> {
+    match engine {
+        Some(engine) => engine.rotate(path, cw),
+        None => pipeline::rotate_file(catalog, path, cw),
+    }
+}
+
+/// The file name of `path`, for descriptions.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// `a face`, `3 faces`.
+fn faces_count(faces: &[FaceId]) -> String {
+    match faces.len() {
+        1 => "a face".to_owned(),
+        n => format!("{n} faces"),
+    }
+}
+
+/// `a.jpg`, or `3 items`.
+fn items(catalog: &Catalog, assets: &[AssetId]) -> String {
+    match assets {
+        [asset] => catalog.asset_path(*asset).map_or_else(|_| "an item".to_owned(), |p| file_name(&p)),
+        _ => format!("{} items", assets.len()),
+    }
+}
+
+/// Moves the asset (and its back, if it is a front) to the library's trash; see
+/// [`Catalog::trash`]. Undone by restoring it ([`undo`]).
+pub fn delete(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<Vec<Trashed>> {
+    let result = catalog.trash(asset);
+    if let Ok(items) = &result {
+        record_trash(catalog, &[(asset, items.clone())]);
     }
     result
 }
 
-/// Moves the asset (and its back, if it is a front) to the library's trash; see
-/// [`Catalog::trash`]. Undo with [`Catalog::restore`].
-pub fn delete(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<Vec<Trashed>> {
-    catalog.trash(asset)
+/// Records a delete in the journal: the assets that trashed something, and everything that went.
+fn record_trash(catalog: &Catalog, done: &[(AssetId, Vec<Trashed>)]) {
+    let fronts: Vec<AssetId> = done.iter().filter(|(_, t)| !t.is_empty()).map(|(a, _)| *a).collect();
+    if fronts.is_empty() {
+        return;
+    }
+    let all: Vec<AssetId> = done.iter().flat_map(|(_, t)| t.iter().map(|t| t.asset)).collect();
+    let description = format!("Delete {}", match fronts.as_slice() {
+        [_] => done.iter().flat_map(|(_, t)| t.first()).next().map_or_else(|| "an item".to_owned(), |t| file_name(&t.original)),
+        _ => format!("{} items", fronts.len()),
+    });
+    if let Err(e) = catalog.record_action(&description, &FileAction::Trash(fronts), &all) {
+        log::warn!("journal: recording {description:?}: {e}");
+    }
 }
 
 /// What a bulk operation did to each asset it was given, in the order given.
@@ -80,6 +217,8 @@ pub type Each<T> = Vec<(AssetId, crate::catalog::Result<T>)>;
 /// assets that trashed something.
 pub fn delete_all(catalog: &mut Catalog, assets: &[AssetId]) -> Each<Vec<Trashed>> {
     let done: Each<Vec<Trashed>> = assets.iter().map(|&asset| (asset, catalog.trash(asset))).collect();
+    let trashed: Vec<(AssetId, Vec<Trashed>)> = done.iter().filter_map(|(a, r)| r.as_ref().ok().map(|t| (*a, t.clone()))).collect();
+    record_trash(catalog, &trashed);
     let failed = done.iter().filter(|(_, r)| r.is_err()).count();
     let files: usize = done.iter().filter_map(|(_, r)| r.as_ref().ok()).map(Vec::len).sum();
     log::debug!("delete_all {} assets: {files} files to the trash, {failed} failed", assets.len());
@@ -88,9 +227,20 @@ pub fn delete_all(catalog: &mut Catalog, assets: &[AssetId]) -> Each<Vec<Trashed
 
 /// Puts each of `assets` back from the trash as [`Catalog::restore`] does (with its back);
 /// one failing (something else is at its old path now) doesn't stop the others. An asset
-/// that isn't in the trash (any more) gives an empty list.
+/// that isn't in the trash (any more) gives an empty list. Undone by trashing them again.
 pub fn restore_all(catalog: &mut Catalog, assets: &[AssetId]) -> Each<Vec<PathBuf>> {
     let done: Each<Vec<PathBuf>> = assets.iter().map(|&asset| (asset, catalog.restore(asset))).collect();
+    let restored: Vec<AssetId> = done.iter().filter(|(_, r)| r.as_ref().is_ok_and(|p| !p.is_empty())).map(|(a, _)| *a).collect();
+    if !restored.is_empty() {
+        let description = format!("Restore {}", match done.iter().find_map(|(_, r)| r.as_ref().ok().and_then(|p| p.first())) {
+            Some(path) if restored.len() == 1 => file_name(path),
+            _ => format!("{} items", restored.len()),
+        });
+        let backs: Vec<AssetId> = restored.iter().filter_map(|a| catalog.back_of(*a).ok().flatten()).collect();
+        if let Err(e) = catalog.record_action(&description, &FileAction::Restore(restored), &backs) {
+            log::warn!("journal: recording {description:?}: {e}");
+        }
+    }
     let failed = done.iter().filter(|(_, r)| r.is_err()).count();
     let files: usize = done.iter().filter_map(|(_, r)| r.as_ref().ok()).map(Vec::len).sum();
     log::debug!("restore_all {} assets: {files} files restored, {failed} failed", assets.len());
@@ -111,9 +261,10 @@ pub fn parse_tag(text: &str) -> (TagKind, String) {
 
 /// The user puts the tag they typed on the asset (see [`parse_tag`]); a person is found as
 /// [`Catalog::person`] finds one. Returns the tag.
-pub fn add_tag(catalog: &Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<TagId> {
+pub fn add_tag(catalog: &mut Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<TagId> {
     let parsed = parse_tag(text);
-    let result = add_parsed_tag(catalog, asset, parsed.clone());
+    let description = format!("Tag {} {}", items(catalog, &[asset]), parsed.1);
+    let result = catalog.journaled(&description, |catalog| add_parsed_tag(catalog, asset, parsed.clone()));
     match &result {
         Ok(tag) => log::debug!("add_tag {text:?} ({:?} {:?}) to asset {}: tag {}", parsed.0, parsed.1, asset.0, tag.0),
         Err(e) => log::warn!("add_tag {text:?} to asset {}: {e}", asset.0),
@@ -125,11 +276,14 @@ pub fn add_tag(catalog: &Catalog, asset: AssetId, text: &str) -> crate::catalog:
 /// transaction: all of them, or none on an error. Returns the tag.
 pub fn add_tag_all(catalog: &mut Catalog, assets: &[AssetId], text: &str) -> crate::catalog::Result<TagId> {
     let parsed = parse_tag(text);
-    let result = match &parsed {
-        (TagKind::Person, path) => catalog.person(path),
-        (kind, path) => catalog.tag(path, *kind),
-    }
-    .and_then(|tag| catalog.add_tag_to_all(assets, tag).map(|()| tag));
+    let description = format!("Tag {} {}", items(catalog, assets), parsed.1);
+    let result = catalog.journaled(&description, |catalog| {
+        match &parsed {
+            (TagKind::Person, path) => catalog.person(path),
+            (kind, path) => catalog.tag(path, *kind),
+        }
+        .and_then(|tag| catalog.add_tag_to_all(assets, tag).map(|()| tag))
+    });
     match &result {
         Ok(tag) => log::debug!("add_tag_all {text:?} ({:?} {:?}) to {} assets: tag {}", parsed.0, parsed.1, assets.len(), tag.0),
         Err(e) => log::warn!("add_tag_all {text:?} to {} assets: {e}", assets.len()),
@@ -155,7 +309,8 @@ fn add_parsed_tag(catalog: &Catalog, asset: AssetId, parsed: (TagKind, String)) 
 /// remembered as rejected, and taking a person tag off un-names that person's faces on the
 /// asset. Returns false (changing nothing) if no such tag is on it.
 pub fn remove_tag(catalog: &mut Catalog, asset: AssetId, text: &str) -> crate::catalog::Result<bool> {
-    let result = remove_typed_tag(catalog, asset, text);
+    let description = format!("Untag {} {}", items(catalog, &[asset]), text.trim());
+    let result = catalog.journaled(&description, |catalog| remove_typed_tag(catalog, asset, text));
     match &result {
         Ok(removed) => log::debug!("remove_tag {text:?} from asset {}: removed {removed}", asset.0),
         Err(e) => log::warn!("remove_tag {text:?} from asset {}: {e}", asset.0),
@@ -218,7 +373,8 @@ pub fn tag_tree(catalog: &Catalog) -> crate::catalog::Result<Vec<TagNode>> {
 /// If `to` is another tag's path, that is [`Renamed::Taken`] unless `merge`, which merges
 /// the two as [`merge_tags`] does. `People` itself can't be renamed.
 pub fn rename_tag(catalog: &mut Catalog, from: &str, to: &str, merge: bool) -> crate::catalog::Result<Renamed> {
-    let result = (|| {
+    let description = format!("{} tag {} {} {}", if merge { "Merge" } else { "Rename" }, parse_tag(from).1, if merge { "into" } else { "to" }, to.trim());
+    let result = catalog.journaled(&description, |catalog| {
         let (tag, path, kind) = existing_tag(catalog, from)?;
         let target = match kind {
             TagKind::Person if !to.contains('|') => match path.rsplit_once('|') {
@@ -228,7 +384,7 @@ pub fn rename_tag(catalog: &mut Catalog, from: &str, to: &str, merge: bool) -> c
             _ => target_path(kind, to)?,
         };
         retag(catalog, (tag, &path, kind), &target, merge)
-    })();
+    });
     match &result {
         Ok(Renamed::Done(done)) => log::debug!("rename_tag {from:?} to {to:?} (merge {merge}): now {:?}, {} assets changed", done.to, done.assets.len()),
         Ok(Renamed::Taken(path)) => log::debug!("rename_tag {from:?} to {to:?}: {path} is taken, nothing changed"),
@@ -243,7 +399,8 @@ pub fn rename_tag(catalog: &mut Catalog, from: &str, to: &str, merge: bool) -> c
 /// person, named by path or by name (`Alice`, if only one person is called that); a tag
 /// into one that doesn't exist yet is a rename.
 pub fn merge_tags(catalog: &mut Catalog, from: &str, into: &str) -> crate::catalog::Result<Retagged> {
-    let result = (|| {
+    let description = format!("Merge tag {} into {}", parse_tag(from).1, into.trim());
+    let result = catalog.journaled(&description, |catalog| {
         let (tag, path, kind) = existing_tag(catalog, from)?;
         let target = match kind {
             TagKind::Person if !into.contains('|') => {
@@ -264,7 +421,7 @@ pub fn merge_tags(catalog: &mut Catalog, from: &str, into: &str) -> crate::catal
             Renamed::Done(done) => Ok(done),
             Renamed::Taken(path) => Err(crate::catalog::Error::Invalid(format!("{path} is taken"))),
         }
-    })();
+    });
     match &result {
         Ok(done) => log::debug!("merge_tags {from:?} into {into:?}: now {:?}, {} assets changed", done.to, done.assets.len()),
         Err(e) => log::warn!("merge_tags {from:?} into {into:?}: {e}"),
@@ -274,11 +431,12 @@ pub fn merge_tags(catalog: &mut Catalog, from: &str, into: &str) -> crate::catal
 
 /// The user deletes the tag at `path` (as typed) and the tags under it: off every picture,
 /// faces named as them un-named ([`Catalog::delete_tag`]; a person without people under
-/// them through [`Catalog::delete_person`]). Not undoable: a front end confirms first, with
-/// the count from [`tag_tree`]. `People` itself can't be deleted. Returns the assets whose
-/// tags changed.
+/// them through [`Catalog::delete_person`]). A front end confirms first, with the count
+/// from [`tag_tree`]; [`undo`] puts it all back. `People` itself can't be deleted. Returns
+/// the assets whose tags changed.
 pub fn delete_tag(catalog: &mut Catalog, path: &str) -> crate::catalog::Result<Vec<AssetId>> {
-    let result = (|| {
+    let description = format!("Delete tag {}", parse_tag(path).1);
+    let result = catalog.journaled(&description, |catalog| {
         let (tag, path, kind) = existing_tag(catalog, path)?;
         not_people_root(&path)?;
         let assets = catalog.tag_assets(tag)?;
@@ -288,7 +446,7 @@ pub fn delete_tag(catalog: &mut Catalog, path: &str) -> crate::catalog::Result<V
             catalog.delete_tag(tag)?;
         }
         Ok(assets)
-    })();
+    });
     match &result {
         Ok(assets) => log::debug!("delete_tag {path:?}: off {} assets", assets.len()),
         Err(e) => log::warn!("delete_tag {path:?}: {e}"),
@@ -362,7 +520,8 @@ fn retag(catalog: &mut Catalog, (tag, path, kind): (TagId, &str, TagKind), targe
 /// [`Catalog::set_pair`]). Returns the assets whose other side changed: the two, and
 /// whatever they were paired with before.
 pub fn pair(catalog: &mut Catalog, front: AssetId, back: AssetId) -> crate::catalog::Result<Vec<AssetId>> {
-    let result = pair_checked(catalog, front, back);
+    let description = format!("Pair {} as the back of {}", items(catalog, &[back]), items(catalog, &[front]));
+    let result = catalog.journaled(&description, |catalog| pair_checked(catalog, front, back));
     match &result {
         Ok(changed) => log::debug!("pair front {} back {}: changed {changed:?}", front.0, back.0),
         Err(e) => log::warn!("pair front {} back {}: {e}", front.0, back.0),
@@ -400,20 +559,22 @@ fn pair_checked(catalog: &mut Catalog, front: AssetId, back: AssetId) -> crate::
 /// Takes the asset (a front or a back) out of its pair. Returns the other side it had,
 /// `None` if it had none.
 pub fn unpair(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<Option<AssetId>> {
-    let result = (|| {
+    let description = format!("Unpair {}", items(catalog, &[asset]));
+    let result = catalog.journaled(&description, |catalog| {
         let other = catalog.back_of(asset)?.or(catalog.front_of(asset)?);
         if other.is_some() {
             catalog.unpair(asset)?;
         }
         Ok(other)
-    })();
+    });
     crate::catalog::logged(format_args!("unpair asset {}", asset.0), result)
 }
 
 /// The asset's pair was the wrong way round: its front becomes the back and the other way
 /// round. Returns the new `(front, back)`; an error if the asset isn't paired.
 pub fn swap_sides(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Result<(AssetId, AssetId)> {
-    let result = (|| {
+    let description = format!("Swap the sides of {}", items(catalog, &[asset]));
+    let result = catalog.journaled(&description, |catalog| {
         let (front, back) = match (catalog.back_of(asset)?, catalog.front_of(asset)?) {
             (Some(back), _) => (asset, back),
             (_, Some(front)) => (front, asset),
@@ -421,7 +582,7 @@ pub fn swap_sides(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Resu
         };
         catalog.set_pair(back, front)?;
         Ok((back, front))
-    })();
+    });
     crate::catalog::logged(format_args!("swap_sides asset {}", asset.0), result)
 }
 
@@ -432,12 +593,233 @@ pub fn swap_sides(catalog: &mut Catalog, asset: AssetId) -> crate::catalog::Resu
 /// Returns the new face, unnamed.
 pub fn add_face(catalog: &mut Catalog, asset: AssetId, region: Region, models: Option<&faces::Faces>) -> Result<FaceId, String> {
     let path = catalog.asset_path(asset).map_err(|e| e.to_string())?;
-    let result = catalog_faces::scan_region(models, &path, region).and_then(|face| catalog.add_face(asset, &face).map_err(|e| e.to_string()));
+    let description = format!("Add a face on {}", file_name(&path));
+    let result = catalog_faces::scan_region(models, &path, region)
+        .and_then(|face| catalog.journaled(&description, |catalog| catalog.add_face(asset, &face)).map_err(|e| e.to_string()));
     match &result {
         Ok(face) => log::debug!("add_face on asset {} ({}): face {} (embedded {})", asset.0, path.display(), face.0, models.is_some()),
         Err(e) => log::warn!("add_face on asset {} ({}) at {region:?}: {e}", asset.0, path.display()),
     }
     result
+}
+
+/// Who a person tag is, for descriptions: `Ann`.
+fn person_name(catalog: &Catalog, person: TagId) -> String {
+    catalog.tag_path(person).map_or_else(|_| "someone".to_owned(), |p| display_name(&p).to_owned())
+}
+
+/// The user names `faces` as the person `name` means ([`Catalog::name_faces`]). Returns
+/// the person.
+pub fn name_faces(catalog: &mut Catalog, faces: &[FaceId], name: &str) -> crate::catalog::Result<TagId> {
+    let description = format!("Name {} {}", faces_count(faces), display_name(name.trim()));
+    catalog.journaled(&description, |catalog| catalog.name_faces(faces, name))
+}
+
+/// The user confirms `faces` as `person` ([`Catalog::confirm_faces`]).
+pub fn confirm_faces(catalog: &mut Catalog, faces: &[FaceId], person: TagId) -> crate::catalog::Result<()> {
+    let description = format!("Confirm {} as {}", faces_count(faces), person_name(catalog, person));
+    catalog.journaled(&description, |catalog| catalog.confirm_faces(faces, person))
+}
+
+/// The user says `faces` aren't who they are named or suggested as ([`Catalog::not_person`]).
+pub fn not_person(catalog: &mut Catalog, faces: &[FaceId]) -> crate::catalog::Result<()> {
+    let description = format!("Say {} {} not who they were named as", faces_count(faces), if faces.len() == 1 { "is" } else { "are" });
+    catalog.journaled(&description, |catalog| catalog.not_person(faces))
+}
+
+/// The user says `faces` aren't worth naming ([`Catalog::ignore_faces`]).
+pub fn ignore_faces(catalog: &mut Catalog, faces: &[FaceId]) -> crate::catalog::Result<()> {
+    catalog.journaled(&format!("Ignore {}", faces_count(faces)), |catalog| catalog.ignore_faces(faces))
+}
+
+/// Ignored `faces` back to unknown ([`Catalog::unignore_faces`]).
+pub fn unignore_faces(catalog: &mut Catalog, faces: &[FaceId]) -> crate::catalog::Result<()> {
+    catalog.journaled(&format!("Un-ignore {}", faces_count(faces)), |catalog| catalog.unignore_faces(faces))
+}
+
+/// The user removes face boxes altogether ([`Catalog::delete_faces`]); undo brings them
+/// back with their crops, names and rejections.
+pub fn delete_faces(catalog: &mut Catalog, faces: &[FaceId]) -> crate::catalog::Result<()> {
+    catalog.journaled(&format!("Delete {}", faces_count(faces)), |catalog| catalog.delete_faces(faces))
+}
+
+/// The user says `faces` aren't `person`, whoever they are suggested as ([`Catalog::reject_person`]).
+pub fn reject_person(catalog: &mut Catalog, faces: &[FaceId], person: TagId) -> crate::catalog::Result<()> {
+    let description = format!("Say {} {} not {}", faces_count(faces), if faces.len() == 1 { "is" } else { "are" }, person_name(catalog, person));
+    catalog.journaled(&description, |catalog| catalog.reject_person(faces, person))
+}
+
+/// Takes back rejections of `person` for `faces` ([`Catalog::clear_rejections`]).
+pub fn clear_rejections(catalog: &mut Catalog, faces: &[FaceId], person: TagId) -> crate::catalog::Result<()> {
+    let description = format!("Suggest {} as {} again", faces_count(faces), person_name(catalog, person));
+    catalog.journaled(&description, |catalog| catalog.clear_rejections(faces, person))
+}
+
+/// The user picks the face that stands for `person`, or `None` for the best one
+/// ([`Catalog::set_person_cover`]).
+pub fn set_person_cover(catalog: &mut Catalog, person: TagId, face: Option<FaceId>) -> crate::catalog::Result<()> {
+    let name = person_name(catalog, person);
+    let description = match face {
+        Some(_) => format!("Set the cover of {name}"),
+        None => format!("Cover of {name} back to automatic"),
+    };
+    catalog.journaled(&description, |catalog| catalog.set_person_cover(person, face))
+}
+
+/// The user renames a person ([`Catalog::rename_person`]: onto an existing one merges).
+/// Returns the person now.
+pub fn rename_person(catalog: &mut Catalog, person: TagId, new_name: &str) -> crate::catalog::Result<TagId> {
+    let description = format!("Rename {} to {}", person_name(catalog, person), display_name(new_name.trim()));
+    catalog.journaled(&description, |catalog| catalog.rename_person(person, new_name))
+}
+
+/// The user merges person `from` into `into` ([`Catalog::merge_people`]).
+pub fn merge_people(catalog: &mut Catalog, from: TagId, into: TagId) -> crate::catalog::Result<()> {
+    let description = format!("Merge {} into {}", person_name(catalog, from), person_name(catalog, into));
+    catalog.journaled(&description, |catalog| catalog.merge_people(from, into))
+}
+
+/// The user deletes a person ([`Catalog::delete_person`]); undo brings back their faces,
+/// tags and cover.
+pub fn delete_person(catalog: &mut Catalog, person: TagId) -> crate::catalog::Result<()> {
+    let description = format!("Delete person {}", person_name(catalog, person));
+    catalog.journaled(&description, |catalog| catalog.delete_person(person))
+}
+
+/// Puts missing person tags on files with named faces ([`Catalog::sync_person_tags`]).
+/// Returns how many.
+pub fn sync_person_tags(catalog: &mut Catalog) -> crate::catalog::Result<usize> {
+    catalog.journaled("Add missing person tags", Catalog::sync_person_tags)
+}
+
+/// Deletes these trashed assets for good ([`Catalog::purge`]). Not undoable: a front end
+/// confirms first. Changes in the journal that touched them are dropped. Returns how many.
+pub fn purge(catalog: &mut Catalog, assets: &[AssetId]) -> crate::catalog::Result<usize> {
+    catalog.purge(assets)
+}
+
+/// Deletes for good what was trashed at least `older_than` ago ([`Catalog::empty_trash`]).
+/// Not undoable, as [`purge`].
+pub fn empty_trash(catalog: &mut Catalog, older_than: std::time::Duration) -> crate::catalog::Result<usize> {
+    catalog.empty_trash(older_than)
+}
+
+/// What [`undo`] or [`redo`] did.
+#[derive(Clone, Debug)]
+pub struct Step {
+    /// The change, as it stands now (`undone` after an undo).
+    pub change: Change,
+    /// Every file it touched, where it was before the step and where it is now (moved to or
+    /// from the trash: both), to refresh.
+    pub paths: Vec<PathBuf>,
+    /// A picture was turned here without an engine (an engine reports its own turns).
+    pub pixels: bool,
+}
+
+/// Undoes the latest change in the journal not undone yet (by any front end): its catalog
+/// rows, and what it did to files (restores what it trashed, turns back what it turned;
+/// through `engine` if it runs here). `None` if there is nothing to undo. A change that
+/// can't be undone (what it touched changed since, e.g. a file is back where a trashed one
+/// was) is dropped from the journal, so the next undo goes on to the one before; the error
+/// says so.
+pub fn undo(catalog: &mut Catalog, engine: Option<&Engine>) -> Result<Option<Step>, String> {
+    step(catalog, engine, true)
+}
+
+/// Redoes the change undone last; as [`undo`] the other way. Any new change drops what was
+/// undone.
+pub fn redo(catalog: &mut Catalog, engine: Option<&Engine>) -> Result<Option<Step>, String> {
+    step(catalog, engine, false)
+}
+
+/// The journal, latest first (undone changes, which [`redo`] would redo, included).
+pub fn history(catalog: &Catalog, limit: usize) -> crate::catalog::Result<Vec<Change>> {
+    catalog.history(limit)
+}
+
+fn step(catalog: &mut Catalog, engine: Option<&Engine>, undo: bool) -> Result<Option<Step>, String> {
+    let verb = if undo { "undo" } else { "redo" };
+    let next = if undo { catalog.next_undo() } else { catalog.next_redo() }.map_err(|e| e.to_string())?;
+    let Some((mut change, action)) = next else {
+        log::debug!("{verb}: nothing to {verb}");
+        return Ok(None);
+    };
+    let assets = catalog.change_assets(change.id).map_err(|e| e.to_string())?;
+    let mut paths: Vec<PathBuf> = assets.iter().filter_map(|&a| catalog.asset_path(a).ok()).collect();
+    let result = (|| {
+        let pixels = match &action {
+            Some(action) => perform(catalog, engine, action, undo)?,
+            None => false,
+        };
+        catalog.apply_change(change.id, undo).map_err(|e| e.to_string())?;
+        Ok::<_, String>(pixels)
+    })();
+    match result {
+        Ok(pixels) => {
+            for path in assets.iter().filter_map(|&a| catalog.asset_path(a).ok()) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            change.undone = undo;
+            log::debug!("{verb} change {} {:?}: {} files", change.id.0, change.description, paths.len());
+            Ok(Some(Step { change, paths, pixels: pixels && engine.is_none() }))
+        }
+        Err(e) => {
+            log::warn!("{verb} change {} {:?}: {e}; dropping it from the journal", change.id.0, change.description);
+            let _ = catalog.drop_change(change.id);
+            Err(format!("can't {verb} \"{}\": {e} (it is left out of the history)", change.description))
+        }
+    }
+}
+
+/// Undoes (`undo`) or redoes what a change did to files. Returns whether a picture was
+/// turned. Trashing and restoring go asset by asset: an error only if none could.
+fn perform(catalog: &mut Catalog, engine: Option<&Engine>, action: &FileAction, undo: bool) -> Result<bool, String> {
+    let each = |catalog: &mut Catalog, assets: &[AssetId], trash: bool| {
+        let mut errors = Vec::new();
+        for &asset in assets {
+            let result = if trash { catalog.trash(asset).map(|_| ()) } else { catalog.restore(asset).map(|_| ()) };
+            if let Err(e) = result {
+                errors.push(e.to_string());
+            }
+        }
+        match errors.first() {
+            Some(e) if errors.len() == assets.len() => Err(e.clone()),
+            Some(_) => {
+                log::warn!("{} of {} assets: {errors:?}", errors.len(), assets.len());
+                Ok(false)
+            }
+            None => Ok(false),
+        }
+    };
+    match action {
+        FileAction::Trash(assets) => each(catalog, assets, !undo),
+        FileAction::Restore(assets) => each(catalog, assets, undo),
+        FileAction::Orient { cw, turned } => {
+            let mut errors = Vec::new();
+            for t in turned {
+                let result = (|| {
+                    if *cw != 0 {
+                        let path = catalog.asset_path(t.asset).map_err(|e| e.to_string())?;
+                        turn(catalog, engine, &path, if undo { 360 - cw } else { *cw })?;
+                    }
+                    catalog.set_run_state(t.asset, ORIENT, if undo { t.before.as_ref() } else { t.after.as_ref() }).map_err(|e| e.to_string())
+                })();
+                if let Err(e) = result {
+                    errors.push(e);
+                }
+            }
+            match errors.first() {
+                Some(e) if errors.len() == turned.len() => Err(e.clone()),
+                Some(_) => {
+                    log::warn!("{} of {} pictures: {errors:?}", errors.len(), turned.len());
+                    Ok(*cw != 0)
+                }
+                None => Ok(*cw != 0),
+            }
+        }
+    }
 }
 
 /// Loads the face models from the models directory ([`Models::locate`]), for a host without
@@ -592,11 +974,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
+        let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
         let a = cat.asset(&root.join("a.png")).unwrap();
         let alice = cat.person("Alice").unwrap();
-        assert_eq!(add_tag(&cat, a, "People|Alice").unwrap(), alice);
-        add_tag(&cat, a, "event:Wedding").unwrap();
+        assert_eq!(add_tag(&mut cat, a, "People|Alice").unwrap(), alice);
+        add_tag(&mut cat, a, "event:Wedding").unwrap();
         let tags: Vec<_> = cat.tags_of(a).unwrap().into_iter().map(|t| (t.path, t.kind)).collect();
         assert_eq!(tags, [("People|Alice".to_owned(), TagKind::Person), ("Wedding".to_owned(), TagKind::Event)]);
     }
@@ -608,8 +990,8 @@ mod tests {
         image::RgbImage::from_pixel(40, 20, image::Rgb([200, 150, 120])).save(root.join("a.png")).unwrap();
         let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
         let a = cat.asset(&root.join("a.png")).unwrap();
-        add_tag(&cat, a, "Holidays|1998").unwrap();
-        add_tag(&cat, a, "place:Home").unwrap();
+        add_tag(&mut cat, a, "Holidays|1998").unwrap();
+        add_tag(&mut cat, a, "place:Home").unwrap();
         let face = add_face(&mut cat, a, Region { x: 0.5, y: 0.0, w: 0.25, h: 0.5 }, None).unwrap();
         cat.name_faces(&[face], "Alice").unwrap();
         let paths = |cat: &Catalog| cat.tags_of(a).unwrap().into_iter().map(|t| t.path).collect::<Vec<_>>();
@@ -635,9 +1017,9 @@ mod tests {
         let mut cat = Catalog::open(&Catalog::default_path(&root), &root).unwrap();
         let a = cat.asset(&root.join("a.png")).unwrap();
         let b = cat.asset(&root.join("b.png")).unwrap();
-        add_tag(&cat, a, "Holidays|1998").unwrap();
-        add_tag(&cat, b, "Trips|1998").unwrap();
-        add_tag(&cat, b, "People|Bob").unwrap();
+        add_tag(&mut cat, a, "Holidays|1998").unwrap();
+        add_tag(&mut cat, b, "Trips|1998").unwrap();
+        add_tag(&mut cat, b, "People|Bob").unwrap();
         let face = add_face(&mut cat, a, Region { x: 0.5, y: 0.0, w: 0.25, h: 0.5 }, None).unwrap();
         cat.name_faces(&[face], "Family|Al").unwrap();
         let paths = |cat: &Catalog, asset| cat.tags_of(asset).unwrap().into_iter().map(|t| t.path).collect::<Vec<_>>();
@@ -755,7 +1137,7 @@ mod tests {
         assert_eq!((boxes.len(), boxes[0].manual), (1, true));
         cat.name_faces(&[face], "Alice").unwrap();
 
-        rotate(&cat, a, 90).unwrap();
+        rotate(&cat, None, a, 90).unwrap();
         let turned = Region { x: 0.5, y: 0.5, w: 0.5, h: 0.25 };
         assert_eq!(cat.face_boxes(a).unwrap()[0].region, turned);
         assert_eq!(cat.tags_of(a).unwrap()[0].region, Some(turned));
@@ -782,14 +1164,14 @@ mod tests {
         assert_eq!(p.tags.len(), 2);
         assert_eq!(p.rotation, Rotation::default());
 
-        rotate(&cat, a, 90).unwrap();
+        rotate(&cat, None, a, 90).unwrap();
         let p = properties(&cat, a).unwrap();
         assert_eq!(p.dimensions, Some((20, 40)));
         assert_eq!((p.rotation.applied_cw, p.rotation.by_user), (Some(90), true));
         assert!(p.stages.iter().any(|s| s.stage == ORIENT && s.current && s.status == RunStatus::User));
         let region = p.tags.iter().find(|t| t.path == "People|Alice").unwrap().region.unwrap();
         assert_eq!(region, Region { x: 0.0, y: 0.0, w: 1.0, h: 0.5 });
-        assert!(rotate(&cat, a, 45).is_err());
+        assert!(rotate(&cat, None, a, 45).is_err());
 
         assert!(cat.remove_tag_path(a, "places|home").unwrap());
         assert!(!cat.remove_tag_path(a, "Nope").unwrap());

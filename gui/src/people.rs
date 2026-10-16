@@ -44,6 +44,7 @@ use crate::{actions, AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, Scr
 use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, PersonFaces, DEFAULT_MIN_SIMILARITY};
 use archive_core::catalog::people::{arrange, display_name, matching_people, person_path, PeopleOrder};
 use archive_core::catalog::{Catalog, TagId, TagKind};
+use archive_core::ops;
 
 /// `PersonItem.key` of the faces nobody has named.
 const UNKNOWN: i32 = -1;
@@ -407,13 +408,13 @@ pub fn set_cover(ui: &AppWindow, person: TagId, face: FaceId, name: String) {
     log::debug!("set face {} as the cover for person {} ({name})", face.0, person.0);
     let weak = ui.as_weak();
     let _ = thread::Builder::new().name("people-cover".into()).spawn(move || {
-        let result = actions::open_catalog(&root).and_then(|mut c| c.set_person_cover(person, Some(face)).map_err(|e| e.to_string()));
+        let result = actions::open_catalog(&root).and_then(|mut c| ops::set_person_cover(&mut c, person, Some(face)).map_err(|e| e.to_string()));
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
             Ok(()) => {
                 with_grid(|g| g.load_people());
-                actions::notify(&ui, format!("Cover for {name} set"), false, Vec::new());
+                actions::notify(&ui, format!("Cover for {name} set"), false, true);
             }
-            Err(e) => actions::notify(&ui, format!("Can't set the cover: {e}"), true, Vec::new()),
+            Err(e) => actions::notify(&ui, format!("Can't set the cover: {e}"), true, false),
         });
     });
 }
@@ -1126,7 +1127,14 @@ fn spawn_writer(root: PathBuf, ui: slint::Weak<AppWindow>) -> mpsc::Sender<Chang
                 Err(e) => log::warn!("change {id} failed: {e}"),
             }
             pending_refresh |= result.is_ok();
-            if let Err(e) = ui.upgrade_in_event_loop(move |_| with_grid(|g| g.changed(id, result))) {
+            // What was saved, as the journal has it, for the notice (with Undo).
+            let saved = result.is_ok().then(|| catalog.as_ref()?.next_undo().ok().flatten().map(|(c, _)| c.description)).flatten();
+            if let Err(e) = ui.upgrade_in_event_loop(move |ui| {
+                with_grid(|g| g.changed(id, result));
+                if let Some(saved) = saved {
+                    actions::notify(&ui, saved, false, true);
+                }
+            }) {
                 log::debug!("change {id}: result not delivered: {e}");
             }
         }
@@ -1157,11 +1165,11 @@ fn change_id(change: &Change) -> u64 {
 fn apply(catalog: &mut Catalog, change: Change) -> (u64, Result<People, String>) {
     let id = change_id(&change);
     let (result, paths) = match change {
-        Change::Name { faces, path, paths, .. } => (catalog.name_faces(&faces, &path).map(|_| ()), paths),
-        Change::Ignore { faces, paths, .. } => (catalog.ignore_faces(&faces), paths),
-        Change::Unignore { faces, paths, .. } => (catalog.unignore_faces(&faces), paths),
-        Change::Reject { faces, person, .. } => (catalog.reject_person(&faces, person), Vec::new()),
-        Change::Unreject { faces, person, .. } => (catalog.clear_rejections(&faces, person), Vec::new()),
+        Change::Name { faces, path, paths, .. } => (ops::name_faces(catalog, &faces, &path).map(|_| ()), paths),
+        Change::Ignore { faces, paths, .. } => (ops::ignore_faces(catalog, &faces), paths),
+        Change::Unignore { faces, paths, .. } => (ops::unignore_faces(catalog, &faces), paths),
+        Change::Reject { faces, person, .. } => (ops::reject_person(catalog, &faces, person), Vec::new()),
+        Change::Unreject { faces, person, .. } => (ops::clear_rejections(catalog, &faces, person), Vec::new()),
     };
     if result.is_ok() {
         for path in &paths {

@@ -142,7 +142,19 @@ export component AppWindow inherits Window {
                 }
                 reject
             }
+            // Keys nothing handled (bubbled up here): Undo / Redo, which text boxes take for
+            // themselves while they have focus.
             key-pressed(event) => {
+                if (event.modifiers.control && !event.modifiers.alt && (event.text == "z" || event.text == "Z")) {
+                    UiLog.debug("window.keys", event.modifiers.shift ? "Ctrl+Shift+Z: redo" : "Ctrl+Z: undo");
+                    ItemMenu.step(!event.modifiers.shift);
+                    return accept;
+                }
+                if (event.modifiers.control && !event.modifiers.alt && (event.text == "y" || event.text == "Y")) {
+                    UiLog.debug("window.keys", "Ctrl+Y: redo");
+                    ItemMenu.step(false);
+                    return accept;
+                }
                 UiLog.debug("window.keys", "key \{root.key-name(event.text)} not handled by any element (page \{root.page})");
                 reject
             }

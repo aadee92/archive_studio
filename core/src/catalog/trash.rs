@@ -226,6 +226,8 @@ impl Catalog {
                 }
             }
             self.conn.execute("DELETE FROM assets WHERE id = ?1", [item.asset.0])?;
+            // Not undoable, and what touched it can't be undone any more either.
+            self.forget_changes_of(item.asset)?;
             if let Some(dir) = item.in_trash.parent() {
                 remove_empty_dirs(dir, &trash_root);
             }

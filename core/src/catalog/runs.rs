@@ -67,7 +67,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Done => "done",
             Self::User => "user",
@@ -443,7 +443,7 @@ pub struct StageRun {
     pub current: bool,
 }
 
-fn status_of(name: &str) -> RunStatus {
+pub(super) fn status_of(name: &str) -> RunStatus {
     match name {
         "done" => RunStatus::Done,
         "user" => RunStatus::User,

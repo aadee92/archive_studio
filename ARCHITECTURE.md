@@ -16,8 +16,8 @@ Archive Studio is a headless core with thin front ends.
 
 | Path | Crate | Role |
 |---|---|---|
-| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: per-asset actions (rotate, delete, tag / untag, pair / unpair / swap sides, properties), bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction), tags as a whole (`tag_tree`, `rename_tag`, `merge_tags`, `delete_tag`), and `retry` of failed stages (through the engine if one runs here). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
-| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face; `reject` / `unreject FACE_ID... PERSON`, `rejected PERSON`, `unignore`, `ignored`), people (`people [name|faces|recent] [TEXT]` with counts and cover face, `person rename / merge / delete / cover`), tags (tag, untag; `tag` and `delete` / `restore` take several files; `tags` as a tree with counts, `rename-tag`, `merge-tag`, `delete-tag`), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`), failures (`failed` with errors, `retry [STAGE|PATH...]`), trash (`trash` with dates, sizes and totals, `restore`, `purge PATH...`, `empty-trash [DAYS]`) |
+| `core/` | `archive-core` (lib `archive_core`) | `device`: the capture device API. `devices`: backends (Epson V850, DV over FireWire, mocks) and `discover` / `hotplug`. `catalog`: the library database. `pipeline`: the processing engine. `ops`: every user-level change, each recorded in the undo journal (`undo` / `redo` / `history`): per-asset actions (rotate, accept / keep a proposed rotation, delete, tag / untag, pair / unpair / swap sides, properties), faces and people (name, confirm, not, ignore / unignore, delete, add, reject / clear rejections, covers, rename / merge / delete people), bulk ones for a multi-selection (`delete_all` / `restore_all` with per-asset results, `add_tag_all` in one transaction, `rotate_all`), tags as a whole (`tag_tree`, `rename_tag`, `merge_tags`, `delete_tag`), the trash (`purge`, `empty_trash`: not undoable), and `retry` of failed stages (through the engine if one runs here). `desktop`: open a file in its default application, show it in the file manager (freedesktop `FileManager1.ShowItems` over D-Bus, else the folder). `exif`: basic EXIF fields |
+| `cli/` | `archive-studio-cli` (bin `archive`) | Interactive shell: hosts the pipeline engine, status, review, list by state (`list failed`, `review`, `untagged`, `unknown-faces`, `has-back`, …, `no-…`), rotate, faces (name, not, ignore, delete-face, add-face; `reject` / `unreject FACE_ID... PERSON`, `rejected PERSON`, `unignore`, `ignored`), people (`people [name|faces|recent] [TEXT]` with counts and cover face, `person rename / merge / delete / cover`), tags (tag, untag; `tag` and `delete` / `restore` take several files; `tags` as a tree with counts, `rename-tag`, `merge-tag`, `delete-tag`), front/back (pair, unpair, swap-sides), find by description (`find WORDS...`), files that look like one (`like PATH`), failures (`failed` with errors, `retry [STAGE|PATH...]`), trash (`trash` with dates, sizes and totals, `restore`, `purge PATH...`, `empty-trash [DAYS]`), `undo`, `redo`, `history [N]` |
 | `logging/` | `archive-logging` (lib `archive_logging`) | The logger the binaries install behind the `log` facade: stderr + rotating file in the library, panic hook, recent records / subscribe for in-app viewers, fd 2 capture |
 | `gui/` | `archive-studio-gui` (bin `archive-studio`) | Slint desktop app: acquire tiles hosting `archive_core` devices, review grid, thumbnail cache (`gui/src/thumbs`) |
 | `utils/epson/v850` | `x980` | Standalone Epson GT-X980 / V850 USB driver (lib + CLI) |
@@ -169,6 +169,28 @@ XMP sidecar sync.
   until the file changes or `retry(Retry::All | Stage(s) | Runs(asset, stage…))` forgets
   it. A running engine needs telling: `Engine::retry` does it on the engine thread and
   looks for work at once; front ends go through `ops::retry(catalog, engine)`.
+- **Undo journal** (`undo`, schema 8): every user change goes through `ops`, which records
+  it as one change with a description (`Tag 12 items Holidays`): `Catalog::journaled(desc,
+  f)` turns on temporary triggers on this connection (installed once per connection) that
+  record each row `f` inserts, deletes or updates in the user's tables (`undo::JOURNALED`:
+  tags, asset_tags, faces, face_crops, face_rejections, person_covers, asset_pairs), the rows
+  the catalog's own triggers and foreign keys change along with them included; an update
+  keeps its key and the columns it changed (values stored exactly: no type affinity). What
+  isn't rows is a `FileAction` (`record_action`): `Trash` / `Restore` of assets, `Orient`
+  (pictures turned `cw`, with each one's orient run before and after). `ops::undo(catalog,
+  engine)` performs the inverse action (restore what was trashed, turn back losslessly (a JPEG's
+  partial edge blocks went with the first turn), through the engine if one runs here, and put the orient run back on the file as it is now) and then
+  `apply_change` replays the rows backwards, inverted, in one transaction with foreign keys
+  deferred (asset tag changes mark sidecars for sync as any change does; a tag the change
+  made is dropped only while nothing else uses it). `ops::redo` replays forwards; both return
+  the files touched (before and after: a file moved to or from the trash both). A stack
+  persisted in the catalog, so the shell and the GUI share it and it survives restarts:
+  `next_undo` is the latest change not undone, `next_redo` the earliest undone one, `history(n)`
+  lists them; a new change drops the undone ones, and only the last `KEEP` (200) are kept. A
+  change that can't be applied any more (what it touched changed since) is dropped with an
+  error, so the next undo goes on. Purging from the trash isn't undoable and drops the changes
+  that touched what was purged. Changes other connections make (the pipeline's) aren't
+  recorded: an undo restores the user's rows as they were, whatever the pipeline wrote since.
 - **Signatures** (`similar`): a 128-bit dHash plus a 64-bin colour histogram per image,
   computed by the pipeline's `signature` stage (no model; after orient). `similar(asset,
   candidates, limit)` returns only highly similar ones (≤ 16 bits apart, ≥ 50% colour overlap).

@@ -6,10 +6,11 @@
 //!
 //! Each change is an [`archive_core::ops`] call on a worker: [`ops::rename_tag`] (onto a
 //! taken path the dialog offers to merge instead), [`ops::merge_tags`] (the box offers the
-//! catalog's matching tags), [`ops::delete_tag`] (confirmed with how many items it is on;
-//! not undoable). People go through the person operations there, so their faces follow. The
-//! files whose tags changed are reported with [`pipeline::changed`], which refreshes the
-//! grid (its tag tree included) and Details; People re-reads if a person changed, and
+//! catalog's matching tags), [`ops::delete_tag`] (confirmed with how many items it is on).
+//! Each is one change in the undo journal: the notice offers Undo. People go through the
+//! person operations there, so their faces follow. The files whose tags changed are
+//! reported with [`pipeline::changed`], which refreshes the grid (its tag tree included)
+//! and Details; People re-reads if a person changed, and
 //! Review's tag filter follows the tag ([`review::tag_moved`]).
 
 use std::cell::RefCell;
@@ -111,7 +112,7 @@ fn person_message(action: &str, name: &str, faces: usize, pictures: usize) -> St
     match action {
         "rename" => format!("{name}: {theirs}. A name alone keeps their place under People."),
         "merge" => format!("{name}'s {theirs} become the person you pick, and {name} is deleted."),
-        _ => format!("Delete {name}? Their {theirs} go back to Unknown, and the tag comes off the pictures. This can't be undone."),
+        _ => format!("Delete {name}? Their {theirs} go back to Unknown, and the tag comes off the pictures."),
     }
 }
 
@@ -144,7 +145,7 @@ fn open(ui: &AppWindow, path: String, count: usize, children: bool, action: Stri
         "merge" => format!("Its {}{under} go to the tag you pick, and it is deleted.", items(count)),
         _ => {
             let faces = if person { " Faces named as them become unknown again." } else { "" };
-            format!("Take it{under} off {} and delete it? This can't be undone.{faces}", items(count))
+            format!("Take it{under} off {} and delete it?{faces}", items(count))
         }
     };
     let edit = ui.global::<TagEdit>();
@@ -294,7 +295,7 @@ fn submit(ui: &AppWindow, text: String, merge: bool) {
                         (Some(to), _) => format!("Merged {} into {}", shown(&path), shown(to)),
                         (None, _) => format!("Deleted {} ({})", shown(&path), items(done.files.len())),
                     };
-                    actions::notify(&ui, what, false, Vec::new());
+                    actions::notify(&ui, what, false, true);
                 }
                 Ok(Err(taken)) => edit.set_taken(taken.into()),
                 Err(e) => edit.set_error(e.into()),

@@ -61,6 +61,10 @@ export global ItemMenu {
     in property <bool> notice-error;
     in property <string> notice-action;
     callback notice-clicked();
+
+    // Ctrl+Z (true) / Ctrl+Shift+Z or Ctrl+Y (false) anywhere a text box doesn't take them:
+    // undo or redo the last change (`src/undo.rs`).
+    callback step(bool);
 }
 
 // Managing a tag from Review's tag tree or a person from People's list (`src/tags.rs`): its

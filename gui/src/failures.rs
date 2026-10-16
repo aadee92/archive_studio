@@ -176,7 +176,7 @@ fn loaded(ui: &AppWindow, result: Result<Vec<Failure>, String>) {
         Ok(items) => items,
         Err(e) => {
             log::warn!("failures: can't read them: {e}");
-            return notify(ui, format!("Can't read the failures: {e}"), true, Vec::new());
+            return notify(ui, format!("Can't read the failures: {e}"), true, false);
         }
     };
     let files: HashSet<AssetId> = items.iter().map(|f| f.asset).collect();
@@ -307,7 +307,7 @@ fn show_in_folder(ui: &AppWindow, path: PathBuf) {
     thread::spawn(move || {
         if let Err(e) = desktop::show_in_folder(&path) {
             let name = file_name(&path);
-            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {name}: {e}"), true, Vec::new()));
+            let _ = weak.upgrade_in_event_loop(move |ui| notify(&ui, format!("Can't show {name}: {e}"), true, false));
         }
     });
 }
@@ -354,10 +354,10 @@ fn retry(ui: &AppWindow, which: Retry) {
                     let n = paths.len();
                     let what = if n == 1 { "1 failed stage".to_owned() } else { format!("{} failed stages", grouped(n)) };
                     let when = if engine.is_some() { "now" } else { "when the pipeline next runs" };
-                    notify(&ui, format!("Retrying {what} {when}"), false, Vec::new());
+                    notify(&ui, format!("Retrying {what} {when}"), false, false);
                     with_state(|s| s.selected.clear());
                 }
-                Err(e) => notify(&ui, format!("Can't retry: {e}"), true, Vec::new()),
+                Err(e) => notify(&ui, format!("Can't retry: {e}"), true, false),
             }
             load(&ui);
         });
