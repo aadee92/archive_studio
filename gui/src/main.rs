@@ -25,6 +25,7 @@ mod review;
 mod semantic;
 mod settings;
 mod shortcuts;
+mod shot;
 mod tags;
 mod thumbs;
 mod trash;
@@ -35,20 +36,31 @@ use std::path::PathBuf;
 slint::include_modules!();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `archive-studio [DIR]` — defaults to the current directory.
-    let root = match std::env::args_os().nth(1) {
-        Some(dir) => PathBuf::from(dir),
+    // `archive-studio [DIR]` — defaults to the current directory. Or `archive-studio --shot
+    // OUT.png [options] [DIR]`: a screenshot of the app, rendered offscreen (`shot.rs`).
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let (shot, dir) = match shot::parse(&args)? {
+        Some((options, dir)) => (Some(options), dir),
+        None => (None, std::env::args_os().nth(1).map(PathBuf::from)),
+    };
+    let root = match dir {
+        Some(dir) => dir,
         None => std::env::current_dir()?,
     };
     // Absolute like the catalog's root, so the paths the pipeline reports match the grid's.
     let root = std::path::absolute(root)?;
     start_logging(&root);
 
+    if let Some(options) = &shot {
+        shot::install_platform(options)?;
+    }
     let ui = AppWindow::new()?;
     // Matches archive-studio.desktop, which is how GNOME (Wayland) finds the launcher
     // icon; the window's own `icon` covers X11 and other platforms. Needs the platform
     // that `AppWindow::new` sets up, and must come before the window is shown.
-    slint::set_xdg_app_id("archive-studio")?;
+    if shot.is_none() {
+        slint::set_xdg_app_id("archive-studio")?;
+    }
     let _log = log_view::install(&ui);
     nav::install(&ui);
     let pipeline = pipeline::install(&ui, root.clone());
@@ -62,8 +74,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     failures::install(&ui, root.clone(), pipeline.clone());
     review::install(&ui, root.clone(), pipeline);
     shortcuts::install(&ui);
-    // The window and its views as they were left (the last page too).
-    settings::install(&ui, &root);
+    // The window and its views as they were left (the last page too); a screenshot shows
+    // the defaults and leaves the user's settings alone.
+    if let Some(options) = &shot {
+        shot::show_page(&ui, &root, options);
+    } else {
+        settings::install(&ui, &root);
+    }
     // Diagnostics: start on another page (1 Review, 2 People), as if picked in the sidebar.
     if let Some(page) = std::env::var("ARCHIVE_STUDIO_PAGE").ok().and_then(|p| p.parse().ok()) {
         log::info!("ARCHIVE_STUDIO_PAGE: starting on page {page}");

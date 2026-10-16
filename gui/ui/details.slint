@@ -813,9 +813,10 @@ component FacePopup inherits Rectangle {
 }
 
 // The items of the view this one was opened from, around it: the shown item is the
-// highlighted one in the middle. A click shows another.
+// highlighted one in the middle. A click shows another. Its own height (a line and a row
+// of tiles), never stretched: the picture takes the rest of the page.
 component FilmStrip inherits VerticalLayout {
-    property <length> tile: 56px;
+    property <length> tile: 64px;
     property <length> gap: 6px;
     property <length> step: self.tile + self.gap;
     // Where item `DetailsBridge.scope-index` starts: the strip is centered on it.
@@ -834,8 +835,10 @@ component FilmStrip inherits VerticalLayout {
     property <int> named: -1;
     changed hover => { self.named = self.hover; }
 
-    spacing: 6px;
+    vertical-stretch: 0;
+    spacing: 4px;
     Text {
+        height: 16px;
         text: root.named >= DetailsBridge.film-start && root.named >= 0 && root.named - DetailsBridge.film-start < DetailsBridge.film.length
             ? DetailsBridge.film[root.named - DetailsBridge.film-start].name
             : DetailsBridge.scope-index >= 0
@@ -889,9 +892,10 @@ component FilmStrip inherits VerticalLayout {
     }
 }
 
-// The items most like this one in the view it was opened from, best first.
+// The items most like this one in the view it was opened from, best first. Its own height,
+// like the filmstrip.
 component SimilarStrip inherits VerticalLayout {
-    property <length> tile: 76px;
+    property <length> tile: 64px;
     property <length> gap: 8px;
     property <int> hover: ta.has-hover ? root.index-at(ta.mouse-x) : -1;
     pure function index-at(x: length) -> int {
@@ -900,8 +904,10 @@ component SimilarStrip inherits VerticalLayout {
             ? -1 : Math.floor(x / (root.tile + root.gap));
     }
 
-    spacing: 6px;
+    vertical-stretch: 0;
+    spacing: 4px;
     Text {
+        height: 16px;
         text: root.hover >= 0
             ? "\{DetailsBridge.similar[root.hover].name} · \{DetailsBridge.similar[root.hover].score}% similar"
             : "Similar in \{DetailsBridge.scope-label}";
@@ -1218,9 +1224,12 @@ export component DetailsPage inherits Rectangle {
             padding: 20px;
             // The bottom bar's own height pads it, unless it is hidden (full screen).
             padding-bottom: DetailsBridge.fullscreen ? 20px : 0px;
-            spacing: 14px;
+            spacing: 10px;
 
+            // Header, filmstrip, similar strip and bottom bar keep their own heights (stretch
+            // 0); the picture's row takes everything else.
             HorizontalLayout {
+                vertical-stretch: 0;
                 spacing: 12px;
                 if NavBridge.can-go-back: VerticalLayout {
                     alignment: center;
@@ -1373,6 +1382,7 @@ export component DetailsPage inherits Rectangle {
             if DetailsBridge.similar.length > 0: SimilarStrip { }
 
             if !DetailsBridge.fullscreen: HorizontalLayout {
+                vertical-stretch: 0;
                 height: 34px;
                 spacing: 8px;
                 Text {
