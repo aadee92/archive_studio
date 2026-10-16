@@ -640,7 +640,11 @@ struct GridModel {
     /// whenever `visible` or the column count changes.
     layout: RefCell<Layout>,
     columns: Cell<usize>,
+    /// The thumbnail size the tiles want: tile size × the window's scale factor.
     tier: Cell<Tier>,
+    /// When the view last came to rest with tiles in view not yet sharp at `tier`; logged
+    /// and cleared once they all are.
+    sharp_wait: Cell<Option<Instant>>,
     /// First and last (inclusive) row in view.
     viewport: Cell<(usize, usize)>,
     scrolling_down: Cell<bool>,
@@ -707,14 +711,18 @@ fn with_grid(f: impl FnOnce(&GridModel)) {
     });
 }
 
-/// The grid's thumbnail of `path` if it has one in memory (the large one if it can), for
+/// The grid's thumbnail of `path` if it has one in memory (the sharpest it has), for
 /// Details to show at once while it decodes the picture.
 pub fn thumbnail(path: &Path) -> Option<slint::Image> {
     GRID.with_borrow(|grid| {
         let grid = grid.as_ref()?;
-        let id = grid.id_of(path)?;
-        grid.thumbs.get(id, Tier::Large).map(|(image, _exact)| image)
+        grid.thumbs.best(grid.id_of(path)?)
     })
+}
+
+/// The window's scale factor changed: thumbnails are wanted at another size.
+pub fn scale_changed() {
+    with_grid(|g| g.set_columns(g.columns.get()));
 }
 
 pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
@@ -1218,7 +1226,8 @@ impl GridModel {
             shown_sort: Cell::new(Sort::default()),
             layout: RefCell::default(),
             columns: Cell::new(1),
-            tier: Cell::new(Tier::Small),
+            tier: Cell::new(Tier::BASE),
+            sharp_wait: Cell::new(None),
             viewport: Cell::new((0, 0)),
             scrolling_down: Cell::new(true),
             settle: Timer::default(),
@@ -1685,17 +1694,26 @@ impl GridModel {
         true
     }
 
-    /// Also called when the tile size changes, to pick the thumbnail tier.
+    /// Also called when the tile size or the window's scale factor changes, to pick the
+    /// thumbnail tier. Thumbnails at another tier are asked for once that settles: until
+    /// then tiles show what they have, scaled.
     fn set_columns(&self, columns: usize) {
-        let tier = self.ui.upgrade().map_or(Tier::Large, |ui| {
+        let tier = self.ui.upgrade().map_or(Tier::BASE, |ui| {
             let tile = ui.global::<ReviewBridge>().get_tile_size();
-            Tier::for_tile(tile * ui.window().scale_factor())
+            Tier::cover(tile * ui.window().scale_factor())
         });
         let columns_changed = self.columns.replace(columns) != columns;
-        if self.tier.replace(tier) != tier || columns_changed {
+        let tier_changed = self.tier.replace(tier) != tier;
+        if tier_changed {
+            log::debug!("review: thumbnails at {} px", tier.edge());
+        }
+        if columns_changed {
             self.relayout();
             self.reset_view();
-            self.reschedule();
+        }
+        if columns_changed || tier_changed {
+            self.schedule_window(true);
+            self.settle.start(TimerMode::SingleShot, SCROLL_SETTLE, || with_grid(|g| g.reschedule()));
         }
     }
 
@@ -1720,9 +1738,14 @@ impl GridModel {
     /// still queued is cancelled.
     fn reschedule(&self) {
         self.schedule_window(false);
+        let waiting = !self.view_sharp();
+        self.sharp_wait.set(waiting.then(Instant::now));
     }
 
-    /// `moving`: the view is scrolling, so visible rows go leading edge first.
+    /// `moving`: the view is scrolling (or the tiles are being resized), so visible rows go
+    /// leading edge first, and only tiles with nothing to show are asked for, at the quick
+    /// [`Tier::BASE`]; once the view rests ([`reschedule`](Self::reschedule)), every tile at
+    /// the size it is shown.
     fn schedule_window(&self, moving: bool) {
         let (first, last) = self.viewport.get();
         let screen = last - first + 1;
@@ -1736,9 +1759,25 @@ impl GridModel {
             (screen / 2).max(1),
         );
         let tier = self.tier.get();
+        let quick = tier.min(Tier::BASE);
         let (visible, entries, layout) = (self.visible.borrow(), self.entries.borrow(), self.layout());
         let ids = rows.iter().flat_map(|&row| visible.get(layout.slots(row)).unwrap_or_default());
-        self.thumbs.schedule(ids.map(|&id| (id, tier)), |id| entries.get(id).map(|e| (e.path.clone(), e.kind)));
+        let source = |id| entries.get(id).map(|e: &Entry| (e.path.clone(), e.kind));
+        if moving {
+            self.thumbs.schedule(ids.filter(|&&id| !self.thumbs.has_any(id)).map(|&id| (id, quick)), source);
+        } else {
+            self.thumbs.schedule(ids.map(|&id| (id, tier)), source);
+        }
+    }
+
+    /// Whether every tile in view has its thumbnail at the tier it wants (or has failed).
+    fn view_sharp(&self) -> bool {
+        let (first, last) = self.viewport.get();
+        let tier = self.tier.get();
+        let (visible, layout) = (self.visible.borrow(), self.layout());
+        (first..=last.min(self.row_count().saturating_sub(1)))
+            .flat_map(|row| visible.get(layout.slots(row)).unwrap_or_default())
+            .all(|&id| self.thumbs.failed(id) || self.thumbs.get(id, tier).is_some_and(|(_, exact)| exact))
     }
 
     /// Selects `id` alone, focused, as the anchor of a Shift range.
@@ -2160,6 +2199,10 @@ impl GridModel {
         rows.dedup();
         for row in rows {
             self.notify.row_changed(row);
+        }
+        if let Some(since) = self.sharp_wait.get().filter(|_| !changed.is_empty() && self.view_sharp()) {
+            log::debug!("review: view sharp {:?} after it came to rest", since.elapsed());
+            self.sharp_wait.set(None);
         }
     }
 
@@ -2766,10 +2809,10 @@ mod tests {
                 let (ready, scheduled) = (g.ready.clone(), &scheduled);
                 s.spawn(move || {
                     for id in (t..2000).step_by(4) {
-                        if id % 10 == 0 && ready.push((id, Tier::Small, Delivery::Preview(Pixels::new(2, 2), [9, 9, 9]))) {
+                        if id % 10 == 0 && ready.push((id, Tier::BASE, Delivery::Preview(Pixels::new(2, 2), [9, 9, 9]))) {
                             scheduled.fetch_add(1, atomic::Ordering::Relaxed);
                         }
-                        if ready.push((id, Tier::Small, Delivery::Thumb(Pixels::new(4, 4), [1, 2, 3]))) {
+                        if ready.push((id, Tier::BASE, Delivery::Thumb(Pixels::new(4, 4), [1, 2, 3]))) {
                             scheduled.fetch_add(1, atomic::Ordering::Relaxed);
                         }
                     }
@@ -2797,9 +2840,9 @@ mod tests {
         notified.dedup();
         assert_eq!(notified, (0..250).collect::<Vec<_>>(), "every row with a new thumbnail");
         assert!(drains >= 1, "more than one only if a drain ran past its time budget");
-        assert!((0..2000).all(|id| g.thumbs.get(id, Tier::Small).is_some_and(|(_, exact)| exact)));
+        assert!((0..2000).all(|id| g.thumbs.get(id, Tier::BASE).is_some_and(|(_, exact)| exact)));
 
-        assert!(g.ready.push((0, Tier::Small, Delivery::Failed)), "an idle mailbox asks for a drain again");
+        assert!(g.ready.push((0, Tier::BASE, Delivery::Failed)), "an idle mailbox asks for a drain again");
         g.drain_ready();
         assert!(g.notify.log.take().is_empty());
     }
@@ -3659,7 +3702,7 @@ mod bench4 {
                     thread::spawn(move || {
                         for id in (t..n).step_by(8) {
                             let px = crate::thumbs::Pixels::new(192, 128);
-                            if ready.push((id, Tier::Small, Delivery::Thumb(px, [1, 2, 3]))) {
+                            if ready.push((id, Tier::BASE, Delivery::Thumb(px, [1, 2, 3]))) {
                                 let _ = tx.send(Box::new(|g: &GridModel| g.drain_ready()));
                             }
                         }

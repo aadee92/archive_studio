@@ -247,15 +247,30 @@ fn open_upright(path: &Path) -> std::result::Result<RgbImage, String> {
     Ok(image.to_rgb8())
 }
 
-/// A square around the box, [`CROP_CONTEXT`] times its larger side and kept inside the
-/// image, scaled to [`CROP_EDGE`].
-fn crop_jpeg(image: &RgbImage, [x1, y1, x2, y2]: [f32; 4]) -> image::ImageResult<Vec<u8>> {
-    let (iw, ih) = image.dimensions();
+/// The square a face's crop shows, in pixels of a `iw`×`ih` image: around the box
+/// (`[x1, y1, x2, y2]`), [`CROP_CONTEXT`] times its larger side and kept inside the image.
+/// Returns (left, top, side).
+fn crop_square((iw, ih): (u32, u32), [x1, y1, x2, y2]: [f32; 4]) -> (u32, u32, u32) {
     let side = ((x2 - x1).max(y2 - y1) * CROP_CONTEXT).max(1.0).min(iw.min(ih) as f32);
     let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
     let left = (cx - side / 2.0).clamp(0.0, iw as f32 - side) as u32;
     let top = (cy - side / 2.0).clamp(0.0, ih as f32 - side) as u32;
-    let side = side as u32;
+    (left, top, side as u32)
+}
+
+/// What the stored crop of a face at `region` shows, as fractions of the upright picture
+/// (`w`×`h` pixels, the shape matters): for a front end to cut it again from the picture,
+/// sharper than the stored [`Catalog::face_crop`] where that is shown larger.
+pub fn crop_region(region: Region, (w, h): (u32, u32)) -> Region {
+    let (fw, fh) = (w.max(1) as f32, h.max(1) as f32);
+    let bbox = [region.x * fw, region.y * fh, (region.x + region.w) * fw, (region.y + region.h) * fh];
+    let (left, top, side) = crop_square((w.max(1), h.max(1)), bbox);
+    Region { x: left as f32 / fw, y: top as f32 / fh, w: side as f32 / fw, h: side as f32 / fh }
+}
+
+/// A square around the box ([`crop_square`]), scaled to [`CROP_EDGE`].
+fn crop_jpeg(image: &RgbImage, bbox: [f32; 4]) -> image::ImageResult<Vec<u8>> {
+    let (left, top, side) = crop_square(image.dimensions(), bbox);
     let crop = image::imageops::crop_imm(image, left, top, side, side).to_image();
     let crop = crate::resize::fit(&crop, CROP_EDGE);
     let mut jpeg = Vec::new();
@@ -813,6 +828,22 @@ mod tests {
             let all = self.cat.faces(FaceFilter::All, FaceOrder::Asset).unwrap();
             all.into_iter().find(|f| f.id == face).unwrap().suggestion.map(|s| s.0)
         }
+    }
+
+    #[test]
+    fn crop_region_is_the_stored_crops_square() {
+        let near = |a: Region, b: Region| [a.x - b.x, a.y - b.y, a.w - b.w, a.h - b.h].iter().all(|d| d.abs() < 1e-3);
+        // A 400×300 face box in the middle of a 4000×3000 picture: 1.6 × 400 = 640 px square.
+        let r = crop_region(Region { x: 0.45, y: 0.45, w: 0.1, h: 0.1 }, (4000, 3000));
+        assert!(near(r, Region { x: 1680.0 / 4000.0, y: 1180.0 / 3000.0, w: 640.0 / 4000.0, h: 640.0 / 3000.0 }), "{r:?}");
+        // At the corner: kept inside the picture, still square in pixels.
+        let r = crop_region(Region { x: 0.0, y: 0.0, w: 0.05, h: 0.1 }, (2000, 1000));
+        assert!(near(r, Region { x: 0.0, y: 0.0, w: 0.08, h: 0.16 }), "{r:?}");
+        // As large as the picture's short side at most.
+        let r = crop_region(Region { x: 0.1, y: 0.0, w: 0.8, h: 1.0 }, (2000, 1000));
+        assert!(near(r, Region { x: 0.25, y: 0.0, w: 0.5, h: 1.0 }), "{r:?}");
+        // The same square crop_jpeg cuts.
+        assert_eq!(crop_square((2000, 1000), [900.0, 400.0, 1100.0, 600.0]), (840, 340, 320));
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //! The list is read on a worker when the page is shown, and again when the trash's totals
 //! change while it is ([`totals`], from the pipeline relay's counts: deletes, restores and
 //! undo from anywhere). Thumbnails are loaded on a worker for the whole list
-//! (small tier, `thumbs::small_for_files`), dropped if the list is read again meanwhile.
+//! (`thumbs::for_files`, as large as a tile is on screen: again if the window's scale factor
+//! changes), dropped if the list is read again meanwhile.
 //! Every change runs on a worker; restored files are reported with [`pipeline::changed`],
 //! so they come back to Review, and the totals are recounted.
 
@@ -27,7 +28,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::actions::{self, local_time, notify};
 use crate::pipeline::{self, Handle};
 use crate::review::{grouped, human_size};
-use crate::thumbs::{self, Pixels};
+use crate::thumbs::{self, Accept, Pixels, Tier};
 use crate::{nav, AppWindow, TrashBridge, TrashRow, TrashTile};
 use archive_core::catalog::trash::{Trashed, TrashTotals};
 use archive_core::catalog::AssetId;
@@ -41,6 +42,8 @@ struct State {
     pipeline: Handle,
     items: Vec<Trashed>,
     thumbs: HashMap<PathBuf, slint::Image>,
+    /// The size `thumbs` were loaded for, in physical pixels.
+    thumb_px: u32,
     selected: HashSet<AssetId>,
     /// Where a Shift-click range starts (an index of `items`).
     anchor: Option<usize>,
@@ -71,6 +74,7 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
         pipeline,
         items: Vec::new(),
         thumbs: HashMap::new(),
+        thumb_px: 0,
         selected: HashSet::new(),
         anchor: None,
         columns: 1,
@@ -156,6 +160,16 @@ pub fn install(ui: &AppWindow, root: PathBuf, pipeline: Handle) {
     });
 }
 
+/// The window's scale factor changed: thumbnails at the new size, now if the page is
+/// shown, else when it is next.
+pub fn scale_changed(ui: &AppWindow) {
+    if ui.get_page() == nav::TRASH {
+        load(ui);
+    } else {
+        with_state(|s| s.loaded = None);
+    }
+}
+
 /// The page is shown: read the trash again.
 pub fn entered(ui: &AppWindow) {
     load(ui);
@@ -211,7 +225,11 @@ fn loaded(ui: &AppWindow, result: Result<(Vec<Trashed>, TrashTotals), String>) {
     bridge.set_count(totals.items as i32);
     bridge.set_summary(summary(&items).into());
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let px = (bridge.get_tile_size() * ui.window().scale_factor()).ceil() as u32;
     let missing = with_state(|s| {
+        if std::mem::replace(&mut s.thumb_px, px) != px {
+            s.thumbs.clear();
+        }
         s.loading = false;
         s.loaded = Some(totals);
         let present: HashSet<AssetId> = items.iter().map(|t| t.asset).collect();
@@ -230,12 +248,13 @@ fn loaded(ui: &AppWindow, result: Result<(Vec<Trashed>, TrashTotals), String>) {
     }
     let weak = ui.as_weak();
     thread::spawn(move || {
-        thumbs::small_for_files(&missing, |i, small| {
+        // A tile shows the whole picture: as large as the tier covering it, then fitted.
+        thumbs::for_files(&missing, Tier::cover(px as f32), Accept::Sharp, |i, image| {
             if GENERATION.load(Ordering::Relaxed) != generation {
                 return false;
             }
             let path = missing[i].clone();
-            let pixels = small.map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+            let pixels = image.map(|rgb| thumbs::fit(&rgb, px)).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
             let _ = weak.upgrade_in_event_loop(move |_| thumb(path, pixels));
             true
         });

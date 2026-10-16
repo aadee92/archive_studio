@@ -11,14 +11,14 @@ use image::RgbImage;
 use archive_core::media::MediaKind;
 
 #[allow(unused_imports)] // `decode_preview`, `write_tiff_with_reduced_page`: for capture backends
-pub use picture::{average_color, decode_preview, dimensions, fit, is_tiff, preview_from_bytes, upright_dimensions, write_tiff_with_reduced_page};
+pub use picture::{average_color, decode_preview, decode_regions, dimensions, fit, is_tiff, preview_from_bytes, resize_to, upright_dimensions, write_tiff_with_reduced_page, Bound};
 
-/// Decodes `path` to an upright RGB picture no larger than `edge` on its longest side.
-pub fn decode(path: &Path, kind: MediaKind, edge: u32) -> Option<RgbImage> {
+/// Decodes `path` to an upright RGB picture of the size `bound` asks.
+pub fn decode(path: &Path, kind: MediaKind, bound: Bound) -> Option<RgbImage> {
     if kind != MediaKind::Image {
         return None;
     }
-    picture::decode(path, edge)
+    picture::decode_to(path, bound)
 }
 
 /// [`decode`] at full resolution, for looking closely (zoom), unless that is more than
@@ -31,9 +31,9 @@ pub fn decode_full(path: &Path, kind: MediaKind, max_pixels: u64) -> Option<RgbI
 }
 
 /// [`decode`] of a file already read into memory (by an I/O thread).
-pub fn decode_bytes(bytes: &[u8], kind: MediaKind, edge: u32) -> Option<RgbImage> {
+pub fn decode_bytes(bytes: &[u8], kind: MediaKind, bound: Bound) -> Option<RgbImage> {
     if kind != MediaKind::Image {
         return None;
     }
-    picture::decode_bytes(bytes, edge)
+    picture::decode_bytes_to(bytes, bound)
 }

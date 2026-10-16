@@ -24,7 +24,7 @@ Archive Studio is a headless core with thin front ends.
 | `utils/photo-duplex` | `photo-duplex` | Finds and cuts out photos on a flatbed scan, pairs fronts with backs (lib + CLI) |
 | `utils/faces` | `faces` | Face detection (SCRFD), alignment, ArcFace embeddings (also of a hand-drawn box) and clustering into people (lib; `examples/faces.rs` driver) |
 | `utils/orientation` | `orientation` | 90°-step orientation model (lib; used by the pipeline's orient stage) |
-| `utils/picture` | `picture` | Decoding pictures no larger than they are shown, upright: JPEG at a reduced DCT scale, a TIFF's reduced page, the EXIF preview; sizes from headers (lib; used by the GUI's thumbnails and Details; optimized in debug builds too) |
+| `utils/picture` | `picture` | Decoding pictures no larger than they are shown, upright: to a `Bound` (`Fit`: longest edge, a picture shown whole; `Cover`: shortest edge, a thumbnail filling a square tile), JPEG at a reduced DCT scale, a TIFF's reduced page, parts of a picture (`decode_regions`, e.g. face crops), the EXIF preview; Catmull-Rom downscaling; sizes from headers (lib; used by the GUI's thumbnails, People and Details; optimized in debug builds too) |
 | `utils/clip` | `clip` | TinyCLIP image and text embeddings, CLIP tokenizer, grouped zero-shot labels (lib; `examples/clip.rs` driver; `export_onnx.py` makes the model) |
 | `utils/*.py`, `utils/*.sh` | | Standalone scripts |
 
@@ -105,7 +105,9 @@ XMP sidecar sync.
   person)` takes it back; `unignore_faces` returns only ignored faces to unreviewed (a face
   named meanwhile keeps its name, unlike `unreview_faces`). `FaceFilter::Rejected(person)`
   and `FaceFilter::Ignored` list them; `count_faces(filter)` counts any filter without
-  reading the faces.
+  reading the faces. A face's crop is stored at 160 px (`Catalog::face_crop`);
+  `faces::crop_region(region, size)` gives the square it shows, as fractions of the picture,
+  so a front end can cut it again sharper where it is shown larger.
 - **Fixing faces on one picture** (`faces`): `not_person` (un-named and untagged as above,
   and that person never suggested for it again), `ignore_faces`, `delete_faces` (the row,
   its crop and rejections; the tag follows as for un-naming; a rescan may find a deleted

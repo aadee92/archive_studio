@@ -7,6 +7,10 @@
 //! - TIFF: the smallest reduced-resolution page (NewSubfileType = 1, or a SubIFD) that still
 //!   covers the edge, if the file has one; see [`write_tiff_with_reduced_page`].
 //! - Everything else: full decode via `image`, then a SIMD convolution resize (`fast_image_resize`).
+//!
+//! How large is given as a [`Bound`]: the longest edge for a picture shown whole
+//! ([`Bound::Fit`]), the shortest for a thumbnail that fills a square tile ([`Bound::Cover`]).
+//! Downscaling uses Catmull-Rom, sharper than bilinear without Lanczos' ringing.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom};
@@ -26,12 +30,78 @@ const REDUCED_PAGE_EDGE: u32 = 1024;
 /// Stop walking the page chain of huge multi-page documents.
 const MAX_TIFF_PAGES: usize = 64;
 
+/// A panorama's thumbnail is at most this many times longer than its [`Bound::Cover`]
+/// edge: a square tile shows its middle anyway.
+pub const MAX_COVER_ASPECT: u32 = 3;
+
+/// How large a decoded picture is wanted. Never larger than the picture itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Bound {
+    /// No more than this on the longest edge: shown whole (`contain`).
+    Fit(u32),
+    /// At least this on the shortest edge, to fill a square this size without being
+    /// stretched (`cover`); the longest edge is kept within [`MAX_COVER_ASPECT`] times it.
+    Cover(u32),
+}
+
+impl Bound {
+    /// The size a `w`×`h` picture is scaled to (aspect ratio kept, at least 1×1).
+    pub fn size(self, w: u32, h: u32) -> (u32, u32) {
+        let (long, short) = (w.max(h).max(1) as f64, w.min(h).max(1) as f64);
+        let scale = match self {
+            Self::Fit(edge) => edge as f64 / long,
+            Self::Cover(edge) => (edge as f64 / short).min((edge * MAX_COVER_ASPECT) as f64 / long),
+        }
+        .min(1.0);
+        let size = |n: u32| ((n as f64 * scale).round() as u32).max(1);
+        (size(w), size(h))
+    }
+
+    /// The longest edge of [`size`](Self::size).
+    fn long_edge(self, w: u32, h: u32) -> u32 {
+        let (w, h) = self.size(w, h);
+        w.max(h)
+    }
+}
+
 /// Decodes the image at `path` to an upright RGB picture no larger than `edge` on its
 /// longest side. `None` if it isn't an image this can read.
 pub fn decode(path: &Path, edge: u32) -> Option<RgbImage> {
+    decode_to(path, Bound::Fit(edge))
+}
+
+/// [`decode`] to any [`Bound`].
+pub fn decode_to(path: &Path, bound: Bound) -> Option<RgbImage> {
     // Every decoder streams from this one reader; a fallback rewinds it. Large TIFFs are
     // never copied whole into memory (measured faster than both `fs::read` and mmap).
-    decode_from(BufReader::with_capacity(64 << 10, File::open(path).ok()?), edge)
+    decode_from(BufReader::with_capacity(64 << 10, File::open(path).ok()?), bound)
+}
+
+/// The part `region` (`[x, y, w, h]`, fractions of the upright picture) of the image at
+/// `path`, no larger than `edge` on its longest side: decoded only as large as that part
+/// needs, e.g. a face's crop sharper than a stored one.
+pub fn decode_region(path: &Path, region: [f32; 4], edge: u32) -> Option<RgbImage> {
+    decode_regions(path, &[region], edge)?.pop()
+}
+
+/// [`decode_region`] for several parts of one picture, decoded once (as large as the
+/// smallest part needs).
+pub fn decode_regions(path: &Path, regions: &[[f32; 4]], edge: u32) -> Option<Vec<RgbImage>> {
+    let (iw, ih) = upright_dimensions(path)?;
+    let span = regions.iter().map(|&[_, _, w, h]| (w * iw as f32).max(h * ih as f32)).fold(f32::INFINITY, f32::min).max(1.0);
+    // The whole picture's longest edge at which the smallest part is `edge` across.
+    let long = ((iw.max(ih) as f32) * (edge as f32 / span).min(1.0)).ceil() as u32 + 1;
+    let image = decode(path, long)?;
+    let (dw, dh) = image.dimensions();
+    let px = |f: f32, n: u32| ((f.clamp(0.0, 1.0) * n as f32) as u32).min(n - 1);
+    let parts = regions.iter().map(|&[x, y, w, h]| {
+        let (left, top) = (px(x, dw), px(y, dh));
+        let width = ((w.max(0.0) * dw as f32).round() as u32).clamp(1, dw - left);
+        let height = ((h.max(0.0) * dh as f32).round() as u32).clamp(1, dh - top);
+        let part = image::imageops::crop_imm(&image, left, top, width, height).to_image();
+        resize_to(&part, Bound::Fit(edge))
+    });
+    Some(parts.collect())
 }
 
 /// The stored size of the image at `path` (before EXIF orientation: the longest edge is
@@ -67,23 +137,28 @@ pub fn decode_full(path: &Path, max_pixels: u64) -> Option<RgbImage> {
 
 /// [`decode`] of a file already read into memory (by an I/O thread).
 pub fn decode_bytes(bytes: &[u8], edge: u32) -> Option<RgbImage> {
-    decode_from(Cursor::new(bytes), edge)
+    decode_bytes_to(bytes, Bound::Fit(edge))
 }
 
-fn decode_from(mut file: impl BufRead + Seek, edge: u32) -> Option<RgbImage> {
+/// [`decode_to`] of a file already read into memory.
+pub fn decode_bytes_to(bytes: &[u8], bound: Bound) -> Option<RgbImage> {
+    decode_from(Cursor::new(bytes), bound)
+}
+
+fn decode_from(mut file: impl BufRead + Seek, bound: Bound) -> Option<RgbImage> {
     let format = image::guess_format(file.fill_buf().ok()?).ok();
     // Decoders are fed untrusted files; a panic must not take the worker thread down.
     panic::catch_unwind(AssertUnwindSafe(|| {
         let (image, orientation) = match format {
-            Some(ImageFormat::Jpeg) => jpeg(&mut file, edge),
-            Some(ImageFormat::Tiff) => tiff(&mut file, edge),
+            Some(ImageFormat::Jpeg) => jpeg(&mut file, bound),
+            Some(ImageFormat::Tiff) => tiff(&mut file, bound),
             _ => None,
         }
         .or_else(|| {
             file.rewind().ok()?;
             any_format(&mut file)
         })?;
-        Some(upright(fit(&image, edge), orientation))
+        Some(upright(resize_to(&image, bound), orientation))
     }))
     .ok()
     .flatten()
@@ -154,14 +229,18 @@ pub fn write_tiff_with_reduced_page(path: &Path, image: &RgbImage) -> tiff::Tiff
 
 /// Scales down to fit `edge` on the longest side, keeping the aspect ratio.
 pub fn fit(image: &RgbImage, edge: u32) -> RgbImage {
+    resize_to(image, Bound::Fit(edge))
+}
+
+/// Scales down to `bound`, keeping the aspect ratio (a copy if it is that small already).
+pub fn resize_to(image: &RgbImage, bound: Bound) -> RgbImage {
     let (w, h) = image.dimensions();
-    if w.max(h) <= edge {
+    let (tw, th) = bound.size(w, h);
+    if (tw, th) == (w, h) {
         return image.clone();
     }
-    let scale = edge as f64 / w.max(h) as f64;
-    let size = |n: u32| ((n as f64 * scale).round() as u32).max(1);
-    let mut out = RgbImage::new(size(w), size(h));
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    let mut out = RgbImage::new(tw, th);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom));
     match Resizer::new().resize(image, &mut out, &options) {
         Ok(()) => out,
         Err(_) => image::imageops::thumbnail(image, out.width(), out.height()),
@@ -184,12 +263,16 @@ fn any_format(reader: impl BufRead + Seek) -> Option<(RgbImage, Orientation)> {
     Some((DynamicImage::from_decoder(decoder).ok()?.into_rgb8(), orientation))
 }
 
-/// Decodes at the smallest IDCT scale (1/8, 1/4, 1/2, 1) whose longest edge is still ≥ `edge`.
-fn jpeg(reader: impl Read, edge: u32) -> Option<(RgbImage, Orientation)> {
+/// Decodes at the smallest IDCT scale (1/8, 1/4, 1/2, 1) still as large as `bound` wants.
+fn jpeg(reader: impl Read, bound: Bound) -> Option<(RgbImage, Orientation)> {
     let mut decoder = jpeg_decoder::Decoder::new(reader);
-    let edge = edge.min(u16::MAX.into()) as u16;
-    // Satisfied when either axis reaches `edge`, i.e. the longest one does.
-    decoder.scale(edge, edge).ok()?;
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    let (w, h) = (u32::from(info.width), u32::from(info.height));
+    let (tw, th) = bound.size(w, h);
+    let at_most = |n: u32| n.min(u16::MAX.into()) as u16;
+    // Satisfied when either axis reaches what is asked: ask only along the longest one.
+    if w >= h { decoder.scale(at_most(tw), u16::MAX) } else { decoder.scale(u16::MAX, at_most(th)) }.ok()?;
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
     let image = RgbImage::from_raw(info.width.into(), info.height.into(), jpeg_rgb(pixels, info.pixel_format)?)?;
@@ -220,11 +303,12 @@ enum Page {
     Sub(IfdPointer),
 }
 
-/// Decodes the smallest reduced-resolution page whose longest edge is still ≥ `edge`, else
-/// the full image. `None` for layouts [`tiff_rgb`] doesn't convert, to fall back to `image`.
-fn tiff<R: Read + Seek>(reader: &mut R, edge: u32) -> Option<(RgbImage, Orientation)> {
+/// Decodes the smallest reduced-resolution page still as large as `bound` wants, else the
+/// full image. `None` for layouts [`tiff_rgb`] doesn't convert, to fall back to `image`.
+fn tiff<R: Read + Seek>(reader: &mut R, bound: Bound) -> Option<(RgbImage, Orientation)> {
     let mut decoder = TiffDecoder::new(&mut *reader).ok()?;
     let (w, h) = decoder.dimensions().ok()?;
+    let edge = bound.long_edge(w, h);
     let orientation = decoder.find_tag_unsigned::<u8>(Tag::Orientation).ok().flatten().and_then(Orientation::from_exif);
 
     let mut pages = Vec::new();
@@ -494,7 +578,7 @@ mod tests {
             ((300, 200), (300, 200), (300, 200)),   // never upscaled
         ] {
             let bytes = jpeg_bytes(&halves(w, h, RED, BLUE));
-            let (image, _) = jpeg(&bytes[..], 384).unwrap();
+            let (image, _) = jpeg(&bytes[..], Bound::Fit(384)).unwrap();
             assert_eq!(image.dimensions(), scaled, "{w}x{h}");
 
             let dir = tempfile::tempdir().unwrap();
@@ -502,6 +586,55 @@ mod tests {
             assert_eq!(thumb_image.dimensions(), thumb, "{w}x{h}");
             assert!(near(*thumb_image.get_pixel(thumb.0 / 2, 2), RED) && near(*thumb_image.get_pixel(thumb.0 / 2, thumb.1 - 3), BLUE));
         }
+    }
+
+    #[test]
+    fn bounds_fit_or_cover_and_never_upscale() {
+        assert_eq!(Bound::Fit(384).size(4000, 3000), (384, 288));
+        assert_eq!(Bound::Cover(384).size(4000, 3000), (512, 384));
+        assert_eq!(Bound::Cover(384).size(3000, 4000), (384, 512));
+        // A 20:9 phone panorama fills a square tile at its height, not its width.
+        assert_eq!(Bound::Fit(384).size(4000, 1800), (384, 173));
+        assert_eq!(Bound::Cover(384).size(4000, 1800), (853, 384));
+        // Wider than MAX_COVER_ASPECT: the length is capped, the height gives way.
+        assert_eq!(Bound::Cover(100).size(8000, 1000), (300, 38));
+        assert_eq!(Bound::Cover(384).size(300, 200), (300, 200));
+        assert_eq!(Bound::Fit(384).size(300, 200), (300, 200));
+        assert_eq!(Bound::Cover(10).size(1, 1000), (1, 30));
+    }
+
+    #[test]
+    fn jpeg_cover_decodes_large_enough_for_the_short_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = jpeg_bytes(&halves(4000, 1800, RED, BLUE));
+        // The longest edge alone would take 1/8 (500×225): too short to fill 384.
+        let (scaled, _) = jpeg(&bytes[..], Bound::Cover(384)).unwrap();
+        assert_eq!(scaled.dimensions(), (1000, 450));
+        let thumb = decode_to(&write(dir.path(), "pano.jpg", &bytes), Bound::Cover(384)).unwrap();
+        assert_eq!(thumb.dimensions(), (853, 384));
+        assert!(near(*thumb.get_pixel(400, 3), RED) && near(*thumb.get_pixel(400, 380), BLUE));
+        assert_eq!(decode_bytes_to(&bytes, Bound::Cover(384)).unwrap().dimensions(), (853, 384));
+    }
+
+    #[test]
+    fn region_is_decoded_as_large_as_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Red left half, blue right half, 4000×3000.
+        let image = RgbImage::from_fn(4000, 3000, |x, _| if x < 2000 { RED } else { BLUE });
+        let path = write(dir.path(), "a.jpg", &jpeg_bytes(&image));
+        // A 400×400 square in the middle of the right half, wanted 240 across.
+        let part = decode_region(&path, [0.65, 0.4333, 0.1, 0.1333], 240).unwrap();
+        assert_eq!(part.dimensions(), (240, 240));
+        assert!(part.pixels().all(|&p| near(p, BLUE)));
+        // Straddling the halves; larger than the file has: never upscaled.
+        let part = decode_region(&path, [0.45, 0.0, 0.1, 0.1333], 1000).unwrap();
+        assert_eq!(part.dimensions(), (400, 400));
+        assert!(near(*part.get_pixel(5, 200), RED) && near(*part.get_pixel(394, 200), BLUE));
+        assert!(decode_region(&dir.path().join("missing.jpg"), [0.0, 0.0, 1.0, 1.0], 100).is_none());
+        // Two at once: decoded for the smaller, each fitted to the edge.
+        let parts = decode_regions(&path, &[[0.0, 0.0, 0.375, 0.5], [0.65, 0.4333, 0.1, 0.1333]], 240).unwrap();
+        assert_eq!(parts.iter().map(|p| p.dimensions()).collect::<Vec<_>>(), vec![(240, 240), (240, 240)]);
+        assert!(near(*parts[0].get_pixel(120, 120), RED) && near(*parts[1].get_pixel(120, 120), BLUE));
     }
 
     #[test]
@@ -552,14 +685,14 @@ mod tests {
 
         // Adobe CMYK (as Photoshop / PIL write it): left 100% M+Y = red, right 50% K = gray.
         let bytes = include_bytes!("testdata/cmyk.jpg");
-        let (cmyk, _) = jpeg(&bytes[..], 384).expect("CMYK via jpeg-decoder");
+        let (cmyk, _) = jpeg(&bytes[..], Bound::Fit(384)).expect("CMYK via jpeg-decoder");
         assert!(near(*cmyk.get_pixel(5, 16), Rgb([255, 0, 0])), "{:?}", cmyk.get_pixel(5, 16));
         assert!(near(*cmyk.get_pixel(58, 16), Rgb([127; 3])), "{:?}", cmyk.get_pixel(58, 16));
         let (zune, _) = any_format(Cursor::new(bytes)).unwrap();
         assert!(near(*cmyk.get_pixel(5, 16), *zune.get_pixel(5, 16)) && near(*cmyk.get_pixel(58, 16), *zune.get_pixel(58, 16)));
 
         let bytes = include_bytes!("testdata/progressive.jpg");
-        let (scaled, _) = jpeg(&bytes[..], 384).expect("progressive");
+        let (scaled, _) = jpeg(&bytes[..], Bound::Fit(384)).expect("progressive");
         assert_eq!(scaled.dimensions(), (400, 300), "1/4 scale");
         let thumb = decode(&write(dir.path(), "p.jpg", bytes), 384).unwrap();
         assert_eq!(thumb.dimensions(), (384, 288));
@@ -633,20 +766,20 @@ mod tests {
             let path = dir.path().join(name);
             write(&path);
             let bytes = std::fs::read(&path).unwrap();
-            let (reduced, _) = tiff(&mut Cursor::new(&bytes), 384).expect(name);
+            let (reduced, _) = tiff(&mut Cursor::new(&bytes), Bound::Fit(384)).expect(name);
             assert_eq!(reduced.dimensions(), page, "{name}");
             let thumb = decode(&path, 384).unwrap();
             assert_eq!(thumb.dimensions(), (384, 256));
             let wanted = if name == "chained.tif" { GREEN } else { BLUE };
             assert!(near(*thumb.get_pixel(192, 128), wanted), "{name}: {:?}", thumb.get_pixel(192, 128));
-            assert_eq!(tiff(&mut Cursor::new(&bytes), 1600).unwrap().0.dimensions(), (2400, 1600), "{name}: no page covers 1600 px");
+            assert_eq!(tiff(&mut Cursor::new(&bytes), Bound::Fit(1600)).unwrap().0.dimensions(), (2400, 1600), "{name}: no page covers 1600 px");
             assert_eq!(any_format(Cursor::new(&bytes)).unwrap().0.dimensions(), (2400, 1600), "{name}: others see page 0");
         }
 
         // Single-page TIFF: full decode.
         let plain = dir.path().join("plain.tif");
         RgbImage::from_pixel(1200, 800, RED).save(&plain).unwrap();
-        assert_eq!(tiff(&mut Cursor::new(std::fs::read(&plain).unwrap()), 384).unwrap().0.dimensions(), (1200, 800));
+        assert_eq!(tiff(&mut Cursor::new(std::fs::read(&plain).unwrap()), Bound::Fit(384)).unwrap().0.dimensions(), (1200, 800));
         assert_eq!(decode(&plain, 384).unwrap().dimensions(), (384, 256));
     }
 
@@ -657,7 +790,7 @@ mod tests {
         let scan = halves(2000, 3000, RED, BLUE);
         write_tiff_with_reduced_page(&path, &scan).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(tiff(&mut Cursor::new(&bytes), 384).unwrap().0.dimensions(), (683, 1024));
+        assert_eq!(tiff(&mut Cursor::new(&bytes), Bound::Fit(384)).unwrap().0.dimensions(), (683, 1024));
         assert_eq!(any_format(Cursor::new(&bytes)).unwrap().0, scan, "page 0 is the lossless full scan");
         let thumb = decode(&path, 384).unwrap();
         assert_eq!(thumb.dimensions(), (256, 384));

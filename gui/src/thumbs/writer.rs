@@ -1,5 +1,5 @@
 //! Persists freshly decoded thumbnails off the decode path: one low-priority thread
-//! JPEG-encodes both tiers, fills the compressed LRU and writes SQLite in batched
+//! JPEG-encodes their tiers, fills the compressed LRU and writes SQLite in batched
 //! transactions. Decoders hand over with [`Writer::submit`], which never blocks: when the
 //! bounded queue is full the write is dropped (the file is just decoded again next time).
 
@@ -13,20 +13,25 @@ use image::RgbImage;
 use super::cache::{self, DiskCache, DiskConn, Fingerprint};
 use super::{Compressed, Tier};
 
-/// Rows per SQLite transaction (each file is two rows).
+/// Files per SQLite transaction (each file is a row per tier, usually two).
 const BATCH: usize = 16;
 
-/// Both tiers of one decoded file, and its average color.
+/// The tiers made of one decoded file, and its average color.
 pub struct Produced {
     pub fingerprint: Fingerprint,
-    pub large: RgbImage,
-    pub small: RgbImage,
+    pub tiers: Vec<(Tier, RgbImage)>,
     pub color: [u8; 3],
 }
 
 impl Produced {
-    fn tier(&self, tier: Tier) -> &RgbImage {
-        if tier == Tier::Large { &self.large } else { &self.small }
+    /// `image` at `tier`, and the [`Tier::BASE`] stand-in made from it if that is smaller.
+    pub fn new(fingerprint: Fingerprint, image: RgbImage, tier: Tier, color: [u8; 3]) -> Self {
+        let base = (tier > Tier::BASE).then(|| (Tier::BASE, super::decode::resize_to(&image, Tier::BASE.bound())));
+        Self { fingerprint, tiers: std::iter::once((tier, image)).chain(base).collect(), color }
+    }
+
+    fn tier(&self, tier: Tier) -> Option<&RgbImage> {
+        self.tiers.iter().find(|(t, _)| *t == tier).map(|(_, image)| image)
     }
 }
 
@@ -44,9 +49,9 @@ pub fn unpack(color: u32) -> [u8; 3] {
 pub fn store(disk: Option<&mut DiskConn>, compressed: &Compressed, items: &[Produced]) -> bool {
     let mut rows: Vec<(i64, Arc<[u8]>, u32)> = Vec::with_capacity(items.len() * 2);
     for item in items {
-        for tier in [Tier::Large, Tier::Small] {
-            if let Some(jpeg) = cache::encode(item.tier(tier)) {
-                rows.push((item.fingerprint.key(tier), jpeg.into(), pack(item.color)));
+        for (tier, image) in &item.tiers {
+            if let Some(jpeg) = cache::encode(image) {
+                rows.push((item.fingerprint.key(*tier), jpeg.into(), pack(item.color)));
             }
         }
     }
@@ -139,8 +144,7 @@ impl Writer {
     pub fn lookup(&self, fingerprint: Fingerprint, tier: Tier) -> Option<(RgbImage, [u8; 3])> {
         let key = fingerprint.key(tier);
         let state = self.shared.state.lock().unwrap();
-        let item = state.queue.iter().find(|p| p.fingerprint.key(tier) == key)?;
-        Some((item.tier(tier).clone(), item.color))
+        state.queue.iter().filter(|p| p.fingerprint.key(tier) == key).find_map(|p| Some((p.tier(tier)?.clone(), p.color)))
     }
 
     /// Waits up to `timeout` for everything queued so far to be written.

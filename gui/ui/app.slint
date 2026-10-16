@@ -116,6 +116,9 @@ export component AppWindow inherits Window {
             }
         }
     }
+    // Physical pixels per logical one, e.g. 2 on a HiDPI screen.
+    property <float> scale-factor: 1px / 1phx;
+    changed scale-factor => { NavBridge.scale-changed(self.scale-factor); }
     property <int> menu-serial: ItemMenu.serial;
     changed menu-serial => {
         UiLog.debug("window.menu", "context menu shown at \{ItemMenu.x / 1px},\{ItemMenu.y / 1px} (serial \{self.menu-serial})");

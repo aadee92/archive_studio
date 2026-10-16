@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     fn keys(ids: impl IntoIterator<Item = u32>) -> Vec<Key> {
-        ids.into_iter().map(|id| (id, Tier::Small)).collect()
+        ids.into_iter().map(|id| (id, Tier::BASE)).collect()
     }
 
     fn drain_cpu(s: &mut Sched<u32>) -> Vec<u32> {

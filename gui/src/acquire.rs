@@ -19,10 +19,9 @@ use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer
 
 use archive_core::device::{CaptureDevice, DeviceEvent, EventSink, Frame, RECENT};
 use archive_core::devices;
-use archive_core::image::DynamicImage;
 
 use crate::pipeline::Handle;
-use crate::thumbs::{self, Tier};
+use crate::thumbs;
 use crate::nav::{self, Scope, Target};
 use crate::{AcquireBridge, AppWindow, DeviceState, DeviceTile};
 
@@ -220,8 +219,7 @@ impl Acquire {
                     log::info!("device {row}: saved {}", path.display());
                     // Seeds the review grid from memory, so it never decodes the file.
                     if let Some(image) = image {
-                        let large = thumbs::fit(&image, Tier::Large.edge());
-                        thumbs::store_for_new_file(&path, &DynamicImage::ImageRgb8(large));
+                        thumbs::store_for_new_file(&path, &image);
                     }
                     // After seeding, so the grid finds the thumbnail when the file arrives.
                     pipeline.saved(&path);

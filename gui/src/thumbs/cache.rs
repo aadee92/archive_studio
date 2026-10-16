@@ -4,6 +4,9 @@
 //! Entries are keyed by [`Fingerprint::key`], a hash of (canonical path, size, mtime, tier), so an
 //! edited file simply misses and its stale thumbnail is never served. Nothing is ever
 //! invalidated in place; old rows are just never read again.
+//!
+//! The database's `user_version` is [`VERSION`]: one written with other tiers (version 0
+//! sized them by their longest edge) is emptied when opened.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -18,6 +21,8 @@ use rusqlite::{Connection, OptionalExtension};
 use super::Tier;
 
 const JPEG_QUALITY: u8 = 85;
+/// What thumbnails are stored: 2 since tiers are sized by the shortest edge (`Bound::Cover`).
+const VERSION: i64 = 2;
 
 /// Identifies one version of a file: (canonical path, size, mtime).
 #[derive(Clone, Copy)]
@@ -35,7 +40,7 @@ impl Fingerprint {
 
     /// Cache key of this file's thumbnail at `tier`.
     pub fn key(self, tier: Tier) -> i64 {
-        fnv1a(self.0, &tier.edge().to_le_bytes()) as i64
+        fnv1a(fnv1a(self.0, &tier.edge().to_le_bytes()), &VERSION.to_le_bytes()) as i64
     }
 }
 
@@ -84,16 +89,16 @@ impl DiskCache {
         }
         let conn = Connection::open(path).ok()?;
         conn.pragma_update(None, "journal_mode", "WAL").ok()?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).ok()?;
+        if version != VERSION {
+            // Older thumbnails are another size than their tier says: dropped at once (a
+            // DROP frees the pages without reading them), the file keeps its size.
+            log::info!("thumbnail cache {}: version {version}, emptied for version {VERSION}", path.display());
+            conn.execute_batch("DROP TABLE IF EXISTS thumbs;").ok()?;
+            conn.pragma_update(None, "user_version", VERSION).ok()?;
+        }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS thumbs (key INTEGER PRIMARY KEY, jpeg BLOB NOT NULL, color INTEGER);")
             .ok()?;
-        // Databases from before the `color` column (0xRRGGBB average, NULL if unknown).
-        let has_color = conn
-            .prepare("SELECT 1 FROM pragma_table_info('thumbs') WHERE name = 'color'")
-            .and_then(|mut stmt| stmt.exists([]))
-            .ok()?;
-        if !has_color {
-            conn.execute_batch("ALTER TABLE thumbs ADD COLUMN color INTEGER;").ok()?;
-        }
         // Reads a page, to catch a database that isn't one; `count(*)` would scan every
         // thumbnail, on the UI thread at startup.
         conn.query_row("SELECT 1 FROM thumbs LIMIT 1", [], |_| Ok(())).optional().ok()?;
@@ -198,7 +203,7 @@ impl<K: Hash + Eq + Copy, V: Clone> Lru<K, V> {
         self.bytes
     }
 
-    #[cfg(test)]
+    /// Whether `key` is present, without marking it used.
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }

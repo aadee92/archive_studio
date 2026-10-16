@@ -18,8 +18,11 @@
 //!   read); everything else is read whole and decoded on a CPU worker.
 //! - A JPEG's embedded EXIF thumbnail is delivered as soon as its first bytes are read, and
 //!   every thumbnail's average color is kept (and persisted), so tiles never sit empty.
-//! - Two size [`Tier`]s; a source-file decode produces and persists both (on the writer
-//!   thread, after delivery), so zooming never re-decodes.
+//! - Size [`Tier`]s by the shortest edge, so a thumbnail fills its square tile without being
+//!   upscaled; the grid asks for the quick [`Tier::BASE`] while it scrolls and for the
+//!   tile's own tier once it rests. A source-file decode persists the tier asked for and
+//!   `BASE` (on the writer thread, after delivery); a tier missing on disk is made from a
+//!   larger one there before the file is decoded.
 //! - Pixels cross threads as `SharedPixelBuffer`; the `slint::Image` (not `Send`)
 //!   is created on the UI thread.
 
@@ -29,7 +32,7 @@ pub mod sched;
 mod writer;
 
 #[allow(unused_imports)] // used by capture backends
-pub use decode::{decode, decode_full, decode_preview, dimensions, fit, upright_dimensions, write_tiff_with_reduced_page};
+pub use decode::{decode, decode_full, decode_preview, decode_regions, dimensions, fit, upright_dimensions, write_tiff_with_reduced_page, Bound};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -40,7 +43,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use image::{DynamicImage, RgbImage};
+use image::RgbImage;
 use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 
 use archive_core::media::MediaKind;
@@ -69,31 +72,46 @@ const MAX_READ_BYTES: u64 = 256 << 20;
 /// How long app exit waits for queued thumbnail writes.
 const EXIT_FLUSH: Duration = Duration::from_secs(2);
 
-/// Thumbnail size class, by longest edge in physical pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Tier {
-    Small,
-    Large,
-}
+/// Thumbnail size class: the shortest edge in physical pixels (see [`Bound::Cover`]), so a
+/// thumbnail fills a square tile that size, whatever its shape, without being upscaled.
+/// Steps of at most 1.33×, so the renderer never shrinks one much (shrinking a texture
+/// several times over aliases).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Tier(u8);
+
+const EDGES: [u32; 10] = [128, 160, 192, 256, 320, 384, 512, 640, 768, 1024];
 
 impl Tier {
+    /// Stored with every decode at another tier, and asked for while the view scrolls: a
+    /// quick stand-in until the view rests.
+    pub const BASE: Tier = Tier(1);
+    /// Large enough to stand in for a picture on Details until it is decoded.
+    pub const STAND_IN: Tier = Tier(5);
+
     pub const fn edge(self) -> u32 {
-        match self {
-            Self::Small => 192,
-            Self::Large => 384,
-        }
+        EDGES[self.0 as usize]
     }
 
-    /// The smallest tier covering a tile `px` physical pixels wide.
-    pub fn for_tile(px: f32) -> Self {
-        if px <= Self::Small.edge() as f32 { Self::Small } else { Self::Large }
+    /// The smallest tier covering a square tile `px` physical pixels wide (the largest one
+    /// for larger tiles).
+    pub fn cover(px: f32) -> Self {
+        let i = EDGES.iter().position(|&edge| edge as f32 >= px.ceil()).unwrap_or(EDGES.len() - 1);
+        Self(i as u8)
     }
 
-    fn other(self) -> Self {
-        match self {
-            Self::Small => Self::Large,
-            Self::Large => Self::Small,
-        }
+    /// The size a thumbnail at this tier is decoded to.
+    pub fn bound(self) -> Bound {
+        Bound::Cover(self.edge())
+    }
+
+    /// Every tier, smallest first.
+    pub fn all() -> impl DoubleEndedIterator<Item = Tier> {
+        (0..EDGES.len() as u8).map(Tier)
+    }
+
+    /// The next larger tier.
+    fn up(self) -> Option<Tier> {
+        ((self.0 as usize) + 1 < EDGES.len()).then(|| Tier(self.0 + 1))
     }
 }
 
@@ -233,14 +251,33 @@ impl ThumbCache {
         }
     }
 
-    /// The thumbnail at `tier`, else the other tier or the EXIF preview as a stand-in
-    /// (`exact == false`) so zooming and cold loads don't show empty tiles.
+    /// The thumbnail for a tile wanting `tier` (`exact`: at that tier or the next, sharp
+    /// enough without being much too large), else the sharpest held at another tier or the EXIF preview as a stand-in
+    /// (`exact == false`), so scrolling, resizing and cold loads don't show empty tiles.
     pub fn get(&self, id: u32, tier: Tier) -> Option<(Image, bool)> {
         let mut images = self.images.borrow_mut();
-        if let Some(image) = images.get(&(id, tier)) {
+        if let Some(image) = images.get(&(id, tier)).or_else(|| tier.up().and_then(|up| images.get(&(id, up)))) {
             return Some((image, true));
         }
-        images.get(&(id, tier.other())).or_else(|| self.previews.borrow_mut().get(&id)).map(|image| (image, false))
+        drop(images);
+        self.best(id).map(|image| (image, false))
+    }
+
+    /// The sharpest thumbnail of `id` held at any tier, else its EXIF preview.
+    pub fn best(&self, id: u32) -> Option<Image> {
+        let mut images = self.images.borrow_mut();
+        Tier::all().rev().find_map(|t| images.get(&(id, t))).or_else(|| self.previews.borrow_mut().get(&id))
+    }
+
+    /// Whether a thumbnail of `id` is held at any tier (EXIF previews aside).
+    pub fn has_any(&self, id: u32) -> bool {
+        let images = self.images.borrow();
+        Tier::all().any(|t| images.contains(&(id, t)))
+    }
+
+    /// Whether `id` has no thumbnail to be had (its decode failed).
+    pub fn failed(&self, id: u32) -> bool {
+        self.failed.borrow().contains(&id)
     }
 
     /// The average color of `id`'s thumbnail, once any version of it has been seen.
@@ -248,13 +285,19 @@ impl ThumbCache {
         self.colors.borrow().get(&id).copied()
     }
 
-    /// Makes `wanted` (best first) the set of thumbnails to load: those not cached yet are
-    /// queued in that order, and queued work for anything else is cancelled.
-    /// `source` gives the file behind an id.
+    /// Makes `wanted` (best first) the set of thumbnails to load: those not held yet (at
+    /// that tier or the next) are queued in that order, and queued work for anything else
+    /// is cancelled. `source` gives the file behind an id.
     pub fn schedule(&self, wanted: impl IntoIterator<Item = Key>, mut source: impl FnMut(u32) -> Option<(PathBuf, MediaKind)>) {
+        let wanted: Vec<Key> = wanted.into_iter().collect(); // may look at the cache itself
         let wanted: Vec<Key> = {
             let (mut images, failed) = (self.images.borrow_mut(), self.failed.borrow());
-            wanted.into_iter().filter(|&(id, tier)| !failed.contains(&id) && !images.touch(&(id, tier))).collect()
+            wanted
+                .into_iter()
+                .filter(|&(id, tier)| {
+                    !failed.contains(&id) && !images.touch(&(id, tier)) && !tier.up().is_some_and(|up| images.touch(&(id, up)))
+                })
+                .collect()
         };
         self.pipeline.sched.lock().unwrap().schedule(wanted, |(id, tier)| {
             let (path, kind) = source(id)?;
@@ -264,7 +307,9 @@ impl ThumbCache {
         self.pipeline.io.notify_all();
     }
 
-    /// Takes a worker's result; returns whether the tile's appearance changed.
+    /// Takes a worker's result; returns whether the tile's appearance changed. A thumbnail
+    /// replaces the preview and the smaller tiers held of it (the larger ones stay, for
+    /// the LRU to drop: a tile grown back finds them).
     pub fn complete(&self, id: u32, tier: Tier, delivery: Delivery) -> bool {
         match delivery {
             Delivery::Thumb(pixels, color) => {
@@ -272,13 +317,16 @@ impl ThumbCache {
                 self.colors.borrow_mut().insert(id, color);
                 self.previews.borrow_mut().remove(&id);
                 let bytes = pixels.width() as usize * pixels.height() as usize * 3;
-                self.images.borrow_mut().insert((id, tier), Image::from_rgb8(pixels), bytes);
+                let mut images = self.images.borrow_mut();
+                for smaller in Tier::all().take_while(|&t| t < tier) {
+                    images.remove(&(id, smaller));
+                }
+                images.insert((id, tier), Image::from_rgb8(pixels), bytes);
                 true
             }
             Delivery::Preview(pixels, color) => {
                 self.colors.borrow_mut().entry(id).or_insert(color);
-                let mut images = self.images.borrow_mut();
-                if images.touch(&(id, Tier::Small)) || images.touch(&(id, Tier::Large)) {
+                if self.has_any(id) {
                     return false;
                 }
                 let bytes = pixels.width() as usize * pixels.height() as usize * 3;
@@ -293,14 +341,15 @@ impl ThumbCache {
         }
     }
 
-    /// Forgets everything held for `id` (both tiers, preview, color, a failed decode), e.g.
+    /// Forgets everything held for `id` (every tier, preview, color, a failed decode), e.g.
     /// because its file changed: the next [`schedule`](Self::schedule) of it loads it anew.
     /// The persistent layers need no invalidation: they are keyed by the file's size and
     /// mtime, so a rewritten file misses there.
     pub fn invalidate(&self, id: u32) {
         let mut images = self.images.borrow_mut();
-        images.remove(&(id, Tier::Small));
-        images.remove(&(id, Tier::Large));
+        for tier in Tier::all() {
+            images.remove(&(id, tier));
+        }
         self.previews.borrow_mut().remove(&id);
         self.colors.borrow_mut().remove(&id);
         self.failed.borrow_mut().remove(&id);
@@ -353,17 +402,20 @@ impl Ctx {
         (self.on_ready)(job.id, job.tier, Delivery::Thumb(pixels(image), color));
     }
 
-    /// Delivers the requested tier of a fresh source decode, then hands both tiers to the writer.
-    fn produce(&self, job: &Job, fingerprint: Option<Fingerprint>, large: Option<RgbImage>) {
-        let Some(large) = large else {
+    /// Delivers a fresh decode at the requested tier, then hands it (and the [`Tier::BASE`]
+    /// stand-in made from it) to the writer.
+    fn produce(&self, job: &Job, fingerprint: Option<Fingerprint>, image: Option<RgbImage>) {
+        let Some(image) = image else {
             (self.on_ready)(job.id, job.tier, Delivery::Failed);
             return;
         };
-        let small = decode::fit(&large, Tier::Small.edge());
-        let color = decode::average_color(&small);
-        self.deliver(job, if job.tier == Tier::Large { &large } else { &small }, color);
+        let base = (job.tier > Tier::BASE).then(|| decode::resize_to(&image, Tier::BASE.bound()));
+        let color = decode::average_color(base.as_ref().unwrap_or(&image));
+        self.deliver(job, &image, color);
         if let Some(fingerprint) = fingerprint {
-            self.writer.submit(Produced { fingerprint, large, small, color });
+            let mut tiers = vec![(job.tier, image)];
+            tiers.extend(base.map(|base| (Tier::BASE, base)));
+            self.writer.submit(Produced { fingerprint, tiers, color });
         }
     }
 
@@ -373,7 +425,7 @@ impl Ctx {
             let job = &work.job;
             if let Some(bytes) = work.bytes.take() {
                 self.pipeline.io.notify_one(); // room for more read-ahead
-                self.produce(job, work.fingerprint, decode::decode_bytes(&bytes, job.kind, Tier::Large.edge()));
+                self.produce(job, work.fingerprint, decode::decode_bytes(&bytes, job.kind, job.tier.bound()));
                 continue;
             }
             if job.kind != MediaKind::Image {
@@ -385,6 +437,14 @@ impl Ctx {
             let hit = work.fingerprint.and_then(|f| loader.cached(f, job.tier).or_else(|| self.writer.lookup(f, job.tier)));
             if let Some((image, color)) = hit {
                 self.deliver(job, &image, color);
+                continue;
+            }
+            // A larger tier on disk (the tiles were larger once) is quicker than the file.
+            let larger = work.fingerprint.and_then(|f| Some((f, loader.cached_larger(f, job.tier)?)));
+            if let Some((fingerprint, (image, color))) = larger {
+                let image = decode::resize_to(&image, job.tier.bound());
+                self.deliver(job, &image, color);
+                self.writer.submit(Produced { fingerprint, tiers: vec![(job.tier, image)], color });
             } else if self.pipeline.sched.lock().unwrap().miss(key, work) {
                 self.pipeline.io.notify_one();
             }
@@ -411,7 +471,7 @@ impl Ctx {
     fn read_source(&self, job: &Job) -> Result<Vec<u8>, Option<RgbImage>> {
         let mut file = File::open(&job.path).map_err(|_| None)?;
         let len = file.metadata().map_or(0, |m| m.len());
-        let stream = || decode::decode(&job.path, job.kind, Tier::Large.edge());
+        let stream = || decode::decode(&job.path, job.kind, job.tier.bound());
         if len > MAX_READ_BYTES {
             return Err(stream());
         }
@@ -438,51 +498,77 @@ fn pixels(image: &RgbImage) -> Pixels {
 /// decodes the file. Call after `path` is fully written and closed: the cache key
 /// includes its size and mtime. Returns whether the thumbnails were stored.
 #[allow(dead_code)] // called by real capture backends
-pub fn store_for_new_file(path: &Path, image: &DynamicImage) -> bool {
+pub fn store_for_new_file(path: &Path, image: &RgbImage) -> bool {
     let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
     disk.is_some_and(|disk| store_in(&disk, path, image))
 }
 
-/// A small-tier thumbnail of the image at `path`, for a capture backend's strip of recent
-/// captures: from the disk cache when it's there, else decoded (and not stored).
+/// A [`Tier::BASE`] thumbnail of the image at `path`, for a capture backend's strip of
+/// recent captures: see [`for_files`].
 pub fn small_for_file(path: &Path) -> Option<RgbImage> {
     let mut image = None;
-    small_for_files(std::slice::from_ref(&path), |_, small| {
+    for_files(std::slice::from_ref(&path), Tier::BASE, Accept::Sharp, |_, small| {
         image = small;
         false
     });
     image
 }
 
-/// [`small_for_file`] for a run of images, with one disk cache connection: calls `each`
-/// with every path's index and thumbnail in turn, until it returns false.
-pub fn small_for_files<P: AsRef<Path>>(paths: &[P], each: impl FnMut(usize, Option<RgbImage>) -> bool) {
-    for_files(paths, Tier::Small, each);
+/// What [`for_files`] takes from the disk cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Accept {
+    /// The tier asked for, or made from a larger one.
+    Sharp,
+    /// That, else a smaller one as it is: a quick stand-in.
+    Any,
 }
 
-/// [`small_for_files`] at any tier.
-pub fn for_files<P: AsRef<Path>>(paths: &[P], tier: Tier, mut each: impl FnMut(usize, Option<RgbImage>) -> bool) {
+/// Thumbnails of the images at `paths` at `tier`, with one disk cache connection: calls
+/// `each` with every path's index and thumbnail in turn, until it returns false. From the
+/// disk cache when it has them (as `accept` says), else decoded and stored there.
+pub fn for_files<P: AsRef<Path>>(paths: &[P], tier: Tier, accept: Accept, mut each: impl FnMut(usize, Option<RgbImage>) -> bool) {
     let disk = cache::default_db_path().and_then(|db| DiskCache::open(&db));
-    let mut loader = disk.as_ref().map(|disk| Loader::new(Some(disk), Arc::new(Mutex::new(Lru::new(1 << 20)))));
+    let compressed: Compressed = Arc::new(Mutex::new(Lru::new(1 << 20)));
+    let mut loader = Loader::new(disk.as_ref(), compressed.clone());
     for (i, path) in paths.iter().enumerate() {
         let path = path.as_ref();
-        let cached = loader.as_mut().zip(Fingerprint::of(path)).and_then(|(loader, fingerprint)| loader.cached(fingerprint, tier));
-        let image = cached.map(|(image, _)| image).or_else(|| decode::decode(path, MediaKind::Image, tier.edge()));
+        let fingerprint = Fingerprint::of(path);
+        let cached = fingerprint.and_then(|f| {
+            let hit = loader.cached(f, tier).map(|(image, _)| image);
+            let hit = hit.or_else(|| loader.cached_larger(f, tier).map(|(image, _)| decode::resize_to(&image, tier.bound())));
+            hit.or_else(|| if accept == Accept::Any { loader.cached_smaller(f, tier) } else { None })
+        });
+        let image = cached.or_else(|| {
+            let image = decode::decode(path, MediaKind::Image, tier.bound())?;
+            if let Some(fingerprint) = fingerprint {
+                let color = decode::average_color(&decode::resize_to(&image, Tier::BASE.bound()));
+                let item = Produced::new(fingerprint, image.clone(), tier, color);
+                writer::store(loader.disk.as_mut(), &compressed, &[item]);
+            }
+            Some(image)
+        });
         if !each(i, image) {
             return;
         }
     }
 }
 
-fn store_in(disk: &DiskCache, path: &Path, image: &DynamicImage) -> bool {
+/// Tiers a capture backend's scan is stored at: what a review grid of usual tile sizes asks for.
+const SEEDED: std::ops::RangeInclusive<Tier> = Tier::BASE..=Tier(6);
+
+fn store_in(disk: &DiskCache, path: &Path, image: &RgbImage) -> bool {
     let (Some(fingerprint), Some(mut conn)) = (Fingerprint::of(path), disk.connect()) else {
         return false;
     };
-    let large = decode::fit(&image.to_rgb8(), Tier::Large.edge());
-    let small = decode::fit(&large, Tier::Small.edge());
-    let color = decode::average_color(&small);
+    // Largest first, each made from the one before.
+    let mut tiers: Vec<(Tier, RgbImage)> = Vec::new();
+    for tier in Tier::all().rev().filter(|t| SEEDED.contains(t)) {
+        let from = tiers.last().map_or(image, |(_, larger)| larger);
+        tiers.push((tier, decode::resize_to(from, tier.bound())));
+    }
+    let color = decode::average_color(&tiers.last().expect("tiers are seeded").1);
     let scratch: Compressed = Arc::new(Mutex::new(Lru::new(1 << 20)));
-    writer::store(Some(&mut conn), &scratch, &[Produced { fingerprint, large, small, color }])
+    writer::store(Some(&mut conn), &scratch, &[Produced { fingerprint, tiers, color }])
 }
 
 /// Where loads were served from; read by tests and the benchmark.
@@ -533,6 +619,16 @@ impl Loader {
         Some((image, color))
     }
 
+    /// The nearest larger tier cached, to scale down instead of decoding the file.
+    fn cached_larger(&mut self, fingerprint: Fingerprint, tier: Tier) -> Option<(RgbImage, [u8; 3])> {
+        Tier::all().filter(|&t| t > tier).find_map(|t| self.cached(fingerprint, t))
+    }
+
+    /// The nearest smaller tier cached.
+    fn cached_smaller(&mut self, fingerprint: Fingerprint, tier: Tier) -> Option<RgbImage> {
+        Tier::all().rev().filter(|&t| t < tier).find_map(|t| self.cached(fingerprint, t)).map(|(image, _)| image)
+    }
+
     /// The pipeline in one call, for tests: cache lookup, else a synchronous decode whose
     /// tiers [`persist`](Self::persist) stores.
     #[cfg(test)]
@@ -541,15 +637,13 @@ impl Loader {
         if let Some((image, _)) = fingerprint.and_then(|f| self.cached(f, tier)) {
             return Some(image);
         }
-        let large = decode::decode(path, kind, Tier::Large.edge())?;
-        let small = decode::fit(&large, Tier::Small.edge());
+        let image = decode::decode(path, kind, tier.bound())?;
         self.stats.decoded += 1;
-        let out = if tier == Tier::Large { large.clone() } else { small.clone() };
         if let Some(fingerprint) = fingerprint {
-            let color = decode::average_color(&small);
-            self.unsaved.push(Produced { fingerprint, large, small, color });
+            let color = decode::average_color(&decode::resize_to(&image, Tier::BASE.bound()));
+            self.unsaved.push(Produced::new(fingerprint, image.clone(), tier, color));
         }
-        Some(out)
+        Some(image)
     }
 
     #[cfg(test)]
@@ -573,8 +667,12 @@ mod tests {
         image::RgbImage::from_pixel(w, h, image::Rgb([200, 100, 50])).save(path).unwrap();
     }
 
-    fn longest(image: &RgbImage) -> u32 {
-        image.width().max(image.height())
+    /// The tiers the tests use: the quick one, and the one a 384 px tile wants.
+    const SMALL: Tier = Tier::BASE;
+    const LARGE: Tier = Tier(5);
+
+    fn shortest(image: &RgbImage) -> u32 {
+        image.width().min(image.height())
     }
 
     #[test]
@@ -585,12 +683,12 @@ mod tests {
             let path = dir.path().join(name);
             write_image(&path, w, h);
 
-            let thumb = decode::decode(&path, MediaKind::Image, Tier::Large.edge()).expect(name);
-            assert_eq!(longest(&thumb), Tier::Large.edge(), "{name}");
+            let thumb = decode::decode(&path, MediaKind::Image, LARGE.bound()).expect(name);
+            assert_eq!(shortest(&thumb), LARGE.edge(), "{name} covers a tile that size");
             let expected_height = thumb.width() as f32 * h as f32 / w as f32;
             assert!((thumb.height() as f32 - expected_height).abs() <= 1.0, "{name} keeps aspect ratio");
         }
-        assert!(decode::decode(&dir.path().join("missing.jpg"), MediaKind::Image, 384).is_none());
+        assert!(decode::decode(&dir.path().join("missing.jpg"), MediaKind::Image, LARGE.bound()).is_none());
     }
 
     #[test]
@@ -600,17 +698,17 @@ mod tests {
         write_image(&src, 1000, 600);
 
         let mut first = loader(Some(&db));
-        let decoded = first.load(&src, MediaKind::Image, Tier::Large).unwrap();
+        let decoded = first.load(&src, MediaKind::Image, LARGE).unwrap();
         first.persist();
         assert_eq!(first.stats.decoded, 1);
-        assert_eq!(first.disk.as_ref().unwrap().len(), 2, "both tiers stored");
+        assert_eq!(first.disk.as_ref().unwrap().len(), 2, "the tier and the quick one stored");
 
         let mut second = loader(Some(&db));
-        let cached = second.load(&src, MediaKind::Image, Tier::Large).unwrap();
+        let cached = second.load(&src, MediaKind::Image, LARGE).unwrap();
         assert_eq!(cached.dimensions(), decoded.dimensions());
         assert_eq!((second.stats.disk_hits, second.stats.decoded), (1, 0));
 
-        second.load(&src, MediaKind::Image, Tier::Large).unwrap();
+        second.load(&src, MediaKind::Image, LARGE).unwrap();
         assert_eq!(second.stats.memory_hits, 1, "second hit served from the compressed LRU");
     }
 
@@ -620,17 +718,17 @@ mod tests {
         let (db, src) = (dir.path().join("thumbs.sqlite"), dir.path().join("a.png"));
         write_image(&src, 1000, 600);
         let mut l = loader(Some(&db));
-        l.load(&src, MediaKind::Image, Tier::Large).unwrap();
+        l.load(&src, MediaKind::Image, LARGE).unwrap();
         l.persist();
-        let before = Fingerprint::of(&src).unwrap().key(Tier::Large);
+        let before = Fingerprint::of(&src).unwrap().key(LARGE);
 
         write_image(&src, 600, 1000);
         let file = std::fs::File::options().write(true).open(&src).unwrap();
         file.set_modified(SystemTime::now() + Duration::from_secs(5)).unwrap();
-        assert_ne!(Fingerprint::of(&src).unwrap().key(Tier::Large), before);
+        assert_ne!(Fingerprint::of(&src).unwrap().key(LARGE), before);
 
         let mut fresh = loader(Some(&db));
-        let thumb = fresh.load(&src, MediaKind::Image, Tier::Large).unwrap();
+        let thumb = fresh.load(&src, MediaKind::Image, LARGE).unwrap();
         assert!(thumb.height() > thumb.width(), "new contents, not the cached landscape thumbnail");
         assert_eq!(fresh.stats.decoded, 1);
     }
@@ -641,18 +739,29 @@ mod tests {
         let (db, src) = (dir.path().join("thumbs.sqlite"), dir.path().join("a.jpg"));
         write_image(&src, 1200, 800);
         let f = Fingerprint::of(&src).unwrap();
-        assert_ne!(f.key(Tier::Small), f.key(Tier::Large));
+        assert_ne!(f.key(SMALL), f.key(LARGE));
 
         let mut l = loader(Some(&db));
-        assert_eq!(longest(&l.load(&src, MediaKind::Image, Tier::Small).unwrap()), 192);
+        assert_eq!(l.load(&src, MediaKind::Image, LARGE).unwrap().dimensions(), (576, 384));
         l.persist();
         let mut fresh = loader(Some(&db));
-        assert_eq!(longest(&fresh.load(&src, MediaKind::Image, Tier::Large).unwrap()), 384);
-        assert_eq!(longest(&fresh.load(&src, MediaKind::Image, Tier::Small).unwrap()), 192);
+        assert_eq!(fresh.load(&src, MediaKind::Image, LARGE).unwrap().dimensions(), (576, 384));
+        assert_eq!(fresh.load(&src, MediaKind::Image, SMALL).unwrap().dimensions(), (240, 160));
         assert_eq!((fresh.stats.disk_hits, fresh.stats.decoded), (2, 0));
+        // Neither is another tier.
+        assert!(fresh.cached(f, Tier(3)).is_none());
+        let (larger, _) = fresh.cached_larger(f, Tier(3)).unwrap();
+        assert_eq!(shortest(&larger), 384, "the nearest larger");
+        assert_eq!(fresh.cached_smaller(f, Tier(3)).map(|i| shortest(&i)), Some(160));
+        assert!(fresh.cached_smaller(f, SMALL).is_none());
 
-        assert_eq!(Tier::for_tile(160.0), Tier::Small);
-        assert_eq!(Tier::for_tile(160.0 * 2.0), Tier::Large);
+        // The smallest tier covering a tile, in physical pixels.
+        assert_eq!(Tier::cover(160.0), Tier::BASE);
+        assert_eq!(Tier::cover(161.0), Tier(2));
+        assert_eq!(Tier::cover(160.0 * 2.0).edge(), 320);
+        assert_eq!(Tier::cover(1.0).edge(), 128);
+        assert_eq!(Tier::cover(5000.0).edge(), 1024);
+        assert!(Tier::all().zip(Tier::all().skip(1)).all(|(a, b)| a < b && b.edge() as f32 <= a.edge() as f32 * 1.34));
     }
 
     #[test]
@@ -684,7 +793,7 @@ mod tests {
         assert!(DiskCache::open(&dir.path().join("a.png/not-a-dir/x.sqlite")).is_none());
         let mut l = loader(Some(&db));
         assert!(l.disk.is_none());
-        assert_eq!(longest(&l.load(&src, MediaKind::Image, Tier::Large).unwrap()), 384);
+        assert_eq!(shortest(&l.load(&src, MediaKind::Image, LARGE).unwrap()), 384);
         l.persist();
         let _ = ThumbCache::new(Some(&db), Threads { decode: 1, io: 1 }, |_, _, _| {});
     }
@@ -693,14 +802,15 @@ mod tests {
     fn capture_hook_seeds_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         let (db, src) = (dir.path().join("thumbs.sqlite"), dir.path().join("scan.png"));
-        let scan = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2400, 3600, image::Rgb([10, 20, 30])));
+        let scan = image::RgbImage::from_pixel(2400, 3600, image::Rgb([10, 20, 30]));
         scan.save(&src).unwrap();
         assert!(store_in(&DiskCache::open(&db).unwrap(), &src, &scan));
 
         let mut l = loader(Some(&db));
-        assert_eq!(l.load(&src, MediaKind::Image, Tier::Large).unwrap().dimensions(), (256, 384));
-        assert_eq!(l.load(&src, MediaKind::Image, Tier::Small).unwrap().dimensions(), (128, 192));
-        assert_eq!((l.stats.disk_hits, l.stats.decoded), (2, 0));
+        assert_eq!(l.load(&src, MediaKind::Image, LARGE).unwrap().dimensions(), (384, 576));
+        assert_eq!(l.load(&src, MediaKind::Image, SMALL).unwrap().dimensions(), (160, 240));
+        assert_eq!(l.load(&src, MediaKind::Image, Tier(6)).unwrap().dimensions(), (512, 768));
+        assert_eq!((l.stats.disk_hits, l.stats.decoded), (3, 0));
     }
 
     /// `cargo test --release -- --ignored --nocapture bench_cold_vs_warm`
@@ -739,23 +849,22 @@ mod tests {
         println!("{} images", files.len());
 
         let mut cold = loader(Some(&db));
-        report("cold: decode + encode + store", run(&mut cold, Tier::Large, true));
+        report("cold: decode + encode + store", run(&mut cold, LARGE, true));
         let mut nocache = loader(None);
-        report("no cache: decode only", run(&mut nocache, Tier::Large, false));
+        report("no cache: decode only", run(&mut nocache, LARGE, false));
         let mut warm = loader(Some(&db));
-        report("warm: disk hit (384)", run(&mut warm, Tier::Large, false));
-        report("hot: compressed-memory hit (384)", run(&mut warm, Tier::Large, false));
+        report("warm: disk hit (384)", run(&mut warm, LARGE, false));
+        report("hot: compressed-memory hit (384)", run(&mut warm, LARGE, false));
         let mut small = loader(Some(&db));
-        report("warm: disk hit (192)", run(&mut small, Tier::Small, false));
+        report("warm: disk hit (192)", run(&mut small, SMALL, false));
         println!("{:?} / {:?}", cold.stats, warm.stats);
         println!("db size {} KB", std::fs::metadata(&db).unwrap().len() / 1024);
     }
 
     fn produced(src: &Path, rgb: [u8; 3]) -> Produced {
-        let large = image::RgbImage::from_fn(384, 256, |x, y| image::Rgb([rgb[0], rgb[1].wrapping_add((x / 8) as u8), rgb[2].wrapping_add((y / 8) as u8)]));
-        let small = decode::fit(&large, Tier::Small.edge());
-        let color = decode::average_color(&small);
-        Produced { fingerprint: Fingerprint::of(src).unwrap(), large, small, color }
+        let large = image::RgbImage::from_fn(576, 384, |x, y| image::Rgb([rgb[0], rgb[1].wrapping_add((x / 8) as u8), rgb[2].wrapping_add((y / 8) as u8)]));
+        let color = decode::average_color(&large);
+        Produced::new(Fingerprint::of(src).unwrap(), large, LARGE, color)
     }
 
     #[test]
@@ -781,9 +890,9 @@ mod tests {
         assert_eq!(w.counts(), (20, 0));
         let conn = disk.connect().unwrap();
         assert_eq!(conn.len(), 40, "both tiers of each file");
-        let (_, color) = conn.get(Fingerprint::of(&srcs[3]).unwrap().key(Tier::Small)).unwrap();
+        let (_, color) = conn.get(Fingerprint::of(&srcs[3]).unwrap().key(SMALL)).unwrap();
         assert_eq!(color.map(writer::unpack), Some(produced(&srcs[3], [90, 120, 30]).color));
-        assert!(compressed.lock().unwrap().contains(&Fingerprint::of(&srcs[0]).unwrap().key(Tier::Large)));
+        assert!(compressed.lock().unwrap().contains(&Fingerprint::of(&srcs[0]).unwrap().key(LARGE)));
         assert!(w.close(Duration::from_secs(5)));
         assert!(!w.submit(produced(&srcs[0], [0; 3])), "closed: dropped");
 
@@ -803,34 +912,32 @@ mod tests {
     }
 
     #[test]
-    fn colors_persist_and_old_databases_migrate() {
+    fn colors_persist_and_old_databases_are_emptied() {
         let dir = tempfile::tempdir().unwrap();
         let (db, src) = (dir.path().join("thumbs.sqlite"), dir.path().join("a.png"));
         image::RgbImage::from_pixel(1000, 600, image::Rgb([200, 100, 50])).save(&src).unwrap();
         let f = Fingerprint::of(&src).unwrap();
 
-        // A cache written before colors existed, holding this file's large tier.
+        // A cache from before the tiers were sized by the shortest edge (and before colors).
         let old_thumb = image::RgbImage::from_pixel(384, 230, image::Rgb([10, 20, 200]));
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch("CREATE TABLE thumbs (key INTEGER PRIMARY KEY, jpeg BLOB NOT NULL);").unwrap();
-            conn.execute("INSERT INTO thumbs VALUES (?1, ?2)", rusqlite::params![f.key(Tier::Large), cache::encode(&old_thumb).unwrap()])
-                .unwrap();
+            conn.execute("INSERT INTO thumbs VALUES (?1, ?2)", rusqlite::params![f.key(LARGE), cache::encode(&old_thumb).unwrap()]).unwrap();
         }
         let mut l = loader(Some(&db));
-        let (image, color) = l.cached(f, Tier::Large).expect("old rows still served");
-        assert_eq!(image.dimensions(), (384, 230));
-        assert!(color.iter().zip([10, 20, 200]).all(|(&a, b)| a.abs_diff(b) <= 3), "computed for a NULL color: {color:?}");
-        assert_eq!(l.disk.as_ref().unwrap().get(f.key(Tier::Large)).unwrap().1, None);
+        assert!(l.cached(f, LARGE).is_none(), "old rows are dropped");
+        assert_eq!(l.disk.as_ref().unwrap().len(), 0);
 
         // New entries store their color, and it is read back as stored.
-        assert_eq!(l.load(&src, MediaKind::Image, Tier::Small).map(|i| i.dimensions()), Some((192, 115)));
+        assert_eq!(l.load(&src, MediaKind::Image, SMALL).map(|i| i.dimensions()), Some((267, 160)));
         l.persist();
         let mut fresh = loader(Some(&db));
-        let stored = fresh.disk.as_ref().unwrap().get(f.key(Tier::Small)).unwrap().1.map(writer::unpack);
+        let stored = fresh.disk.as_ref().unwrap().get(f.key(SMALL)).unwrap().1.map(writer::unpack);
         assert_eq!(stored, Some([200, 100, 50]));
-        assert_eq!(fresh.cached(f, Tier::Small).unwrap().1, [200, 100, 50]);
-        assert!(DiskCache::open(&db).is_some(), "reopening a migrated database");
+        assert_eq!(fresh.cached(f, SMALL).unwrap().1, [200, 100, 50]);
+        assert!(DiskCache::open(&db).is_some(), "reopening keeps it");
+        assert_eq!(fresh.disk.as_ref().unwrap().len(), 1);
     }
 
     /// A JPEG whose EXIF segment carries a 160×107 thumbnail, like a camera's.
@@ -877,7 +984,7 @@ mod tests {
                 let _ = tx.send((id, tier, d));
             });
             let kinds = [MediaKind::Image, MediaKind::Image, MediaKind::Audio];
-            cache.schedule((0..3).map(|id| (id, Tier::Large)), |id| Some((files[id as usize].clone(), kinds[id as usize])));
+            cache.schedule((0..3).map(|id| (id, LARGE)), |id| Some((files[id as usize].clone(), kinds[id as usize])));
             let mut events = Vec::new();
             while events.iter().filter(|e: &&(u32, &str)| e.1 != "preview").count() < 3 {
                 let (id, tier, d) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -895,11 +1002,11 @@ mod tests {
                 assert!(position((0, "preview")) < position((0, "thumb")));
             }
             assert!(events.contains(&(1, "thumb")) && events.contains(&(2, "failed")));
-            assert!(cache.get(0, Tier::Large).is_some_and(|(_, exact)| exact));
+            assert!(cache.get(0, LARGE).is_some_and(|(_, exact)| exact));
             let near = |c: [u8; 3], e: [u8; 3]| c.iter().zip(e).all(|(&a, b)| a.abs_diff(b) <= 4);
             assert!(near(cache.color(0).unwrap(), [40, 160, 90]) && near(cache.color(1).unwrap(), [220, 200, 30]));
-            assert!(cache.color(2).is_none() && cache.get(2, Tier::Large).is_none());
-            cache.schedule((0..3).map(|id| (id, Tier::Large)), |_| panic!("nothing left to load"));
+            assert!(cache.color(2).is_none() && cache.get(2, LARGE).is_none());
+            cache.schedule((0..3).map(|id| (id, LARGE)), |_| panic!("nothing left to load"));
             // drop: shutdown flushes the writer
         };
         run(true);
@@ -917,7 +1024,7 @@ mod tests {
             let _ = tx.send((id, tier, d));
         });
         let load = || {
-            cache.schedule([(0, Tier::Large)], |_| Some((src.clone(), MediaKind::Image)));
+            cache.schedule([(0, LARGE)], |_| Some((src.clone(), MediaKind::Image)));
             loop {
                 let (id, tier, d) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 let thumb = matches!(d, Delivery::Thumb(..));
@@ -928,20 +1035,64 @@ mod tests {
             }
         };
         load();
-        let size = |cache: &ThumbCache| cache.get(0, Tier::Large).map(|(image, _)| (image.size().width, image.size().height));
-        assert_eq!(size(&cache), Some((384, 256)));
+        let size = |cache: &ThumbCache| cache.get(0, LARGE).map(|(image, _)| (image.size().width, image.size().height));
+        assert_eq!(size(&cache), Some((576, 384)));
 
         // Rotated on disk, as the pipeline does: a new file renamed over the old one.
         let rotated = dir.path().join(".scan.png.rotating");
         image::RgbImage::from_pixel(600, 900, image::Rgb([0, 0, 200])).save_with_format(&rotated, image::ImageFormat::Png).unwrap();
         std::fs::rename(&rotated, &src).unwrap();
-        cache.schedule([(0, Tier::Large)], |_| panic!("still cached in memory until invalidated"));
+        cache.schedule([(0, LARGE)], |_| panic!("still cached in memory until invalidated"));
 
         cache.invalidate(0);
-        assert!(cache.get(0, Tier::Large).is_none() && cache.color(0).is_none());
+        assert!(cache.get(0, LARGE).is_none() && cache.color(0).is_none());
         load();
-        assert_eq!(size(&cache), Some((256, 384)), "the new pixels, not a stale cache layer");
+        assert_eq!(size(&cache), Some((384, 576)), "the new pixels, not a stale cache layer");
         assert!(cache.color(0).is_some_and(|[r, _, b]| b > r));
+    }
+
+    /// What tiles are shown from memory as thumbnails at several tiers come and go.
+    #[test]
+    fn tiles_get_their_tier_else_a_stand_in() {
+        let cache = ThumbCache::new(None, Threads { decode: 1, io: 1 }, |_, _, _| {});
+        let thumb = |edge: u32| Delivery::Thumb(Pixels::new(edge * 4 / 3, edge), [1, 2, 3]);
+        let width = |got: Option<(Image, bool)>| got.map(|(image, exact)| (image.size().width, exact));
+        let tier = |edge: u32| Tier::cover(edge as f32);
+
+        assert!(cache.get(0, LARGE).is_none() && !cache.has_any(0));
+        cache.complete(0, Tier::BASE, Delivery::Preview(Pixels::new(160, 120), [1, 2, 3]));
+        assert_eq!(width(cache.get(0, LARGE)), Some((160, false)), "the EXIF preview stands in");
+        assert!(!cache.has_any(0), "a preview isn't a thumbnail");
+        cache.complete(0, Tier::BASE, thumb(160));
+        assert!(cache.has_any(0));
+        assert_eq!(width(cache.get(0, Tier::BASE)), Some((213, true)));
+        assert_eq!(width(cache.get(0, LARGE)), Some((213, false)), "the quick tier stands in for a larger one");
+        cache.complete(0, Tier::BASE, Delivery::Preview(Pixels::new(160, 120), [1, 2, 3]));
+        assert_eq!(width(cache.get(0, LARGE)), Some((213, false)), "a late preview doesn't replace a thumbnail");
+
+        cache.complete(0, LARGE, thumb(384));
+        assert_eq!(width(cache.get(0, LARGE)), Some((512, true)));
+        assert_eq!(width(cache.get(0, tier(320))), Some((512, true)), "the next larger tier is sharp, not much too large");
+        assert_eq!(width(cache.get(0, Tier::BASE)), Some((512, false)), "much larger: a stand-in until its own comes");
+        assert!(!cache.images.borrow().contains(&(0, Tier::BASE)), "smaller tiers are dropped for a larger one");
+
+        // Tiles shrunk: their own tier comes; the larger stays for the LRU to drop.
+        cache.complete(0, Tier::BASE, thumb(160));
+        assert_eq!(width(cache.get(0, Tier::BASE)), Some((213, true)));
+        assert_eq!(width(cache.get(0, LARGE)), Some((512, true)));
+        assert_eq!(cache.best(0).map(|i| i.size().width), Some(512));
+
+        // Held at the tier or the next: not asked for again.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let wanted = [(0, Tier::BASE), (0, tier(192)), (0, tier(320)), (0, LARGE), (0, tier(512)), (1, LARGE)];
+        cache.schedule(wanted, |id| {
+            asked.borrow_mut().push(id);
+            None
+        });
+        assert_eq!(asked.into_inner(), vec![0, 0, 1], "(0, 192), (0, 512) and (1, 384) only");
+
+        cache.invalidate(0);
+        assert!(cache.get(0, Tier::BASE).is_none() && cache.best(0).is_none());
     }
 
     #[test]
@@ -953,8 +1104,10 @@ mod tests {
 }
 
 /// Scheduling benchmark: time to first screen and a simulated fast scroll, driving
-/// [`ThumbCache::schedule`] the way the review grid does.
-/// `BENCH_DIR=… BENCH_COLD_DISK=1 BENCH_SPEED=40 cargo test --release -- --ignored --nocapture bench_schedule`
+/// [`ThumbCache::schedule`] the way the review grid does (while moving, [`Tier::BASE`] for
+/// tiles with nothing to show; at rest, every tile at the tier it wants), and how long the
+/// view takes to be sharp once it rests.
+/// `BENCH_DIR=… BENCH_COLD_DISK=1 BENCH_SPEED=40 BENCH_TILE_PX=320 BENCH_COLS=6 BENCH_ROWS=4 cargo test --release -- --ignored --nocapture bench_schedule`
 #[cfg(test)]
 mod sched_bench {
     use super::*;
@@ -962,8 +1115,9 @@ mod sched_bench {
     use std::sync::mpsc;
     use std::time::Instant;
 
-    const COLS: usize = 8;
-    const ROWS: usize = 5;
+    fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
 
     fn files() -> Vec<PathBuf> {
         let root = std::env::var_os("BENCH_DIR")
@@ -1000,8 +1154,9 @@ mod sched_bench {
         files: &'a [PathBuf],
         cache: ThumbCache,
         rx: mpsc::Receiver<(u32, Tier, Delivery)>,
-        thumbs: HashSet<u32>,
-        shown: HashSet<u32>,
+        tier: Tier,
+        cols: usize,
+        rows: usize,
         delivered: u32,
         previews: u32,
     }
@@ -1013,20 +1168,17 @@ mod sched_bench {
             let cache = ThumbCache::new(Some(db), threads, move |id, tier, d| {
                 let _ = tx.send((id, tier, d));
             });
-            Self { files, cache, rx, thumbs: HashSet::new(), shown: HashSet::new(), delivered: 0, previews: 0 }
+            let tier = Tier::cover(env("BENCH_TILE_PX", 320.0));
+            Self { files, cache, rx, tier, cols: env("BENCH_COLS", 6), rows: env("BENCH_ROWS", 4), delivered: 0, previews: 0 }
         }
 
         fn pump(&mut self, until: Instant) {
             while let Ok((id, tier, d)) = self.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 match d {
-                    Delivery::Thumb(..) => {
-                        self.delivered += 1;
-                        self.thumbs.insert(id);
-                    }
+                    Delivery::Thumb(..) => self.delivered += 1,
                     Delivery::Preview(..) => self.previews += 1,
                     Delivery::Failed => {}
                 }
-                self.shown.insert(id);
                 self.cache.complete(id, tier, d);
                 if Instant::now() >= until {
                     break;
@@ -1034,24 +1186,66 @@ mod sched_bench {
             }
         }
 
-        /// What `GridModel::reschedule` does for rows `first..first + ROWS`.
-        fn view(&self, first: usize, down: bool, moving: bool) {
-            let total = self.files.len().div_ceil(COLS);
-            let rows = sched::window_rows(first, first + ROWS - 1, total, down, moving, ROWS * 2, ROWS / 2);
+        fn ids(&self, rows: impl IntoIterator<Item = usize>) -> Vec<u32> {
             let n = self.files.len();
-            let ids = rows.iter().flat_map(|&r| (r * COLS..((r + 1) * COLS).min(n)).map(|i| (i as u32, Tier::Small)));
-            self.cache.schedule(ids, |id| Some((self.files[id as usize].clone(), MediaKind::Image)));
+            rows.into_iter().flat_map(|r| (r * self.cols..((r + 1) * self.cols).min(n)).map(|i| i as u32)).collect()
         }
 
-        /// Until every tile of the rows has its thumbnail (`full`) or anything at all.
-        fn wait_rows(&mut self, rows: std::ops::Range<usize>, full: bool) -> Duration {
+        /// What `GridModel::schedule_window` does for rows `first..first + rows`.
+        fn view(&self, first: usize, down: bool, moving: bool) {
+            let total = self.files.len().div_ceil(self.cols);
+            let rows = sched::window_rows(first, first + self.rows - 1, total, down, moving, self.rows * 2, self.rows / 2);
+            let ids = self.ids(rows);
+            let source = |id: u32| Some((self.files[id as usize].clone(), MediaKind::Image));
+            if moving {
+                self.cache.schedule(ids.into_iter().filter(|&id| !self.cache.has_any(id)).map(|id| (id, Tier::BASE)), source);
+            } else {
+                self.cache.schedule(ids.into_iter().map(|id| (id, self.tier)), source);
+            }
+        }
+
+        fn sharp(&self, id: u32) -> bool {
+            self.cache.failed(id) || self.cache.get(id, self.tier).is_some_and(|(_, exact)| exact)
+        }
+
+        /// Until every tile of the rows from `first` is sharp at the tier it wants.
+        fn wait_sharp(&mut self, first: usize) -> Duration {
             let start = Instant::now();
-            let need: Vec<u32> = (rows.start * COLS..(rows.end * COLS).min(self.files.len())).map(|i| i as u32).collect();
-            while !need.iter().all(|i| if full { self.thumbs.contains(i) } else { self.shown.contains(i) }) {
+            let need = self.ids(first..first + self.rows);
+            while !need.iter().all(|&id| self.sharp(id)) {
                 self.pump(Instant::now() + Duration::from_millis(1));
                 assert!(start.elapsed() < Duration::from_secs(120), "timeout");
             }
             start.elapsed()
+        }
+
+        /// Scrolls from the top to `end` at `speed` rows/s, then rests there: the share of
+        /// tiles in view with something to show while scrolling, and the time from rest to sharp.
+        fn scroll(&mut self, end: usize, speed: f64) -> (Duration, f64, f64, Duration) {
+            let start = Instant::now();
+            let mut first_row = 0;
+            let (mut seen, mut shown, mut sharp) = (0u32, 0u32, 0u32);
+            self.view(0, true, false);
+            loop {
+                let target = ((start.elapsed().as_secs_f64() * speed) as usize).min(end);
+                if target != first_row {
+                    first_row = target;
+                    self.view(first_row, true, true);
+                }
+                self.pump(Instant::now() + Duration::from_millis(16));
+                for id in self.ids(first_row..first_row + self.rows) {
+                    seen += 1;
+                    shown += self.cache.get(id, self.tier).is_some() as u32;
+                    sharp += self.sharp(id) as u32;
+                }
+                if first_row == end {
+                    break;
+                }
+            }
+            let scrolled = start.elapsed();
+            self.view(end, true, false); // the grid's settle timer
+            let settle = self.wait_sharp(end);
+            (scrolled, 100.0 * shown as f64 / seen as f64, 100.0 * sharp as f64 / seen as f64, settle)
         }
     }
 
@@ -1062,21 +1256,24 @@ mod sched_bench {
         let cold_disk = std::env::var("BENCH_COLD_DISK").is_ok_and(|v| !v.is_empty());
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thumbs.sqlite");
-        println!("{} files, cold disk: {cold_disk}, {:?}", files.len(), Threads::for_root(&files[0]));
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let probe = Harness::new(&files, &db);
+        println!(
+            "{} files, cold disk: {cold_disk}, {:?}, {}×{} tiles in view at {} px",
+            files.len(),
+            Threads::for_root(&files[0]),
+            probe.cols,
+            probe.rows,
+            probe.tier.edge()
+        );
+        drop(probe);
 
         if cold_disk {
             evict(&files)
         }
         let mut h = Harness::new(&files, &db);
-        let start = Instant::now();
         h.view(0, true, false);
-        while h.shown.is_empty() {
-            h.pump(Instant::now() + Duration::from_millis(1));
-        }
-        let first = start.elapsed();
-        let full = h.wait_rows(0..ROWS, true) + first;
-        println!("cold first screen: {:>8.1} ms (first tile {:.1} ms)", ms(full), ms(first));
+        println!("cold first screen sharp: {:>8.1} ms", ms(h.wait_sharp(0)));
         h.pump(Instant::now() + Duration::from_millis(500));
         drop(h); // flushes the writer
 
@@ -1085,48 +1282,36 @@ mod sched_bench {
         }
         let mut h = Harness::new(&files, &db);
         h.view(0, true, false);
-        println!("warm first screen: {:>8.1} ms", ms(h.wait_rows(0..ROWS, true)));
+        println!("warm first screen sharp: {:>8.1} ms", ms(h.wait_sharp(0)));
         drop(h);
 
-        let speed: f64 = std::env::var("BENCH_SPEED").ok().and_then(|s| s.parse().ok()).unwrap_or(40.0);
-        let end = (files.len() / COLS).saturating_sub(ROWS).min(200);
+        let speed: f64 = env("BENCH_SPEED", 40.0);
+        let report = |label: &str, (scrolled, shown, sharp, settle): (Duration, f64, f64, Duration), h: &Harness| {
+            println!(
+                "{label}: {:.0} ms @ {speed} rows/s, in view: something {shown:.1}%, sharp {sharp:.1}%; rest to sharp {:.1} ms; {} thumbnails (+{} previews)",
+                ms(scrolled),
+                ms(settle),
+                h.delivered,
+                h.previews
+            );
+        };
+        let probe = Harness::new(&files, &db);
+        let end = (files.len() / probe.cols).saturating_sub(probe.rows).min(200);
+        drop(probe);
+        // Cold: a cache nothing was stored in yet.
         let dir2 = tempfile::tempdir().unwrap();
+        let db2 = dir2.path().join("t.sqlite");
         if cold_disk {
             evict(&files)
         }
-        let mut h = Harness::new(&files, &dir2.path().join("t.sqlite"));
-        let start = Instant::now();
-        let mut first_row = 0;
-        let (mut frames, mut covered, mut shown, mut tiles_seen) = (0u32, 0u32, 0u32, 0u32);
-        h.view(0, true, false);
-        loop {
-            let target = ((start.elapsed().as_secs_f64() * speed) as usize).min(end);
-            if target != first_row {
-                first_row = target;
-                h.view(first_row, true, true);
-            }
-            h.pump(Instant::now() + Duration::from_millis(16));
-            frames += 1;
-            for id in first_row * COLS..((first_row + ROWS) * COLS).min(files.len()) {
-                tiles_seen += 1;
-                covered += h.thumbs.contains(&(id as u32)) as u32;
-                shown += h.shown.contains(&(id as u32)) as u32;
-            }
-            if first_row == end {
-                break;
-            }
-        }
-        let scroll = start.elapsed();
-        h.view(end, true, false); // the grid's settle timer
-        let settle = h.wait_rows(end..end + ROWS, true);
-        println!(
-            "scroll {end} rows @ {speed} rows/s: {:.0} ms, {frames} frames, visible coverage {:.1}% (incl. previews {:.1}%), settle {:.1} ms, jobs done {} (+{} previews)",
-            ms(scroll),
-            100.0 * covered as f64 / tiles_seen as f64,
-            100.0 * shown as f64 / tiles_seen as f64,
-            ms(settle),
-            h.delivered,
-            h.previews
-        );
+        let mut h = Harness::new(&files, &db2);
+        let result = h.scroll(end, speed);
+        report("cold scroll", result, &h);
+        h.pump(Instant::now() + Duration::from_millis(500));
+        drop(h);
+        // Warm: the same scroll again, its quick tiers and the resting view's on disk.
+        let mut h = Harness::new(&files, &db2);
+        let result = h.scroll(end, speed);
+        report("warm scroll", result, &h);
     }
 }

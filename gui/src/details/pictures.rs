@@ -174,7 +174,7 @@ fn work() {
         };
         let started = Instant::now();
         let before = stamp(&path);
-        let pixels = thumbs::decode(&path, MediaKind::Image, edge).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+        let pixels = thumbs::decode(&path, MediaKind::Image, thumbs::Bound::Fit(edge)).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
         log::debug!(
             "details: decoded {} for edge {edge} in {:?}: {}",
             path.display(),

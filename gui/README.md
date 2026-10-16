@@ -111,15 +111,15 @@ file reader). Popups and menus aren't opened, and nothing is clicked.
 | `ui/nav.slint`, `src/nav.rs` | Navigation: `nav::open(Target)` for every double-click, `nav::go` for the sidebar (People, Trash and Failures re-read the catalog when shown); both push a snapshot of the view left (Review: filters, selection, scroll anchor; People: person, selected faces, scroll anchor; Details: its item) that `nav::back` restores. A `Target` carries the origin view's `Scope` (its filtered items, listed once on first use and shared by its clones), which Details steps through and the similar strip draws from; `nav::context_menu` is where every page's right-click goes (`nav::context_menu_for` with a multi-selection's items) |
 | `ui/pipeline.slint` | `PipelineStatus`: the pipeline's status line with Pause / Resume (in the window's status bar); its "3 rotations to review" is a link that shows Review with just those items (`review::show_attention`: search, tags and type cleared, the sort kept; Back returns from another page), "2 failed" opens the Failures page (Review's "Failed" chip still filters the grid by them) |
 | `ui/sidebar.slint` | Acquire, Review, People, Details at the top; at the bottom Failures (only while something failed, or while it is shown; a red count) and Trash (with how many items are in it). Both counts come from the pipeline relay's counts (`Catalog::attention_counts`, `Catalog::trash_totals`), taken with or without an engine in this window, so they follow deletes, restores, failures and retries live |
-| `ui/trash.slint`, `src/trash.rs` | The library's trash, newest first: a grid of thumbnails (small tier from the files where they lie in the trash, via `thumbs::small_for_files` on a worker, for the whole list) with the name, the folder it was in, when it was deleted and its size; "N items · 3.4 GB" by the title. Click, Shift-click (range), Ctrl-click, Ctrl+A, Esc to select; Restore puts the selection back where it was (`ops::restore_all`, a front with its back; Enter too), reported with `pipeline::changed` so it is back in Review; Delete permanently (also the Delete key) and Empty trash… (everything, or with "Only items deleted more than N days ago") ask first in a dialog that says how many items and how much go for good, which can't be undone (`ops::purge`, which takes a front's trashed back along, and `ops::empty_trash`; changes in the undo journal that touched what went are dropped). Read on a worker when the page is shown and again when the trash's totals move while it is (a delete elsewhere, an Undo); every change on a worker, with a notice |
+| `ui/trash.slint`, `src/trash.rs` | The library's trash, newest first: a grid of thumbnails (as large as the tiles are on screen, from the files where they lie in the trash, via `thumbs::for_files` on a worker, for the whole list) with the name, the folder it was in, when it was deleted and its size; "N items · 3.4 GB" by the title. Click, Shift-click (range), Ctrl-click, Ctrl+A, Esc to select; Restore puts the selection back where it was (`ops::restore_all`, a front with its back; Enter too), reported with `pipeline::changed` so it is back in Review; Delete permanently (also the Delete key) and Empty trash… (everything, or with "Only items deleted more than N days ago") ask first in a dialog that says how many items and how much go for good, which can't be undone (`ops::purge`, which takes a front's trashed back along, and `ops::empty_trash`; changes in the undo journal that touched what went are dropped). Read on a worker when the page is shown and again when the trash's totals move while it is (a delete elsewhere, an Undo); every change on a worker, with a notice |
 | `ui/failures.slint`, `src/failures.rs` | Every stage that failed on the current file of an item (`Catalog::failures`), grouped by stage under a heading with its count and "Retry all", each row with the file, its folder, the error and when it failed. Click / Shift / Ctrl, Ctrl+A, Esc select; "Retry N" runs those stages again (`ops::retry`: through the engine when it runs in this window, which starts on them at once; else in the catalog, for the pipeline to pick up when it next looks; the files are reported with `pipeline::changed` so Review's badges follow). Double-click, Enter or Open shows the item on Details (stepping through the failures; Back returns here), Show in folder, right-click for the item menu. Read on a worker when shown and on every recount of the relay while shown, keeping the selection; an unchanged list isn't redrawn |
 | `ui/theme.slint`, `ui/types.slint` | Palette and the structs shared with Rust |
 | `ui/help.slint`, `src/shortcuts.rs` | The keyboard shortcut list: ? (not while typing in a text box) or F1 anywhere opens an overlay with the shortcuts of the page on screen, then those that work everywhere (undo / redo, dialogs); Esc, ? / F1 again or a click outside closes it, and it takes every key while open (the window's capture handler in `app.slint`). The list is written down once, in `src/shortcuts.rs`: **a shortcut added or changed in a page's key handler must be added or changed there too** |
-| `src/shot.rs` | `--shot`: the app rendered offscreen into a PNG (a `Platform` with a `MinimalSoftwareWindow`, an event loop running timers and other threads' events until `--wait` is over); see Screenshots |
+| `src/shot.rs` | `--shot`: the app rendered offscreen into a PNG (a `Platform` with a `MinimalSoftwareWindow`, an event loop running timers and other threads' events until `--wait` is over, drawing every 100 ms as a window would); see Screenshots |
 | `src/settings.rs` | The window and its views kept across runs, in the per-user settings file (`archive_core::settings`: `$XDG_CONFIG_HOME/archive-studio/settings.json`, versioned; an unreadable file is moved aside to `settings.json.bad` and defaults used): the window's size and whether it is maximized (not full screen), the page shown last (Details comes back as Review), Review's tile size, sort, media kind and search mode, Details' info panel, face boxes, names and slideshow interval, People's sort; per library (keyed by its root) the tag tree's collapsed nodes. Not selections, search text, scroll positions or the tag / "Needs attention" filters. Read at startup; polled every second and saved on a writer thread once a change has held for a second, and on close |
 | `src/clipboard.rs` | Copy (Ctrl+C on Review's grid and Details, Copy in the item menu, for a multi-selection too): the files on the clipboard as `text/uri-list`, `x-special/gnome-copied-files` and their paths as text (`desktop::CopiedFiles`), through Wayland's data-control protocol (`wl-clipboard-rs`), else `arboard` with the URI list alone (X11): paste them in a file manager, a mail or chat window, or as paths in a text field. Dragging items out of the window isn't possible: Slint 1.18 (on winit 0.30) has no drag source the desktop sees, only drags within the window, so copy and paste stands in for it |
 | `src/acquire.rs` | Hosts the device backends from `archive-core` (`../core`): tiles, coalesced preview delivery, thumbnail seeding |
-| `src/people.rs` | Reads people and faces from the catalog on a worker (with each person's cover crop, decoded small there and cached by face); decodes crops for the rows on screen. Named / ignored faces are masked in place (no reflow until the grid is reloaded) while a writer thread saves them (`ops::name_faces`, which tags the pictures `People|<Name>`; `ignore_faces`, `unignore_faces`, `reject_person`, `clear_rejections`), reports the pictures changed (so Review shows the tag) and refreshes the suggestions. Faces changed on Details mark the grid stale, so Back re-reads it |
+| `src/people.rs` | Reads people and faces from the catalog on a worker (with each person's cover crop, decoded small there and cached by face); decodes crops for the rows on screen, and cuts them again sharper from the pictures where the tiles are larger on screen than the stored crops (HiDPI). Named / ignored faces are masked in place (no reflow until the grid is reloaded) while a writer thread saves them (`ops::name_faces`, which tags the pictures `People|<Name>`; `ignore_faces`, `unignore_faces`, `reject_person`, `clear_rejections`), reports the pictures changed (so Review shows the tag) and refreshes the suggestions. Faces changed on Details mark the grid stale, so Back re-reads it |
 | `src/details.rs`, `src/details/pictures.rs` | Shows the opened item's thumbnail at once (the filmstrip's, else Review's in memory, else from the thumbnail cache on a worker), then its picture decoded no larger than the window (its longest edge in physical pixels, not the file's): decoded on a few threads (`pictures.rs`: up to 4, the shown item first, then three ahead in the direction of the last step and two behind, kept within 320 MB while wanted, freed off the UI thread), so a step to a neighbour is shown from memory in well under a frame, and holding an arrow key shows thumbnails until it settles; the catalog (faces, review, other side, the file's own size) is read on another worker meanwhile; fills the filmstrip (large thumbnails, which stand in for the pictures); face hit-testing (`face-at`), the face popup and menu, and face changes on a worker (`FaceChange`); zoomed in past the decoded picture, decodes the file at full resolution on a worker (`thumbs::decode_full`, at most 100 MP, one file at a time, dropped when zoomed out or on another item) and sends the part in view, scaled to no more than it is shown, as a tile drawn over the picture; the info panel (`ops::properties`, tag changes on a worker) and `data_changed` (from the relay: re-reads the panel and the other side); "Open externally", "Show in folder", Delete and T go to `actions::act` for the shown item; after the shown item is trashed, the next one of the scope (`files_gone`); full screen and the slideshow timer are the page's own; asks the engine to rotate / accept / keep on a worker, reloads when the file is rotated |
 | `src/pipeline.rs` | Hosts the pipeline `Engine` while the window is open: relay thread (coalesced reports → review-grid updates, status counts), capture priority, status line |
 | `src/semantic.rs` | Review's search by description on a worker: the text model is the engine's when it runs in this window, else loaded once (`ops::text_search`); requests queued behind a newer one are skipped; each result carries its generation and the catalog's `describe::coverage` |
@@ -256,6 +256,19 @@ attached, `cargo test --release -p archive-core -- --ignored --nocapture dv_hard
   screen behind (≤ 512 tiles). Each report replaces the queue under one lock: tiles that
   left the window are cancelled before any thread starts on them, and work parked between
   stages is re-ranked or dropped at its next hand-off. `row_data` never requests.
+- Sharp at rest: while the view scrolls (or the tile size changes, by the slider or
+  Ctrl+wheel), only tiles with nothing to show are asked for, at the quick 160 px tier; once
+  it has rested 150 ms, every tile in view (top to bottom, then the prefetch bands) is asked
+  for at the tier it is shown at, and replaces its stand-in in place (same shape, so nothing
+  moves). "review: view sharp … after it came to rest" in the debug log says how long that
+  took. Measured with `bench_schedule` (16 + 4 threads, files on tmpfs, 6×4 tiles of 320 px
+  or 7×4 of 160 px, 40 rows/s scroll; add the 150 ms rest):
+
+  | Library | first screen, empty cache / warm | rest → sharp after a scroll, empty cache / warm |
+  |---|---|---|
+  | 15 phone JPEGs, 320 px tiles | 184 ms / 6 ms | 147 ms / 0 ms |
+  | 407 photos and scans (1.3 GB), 320 px | 253 ms / 9 ms | 259 ms / 14 ms |
+  | same, 160 px | 263 ms / 3 ms | 150 ms / 0 ms |
 - Stages: cache lookups run on the CPU pool (cores − 1, ≤ 16), so hits never wait behind
   disk reads. Misses go to a few I/O threads (2 if the root is on a rotational disk per
   `/sys/dev/block/*/queue/rotational`, 8 on SSD, 4 if unknown; override with
@@ -268,8 +281,7 @@ attached, `cargo test --release -p archive-core -- --ignored --nocapture dv_hard
 - JPEG encoding and SQLite inserts happen on one low-priority writer thread, batched 16
   files per transaction, after the thumbnail is delivered. Its queue is bounded (64 files);
   when full, writes are dropped rather than stalling decoders (the file is decoded again
-  next time). App exit waits up to 2 s for queued writes. Databases from before the
-  `color` column are migrated on open (old rows get their color computed on load).
+  next time). App exit waits up to 2 s for queued writes.
 - Measured (32 cores, WD 5400 rpm HDD; viewport 8×5 tiles at 192 px; medians of 3; `bench_schedule`):
 
   | Scenario | before | after |
@@ -282,16 +294,39 @@ attached, `cargo test --release -p archive-core -- --ignored --nocapture dv_hard
   | same, big JPEGs from cold HDD (disk saturated) | 27%, settles 154 ms after stop | 34%, settles 70 ms |
 
   On the HDD, 2–4 concurrent source reads beat 1 or 8 (8: ~1.8× slower first screen).
-- Two size tiers (192 / 384 px longest edge), picked from tile size × window scale factor.
-  While zooming, the other tier's thumbnail stands in until the right one arrives.
+- Size tiers by the **shortest** edge (128, 160, 192, 256, 320, 384, 512, 640, 768, 1024 px;
+  `picture::Bound::Cover`: a thumbnail fills a square tile without being upscaled, a
+  panorama's length capped at 3× its height), picked as the smallest covering tile size ×
+  window scale factor (followed when it changes, e.g. on another screen). Steps of ≤ 1.33×,
+  so the renderer never shrinks a thumbnail much (which aliases). A tile takes its tier or
+  the next; else the sharpest held at another tier (or the EXIF preview) stands in until its
+  own arrives. A thumbnail drops the smaller tiers held for its tile; larger ones are left to
+  the LRU. (Before, tiers were 192 / 384 px on the longest edge: a 20:9 phone picture's
+  thumbnail was 192×86 for a 160 px tile, upscaled 1.9× to fill it, and smaller than its own
+  512×230 EXIF preview.)
 - Cache layers, fastest first: decoded RGB `Image`s on the UI thread (256 MB LRU) →
   compressed JPEGs shared by workers (64 MB LRU, ~1 ms to re-decode) → SQLite at
   `$XDG_CACHE_HOME/archive-studio/thumbs.sqlite` (WAL, one connection per worker) →
-  full decode of the source, which stores both tiers (+ average color). Keys hash (canonical path, size,
-  mtime ns, tier), so edited files miss instead of showing stale thumbnails. An unusable
-  database just disables the disk layer. The DB is never pruned yet.
+  a larger tier on disk, scaled down (the tiles were larger once) → decode of the source,
+  which stores the tier asked for and the quick 160 px one (+ average color). Keys hash
+  (canonical path, size, mtime ns, tier, cache version), so edited files miss instead of
+  showing stale thumbnails. The database's `user_version` is the cache version (2: tiers by the
+  shortest edge); one of another version is emptied on open. An unusable database just
+  disables the disk layer. The DB is never pruned yet.
 - On each `DeviceEvent::Saved`, the acquire sink calls `thumbs::store_for_new_file(path, &image)`
-  with the backend's in-memory image, so new scans are cached without ever being decoded.
+  with the backend's in-memory image, so new scans are cached (tiers 160–512 px) without ever
+  being decoded.
+- Other pages load thumbnails with `thumbs::for_files` on a worker, at the tier their tiles
+  are on screen (× scale factor; again when it changes): Details' filmstrip and similar strip
+  (64 px tiles), Trash (fitted to its 150 px tiles, which show the whole picture). Disk cache
+  first (a larger tier scaled down; for a stand-in, a smaller one will do), else decoded and
+  stored. Details' stand-in for a picture not decoded yet is Review's sharpest thumbnail in
+  memory, else the filmstrip's, replaced by a 384 px one loaded first on that worker.
+- People: face crops are stored at 160 px (`Catalog::face_crop`); where a tile is larger on
+  screen (120 px tiles at 2×), the faces drawn are cut again from their pictures at the
+  tile's size once the view rests 150 ms (`faces::crop_region` gives the stored crop's square,
+  `picture::decode_regions` decodes each picture once, as large as its smallest face needs),
+  on up to 8 workers, kept in a 64 MB LRU (29 faces of 9 pictures: ~370 ms).
 - Search matches pre-lowercased names.
 - UI-thread cost, before → after (`bench4_*` in `review.rs`; 200k = synthetic tree of sparse
   files on tmpfs, name sort unless noted; 32 cores):
@@ -307,19 +342,21 @@ attached, `cargo test --release -p archive-core -- --ignored --nocapture dv_hard
   | deliver 2,000 thumbnails: event-loop callbacks, UI free-running / busy 2 ms per turn | 2,000 / 2,000 | ~1,150 / ~11 |
   | same, UI time / row notifications (busy UI) | 5–6 ms / 2,000 | 1.4–2.4 ms / ~1,200 |
 
-Source decoding (`src/thumbs/decode.rs`, cache misses only) never builds more pixels than the
-384 px tier needs; images are EXIF/TIFF-orientation corrected:
+Source decoding (`utils/picture`, via `src/thumbs/decode.rs`; cache misses only) never builds
+more pixels than the tier asked for needs; images are EXIF/TIFF-orientation corrected:
 - JPEG: `jpeg-decoder` IDCT-domain downscaling (1/8, 1/4, 1/2), then a short resize
   (3600×2400 scan: 110 → 37 ms; 24 MP camera JPEG: 295 → 85 ms). Grayscale, CMYK and
   progressive supported; anything it rejects falls back to `image`.
 - TIFF: streamed from the file (no whole-file read); if it has a reduced-resolution page
-  (NewSubfileType = 1 or a SubIFD) the smallest one ≥ 384 px is decoded instead
+  (NewSubfileType = 1 or a SubIFD) the smallest one large enough is decoded instead
   (86 MB scan: 225 → 80 ms full, ~2 ms with a reduced page). Backends should save scans with
   `thumbs::write_tiff_with_reduced_page`.
-- PNG/WebP/BMP: full `image` decode; all resizing uses `fast_image_resize` (SIMD bilinear
-  convolution, ~5x faster than `image`'s `thumbnail()` on large downscales).
-- `thumbs::decode_preview` returns a JPEG's embedded EXIF thumbnail (~160 px) from the
-  metadata segments alone, for use as an instant placeholder.
+- PNG/WebP/BMP: full `image` decode; all resizing uses `fast_image_resize` (SIMD Catmull-Rom
+  convolution: sharper than bilinear, without Lanczos' ringing; ~5x faster than `image`'s
+  `thumbnail()` on large downscales).
+- `thumbs::decode_preview` returns a JPEG's embedded EXIF thumbnail (160×120 to 512×384) from
+  the metadata segments alone, for use as an instant placeholder; never kept once a
+  thumbnail arrives.
 - Decoder panics on malformed files are caught; the file just gets no thumbnail.
 
 - Pipeline updates (`update_files`): a new file is merged like an indexer batch; a changed one

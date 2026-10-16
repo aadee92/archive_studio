@@ -5,6 +5,10 @@
 //! are put in similarity order, which is quadratic). Crops are small JPEGs in the catalog,
 //! decoded on the UI thread only for the rows on screen and cached.
 //!
+//! Where a tile is larger on screen than the stored crop (on a HiDPI screen), the crop is
+//! cut again from the picture at the tile's size once the view rests, on workers (all the
+//! faces of one picture from one decode, [`thumbs::decode_regions`]), and kept in memory.
+//!
 //! Naming or ignoring faces doesn't reorder the grid: the faces stay where they are, masked
 //! with the name, until the grid is reloaded (another person picked, the page shown again).
 //! The catalog is written by a writer thread (`Catalog::name_faces`, which also tags the
@@ -39,11 +43,11 @@ use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, S
 use std::sync::Mutex;
 
 use crate::nav::{self, Scope, Target};
-use crate::thumbs::Pixels;
+use crate::thumbs::{self, cache::Lru, Pixels};
 use crate::{actions, AppWindow, FaceRow, FaceTile, PeopleBridge, PersonItem, ScrollRestore};
-use archive_core::catalog::faces::{FaceFilter, FaceId, FaceOrder, PersonFaces, DEFAULT_MIN_SIMILARITY};
+use archive_core::catalog::faces::{crop_region, FaceFilter, FaceId, FaceOrder, PersonFaces, DEFAULT_MIN_SIMILARITY};
 use archive_core::catalog::people::{arrange, display_name, matching_people, person_path, PeopleOrder};
-use archive_core::catalog::{Catalog, TagId, TagKind};
+use archive_core::catalog::{Catalog, Region, TagId, TagKind};
 use archive_core::ops;
 
 /// `PersonItem.key` of the faces nobody has named.
@@ -54,6 +58,10 @@ const IGNORED: i32 = -3;
 const CROP_CACHE: usize = 3000;
 /// Names offered under the name box.
 const MATCHES: usize = 6;
+/// Crops cut afresh at the tiles' size, kept in memory (~170 KB each at 240 px).
+const SHARP_BUDGET: usize = 64 << 20;
+/// The view rests this long before sharper crops are cut for the faces in it.
+const SHARP_SETTLE: Duration = Duration::from_millis(150);
 /// The writer waits this long for more changes before refreshing the suggestions.
 const SETTLE: Duration = Duration::from_millis(500);
 /// Edge of the decoded cover faces (the list draws them at 26 px; twice that for HiDPI).
@@ -68,6 +76,8 @@ static AVATARS: Mutex<Option<HashMap<FaceId, Pixels>>> = Mutex::new(None);
 struct FaceRef {
     id: FaceId,
     path: PathBuf,
+    /// Where the face is on its picture.
+    region: Region,
     detail: SharedString,
     suggested: bool,
     /// Named or ignored since the grid was loaded.
@@ -147,6 +157,15 @@ struct FaceGrid {
     faces: RefCell<Vec<FaceRef>>,
     columns: Cell<usize>,
     crops: RefCell<HashMap<FaceId, Image>>,
+    /// Crops cut from the pictures at `sharp_px` (tile size × scale factor), for faces whose
+    /// stored crop is smaller than that.
+    sharp: RefCell<Lru<FaceId, Image>>,
+    sharp_px: Cell<u32>,
+    /// Faces drawn with a crop smaller than their tile, in the order drawn, to cut sharper
+    /// once the view rests; and those being cut.
+    blurry: RefCell<Vec<FaceId>>,
+    cutting: RefCell<HashSet<FaceId>>,
+    sharp_timer: slint::Timer,
     /// Bumped per load; a worker's result for an older one is dropped.
     generation: Cell<u64>,
     notify: ModelNotify,
@@ -218,6 +237,12 @@ fn with_grid(f: impl FnOnce(&Rc<FaceGrid>)) {
     });
 }
 
+/// The window's scale factor changed: the faces are drawn again, cut sharper where the
+/// stored crops are now too small.
+pub fn scale_changed() {
+    with_grid(|g| g.notify.reset());
+}
+
 pub fn install(ui: &AppWindow, root: PathBuf) {
     let open = root.clone();
     let _ = thread::Builder::new().name("people-catalog".into()).spawn(move || {
@@ -239,6 +264,11 @@ pub fn install(ui: &AppWindow, root: PathBuf) {
         faces: RefCell::default(),
         columns: Cell::new(1),
         crops: RefCell::default(),
+        sharp: RefCell::new(Lru::new(SHARP_BUDGET)),
+        sharp_px: Cell::new(0),
+        blurry: RefCell::default(),
+        cutting: RefCell::default(),
+        sharp_timer: slint::Timer::default(),
         generation: Cell::new(0),
         notify: ModelNotify::default(),
         selection: RefCell::default(),
@@ -1042,6 +1072,108 @@ impl FaceGrid {
         crops.insert(id, image.clone());
         Some(image)
     }
+
+    /// The tiles' size on screen in physical pixels; crops cut for another size are dropped.
+    fn tile_px(&self) -> u32 {
+        let px = self.ui.upgrade().map_or(0, |ui| (ui.global::<PeopleBridge>().get_tile_size() * ui.window().scale_factor()).ceil() as u32);
+        if self.sharp_px.replace(px) != px {
+            *self.sharp.borrow_mut() = Lru::new(SHARP_BUDGET);
+        }
+        px
+    }
+
+    /// The face's crop to draw `px` wide: cut sharper from its picture if that was done,
+    /// else the stored one (and if that is smaller, the face is cut once the view rests).
+    fn thumb(&self, face: &FaceRef, px: u32) -> Option<Image> {
+        if let Some(image) = self.sharp.borrow_mut().get(&face.id) {
+            return Some(image);
+        }
+        let image = self.crop(face.id)?;
+        let (mut blurry, cutting) = (self.blurry.borrow_mut(), self.cutting.borrow());
+        if image.size().width < px && !cutting.contains(&face.id) && !blurry.contains(&face.id) {
+            blurry.push(face.id);
+            self.sharp_timer.start(slint::TimerMode::SingleShot, SHARP_SETTLE, || with_grid(|g| g.sharpen()));
+        }
+        Some(image)
+    }
+
+    /// Cuts the faces drawn blurry since the last time from their pictures at the tiles'
+    /// size, on workers, a picture at a time, in the order drawn.
+    fn sharpen(&self) {
+        let want = std::mem::take(&mut *self.blurry.borrow_mut());
+        let px = self.sharp_px.get();
+        let faces = self.faces.borrow();
+        let mut pictures: Vec<(PathBuf, Vec<(FaceId, Region)>)> = Vec::new();
+        for id in want {
+            let Some(face) = faces.iter().find(|f| f.id == id) else { continue };
+            self.cutting.borrow_mut().insert(id);
+            match pictures.iter_mut().find(|(path, _)| *path == face.path) {
+                Some((_, faces)) => faces.push((id, face.region)),
+                None => pictures.push((face.path.clone(), vec![(id, face.region)])),
+            }
+        }
+        if pictures.is_empty() {
+            return;
+        }
+        log::debug!("people: cutting {} faces of {} pictures at {px} px", pictures.iter().map(|p| p.1.len()).sum::<usize>(), pictures.len());
+        let weak = self.ui.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let workers = thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).clamp(1, 8)).min(pictures.len());
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        while let Some((path, faces)) = pictures.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                            let cut = cut_faces(path, faces, px);
+                            let _ = weak.upgrade_in_event_loop(move |_| with_grid(|g| g.sharpened(cut, px)));
+                        }
+                    });
+                }
+            });
+            log::debug!("people: faces cut in {:?}", started.elapsed());
+        });
+    }
+
+    /// Faces cut at `px` came in (`None`: the picture couldn't be read; the stored crop stays).
+    fn sharpened(&self, cut: Vec<(FaceId, Option<Pixels>)>, px: u32) {
+        let mut ids = Vec::with_capacity(cut.len());
+        for (id, pixels) in cut {
+            self.cutting.borrow_mut().remove(&id);
+            if px != self.sharp_px.get() {
+                continue;
+            }
+            // A failed one keeps its stored crop, without being asked for again.
+            let Some(image) = pixels.map(Image::from_rgb8).or_else(|| self.crop(id)) else { continue };
+            let size = image.size();
+            self.sharp.borrow_mut().insert(id, image, size.width as usize * size.height as usize * 3);
+            ids.push(id);
+        }
+        let columns = self.columns.get();
+        let rows: BTreeSet<usize> = self.faces.borrow().iter().enumerate().filter(|(_, f)| ids.contains(&f.id)).map(|(i, _)| i / columns).collect();
+        for row in rows {
+            self.notify.row_changed(row);
+        }
+    }
+}
+
+/// The faces on the picture at `path`, cut as their stored crops are, `px` wide.
+fn cut_faces(path: &Path, faces: &[(FaceId, Region)], px: u32) -> Vec<(FaceId, Option<Pixels>)> {
+    let regions: Option<Vec<[f32; 4]>> = thumbs::upright_dimensions(path).map(|dims| {
+        faces
+            .iter()
+            .map(|(_, region)| {
+                let r = crop_region(*region, dims);
+                [r.x, r.y, r.w, r.h]
+            })
+            .collect()
+    });
+    let cut = regions.and_then(|regions| thumbs::decode_regions(path, &regions, px));
+    if cut.is_none() {
+        log::debug!("people: can't cut faces from {}", path.display());
+    }
+    let mut cut = cut.unwrap_or_default().into_iter().map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+    faces.iter().map(|(id, _)| (*id, cut.next())).collect()
 }
 
 impl Model for FaceGrid {
@@ -1057,11 +1189,12 @@ impl Model for FaceGrid {
         let selection = self.selection.borrow();
         let start = row * columns;
         let slice = faces.get(start..faces.len().min(start + columns))?;
+        let px = self.tile_px();
         let tiles: Vec<FaceTile> = slice
             .iter()
             .enumerate()
             .map(|(i, face)| {
-                let thumb = self.crop(face.id);
+                let thumb = self.thumb(face, px);
                 FaceTile {
                     thumb_ready: thumb.is_some(),
                     thumb: thumb.unwrap_or_default(),
@@ -1293,7 +1426,7 @@ fn read(root: &Path, key: i32, rejected: bool) -> Result<Loaded, String> {
                 Some((_, similarity)) if suggested => format!("Suggested · {:.0}%", similarity * 100.0).into(),
                 _ => file_name(&path),
             };
-            Some(FaceRef { id: face.id, path, detail, suggested, mask: None })
+            Some(FaceRef { id: face.id, path, region: face.region, detail, suggested, mask: None })
         })
         .collect();
     Ok(Loaded { faces, ..loaded })

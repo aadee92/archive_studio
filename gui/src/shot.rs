@@ -200,14 +200,24 @@ impl Platform for ShotPlatform {
         Some(Box::new(Proxy(self.events.clone())))
     }
 
-    /// Runs timers and what other threads send until `wait` is over, then renders the window
-    /// once into `out`.
+    /// Runs timers and what other threads send until `wait` is over, drawing what changed
+    /// every 100 ms as a window on screen would (lists only make the rows they draw), then
+    /// renders the window once into `out`.
     fn run_event_loop(&self) -> Result<(), PlatformError> {
         let window = self.window.window();
         window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: self.scale });
         self.window.set_size(self.physical);
         let started = Instant::now();
+        let (w, h) = (self.physical.width as usize, self.physical.height as usize);
+        let mut frame = vec![slint::Rgb8Pixel::new(0, 0, 0); w * h];
+        let mut drawn = Instant::now();
         loop {
+            if drawn.elapsed() >= Duration::from_millis(100) {
+                self.window.draw_if_needed(|renderer| {
+                    renderer.render(&mut frame, w);
+                });
+                drawn = Instant::now();
+            }
             slint::platform::update_timers_and_animations();
             let events = std::mem::take(&mut *self.events.queue.lock().unwrap());
             for event in events {
@@ -227,7 +237,6 @@ impl Platform for ShotPlatform {
         }
         slint::platform::update_timers_and_animations();
         self.window.request_redraw();
-        let (w, h) = (self.physical.width as usize, self.physical.height as usize);
         let mut pixels = vec![slint::Rgb8Pixel::new(0, 0, 0); w * h];
         self.window.draw_if_needed(|renderer| {
             renderer.render(&mut pixels, w);

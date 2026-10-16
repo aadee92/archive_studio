@@ -105,6 +105,8 @@ const FULL_PIXELS: u64 = 100_000_000;
 const SIMILAR: usize = 12;
 /// Items in the filmstrip on either side of the shown one (more than fit a 4K screen).
 const FILM: usize = 24;
+/// The filmstrip's and the similar strip's tiles, in logical pixels (as on the page).
+const FILM_TILE: f32 = 64.0;
 /// Names offered under the face popup's name box.
 const MATCHES: usize = 6;
 
@@ -500,8 +502,9 @@ pub fn show(ui: &AppWindow, mut target: Target) {
     if image {
         pictures::want(screen_edge(ui), [path.clone()].into_iter().chain(neighbours).collect());
         if !show_picture(ui, &path) {
-            // The filmstrip's, else Review's (opened from there).
-            let thumb = SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()).or_else(|| crate::review::thumbnail(&path));
+            // Review's (opened from there; the larger), else the filmstrip's; a larger one
+            // is loaded with the filmstrip's.
+            let thumb = crate::review::thumbnail(&path).or_else(|| SHOWN.with_borrow(|shown| shown.film_thumbs.get(&path).cloned()));
             if let Some(thumb) = thumb.filter(|t| t.size().width > 0) {
                 set_picture(ui, thumb, Up::Thumbnail);
             }
@@ -588,8 +591,7 @@ fn load_film(ui: &AppWindow) {
             shown.path().map(Path::to_path_buf)
         });
         model.set_vec(Vec::new());
-        // Its thumbnail all the same, to show until the picture is in.
-        film_thumbs(ui, shown.into_iter().collect());
+        film_thumbs(ui, Vec::new(), shown);
         return;
     }
     let paths = scope.paths();
@@ -618,32 +620,57 @@ fn load_film(ui: &AppWindow) {
     });
     details.set_film_start(start as i32);
     log::trace!("details: filmstrip: {} thumbnails to load around #{center}", missing.len());
-    film_thumbs(ui, missing);
+    let shown = SHOWN.with_borrow(|shown| shown.path().filter(|_| shown.up < Up::Soft).map(Path::to_path_buf));
+    film_thumbs(ui, missing, shown);
 }
 
-/// Loads these thumbnails on a worker (in order), for the filmstrip and to stand in for the
-/// pictures until they are decoded: large ones, as they are shown the size of the page.
-fn film_thumbs(ui: &AppWindow, missing: Vec<PathBuf>) {
+/// Loads these thumbnails on a worker (in order), as large as the filmstrip's tiles are on
+/// screen; first, if `stand_in` is given (the item shown, its picture not decoded yet), a
+/// larger one of it to stand in for the picture: any the cache has, else decoded.
+fn film_thumbs(ui: &AppWindow, missing: Vec<PathBuf>, stand_in: Option<PathBuf>) {
     let generation = FILM_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    if missing.is_empty() {
+    if missing.is_empty() && stand_in.is_none() {
         return;
     }
+    let tier = thumbs::Tier::cover(FILM_TILE * ui.window().scale_factor());
     let weak = ui.as_weak();
     thread::spawn(move || {
-        thumbs::for_files(&missing, thumbs::Tier::Large, |i, small| {
+        let pixels = |rgb: image::RgbImage| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height());
+        if let Some(path) = stand_in {
+            let mut found = None;
+            thumbs::for_files(&[&path], thumbs::Tier::STAND_IN, thumbs::Accept::Any, |_, thumb| {
+                found = thumb;
+                false
+            });
+            if let Some(thumb) = found.filter(|_| FILM_GENERATION.load(Ordering::Relaxed) == generation).map(pixels) {
+                let _ = weak.upgrade_in_event_loop(move |ui| stand_in_up(&ui, &path, thumb));
+            }
+        }
+        thumbs::for_files(&missing, tier, thumbs::Accept::Sharp, |i, thumb| {
             if FILM_GENERATION.load(Ordering::Relaxed) != generation {
                 return false;
             }
             let path = missing[i].clone();
-            let pixels = small.map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
-            let _ = weak.upgrade_in_event_loop(move |ui| film_thumb(&ui, path, pixels));
+            let thumb = thumb.map(pixels);
+            let _ = weak.upgrade_in_event_loop(move |ui| film_thumb(&ui, path, thumb));
             true
         });
     });
 }
 
+/// A thumbnail to stand in for the picture of `path` came in: up if that is still shown, its
+/// picture not decoded yet, and nothing larger stands in for it already.
+fn stand_in_up(ui: &AppWindow, path: &Path, pixels: Pixels) {
+    let shown = SHOWN.with_borrow(|shown| shown.path() == Some(path) && shown.up < Up::Soft);
+    let current = ui.global::<DetailsBridge>().get_image().size().width;
+    if shown && pixels.width() > current {
+        log::debug!("details: stand-in {}×{} up {:?} after the show", pixels.width(), pixels.height(), SHOWN.with_borrow(|shown| shown.shown_at.map(|t| t.elapsed())));
+        set_picture(ui, slint::Image::from_rgb8(pixels), Up::Thumbnail);
+    }
+}
+
 /// A filmstrip thumbnail came in (none: the file has none; not asked for again); it stands
-/// in for the picture shown until that is decoded.
+/// in for the picture shown until that is decoded, if nothing does yet.
 fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
     let thumb = pixels.map(slint::Image::from_rgb8).unwrap_or_default();
     let placeholder = SHOWN.with_borrow_mut(|shown| {
@@ -663,6 +690,13 @@ fn film_thumb(ui: &AppWindow, path: PathBuf, pixels: Option<Pixels>) {
         log::debug!("details: thumbnail up {:?} after the show", SHOWN.with_borrow(|shown| shown.shown_at.map(|t| t.elapsed())));
         set_picture(ui, thumb, Up::Thumbnail);
     }
+}
+
+/// The window's scale factor changed: the strips' thumbnails again, at the new size.
+pub fn scale_changed(ui: &AppWindow) {
+    SHOWN.with_borrow_mut(|shown| shown.film_thumbs.clear());
+    load_film(ui);
+    load_similar(ui);
 }
 
 /// The longest edge of the window, in physical pixels: no picture on the page is shown larger.
@@ -1268,7 +1302,7 @@ fn load_other(ui: &AppWindow) {
     thread::spawn(move || {
         let faces = root.and_then(|root| open_catalog(&root)).map(|c| read_faces(&c, &path)).unwrap_or_default();
         let pixels =
-            thumbs::decode(&path, MediaKind::Image, OTHER_EDGE).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+            thumbs::decode(&path, MediaKind::Image, thumbs::Bound::Fit(OTHER_EDGE)).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if SHOWN.with_borrow(|shown| shown.other_generation != generation) {
                 return;
@@ -1299,17 +1333,18 @@ fn load_similar(ui: &AppWindow) {
     let Some(root) = root() else { return };
     // Listed here (once per scope): a scope may only be read on the UI thread.
     let candidates = scope.paths();
+    let tier = thumbs::Tier::cover(FILM_TILE * ui.window().scale_factor());
     let weak = ui.as_weak();
     thread::spawn(move || {
         let found = open_catalog(&root).map(|c| similar(&c, &path, &candidates)).unwrap_or_default();
         log::debug!("details: {} similar among {} in {:?}", found.len(), candidates.len(), scope.label);
-        let items: Vec<(PathBuf, f32, Option<Pixels>)> = found
-            .into_iter()
-            .map(|(path, score)| {
-                let thumb = thumbs::small_for_file(&path).map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
-                (path, score, thumb)
-            })
-            .collect();
+        let paths: Vec<&PathBuf> = found.iter().map(|(path, _)| path).collect();
+        let mut thumbs = vec![None; paths.len()];
+        thumbs::for_files(&paths, tier, thumbs::Accept::Sharp, |i, thumb| {
+            thumbs[i] = thumb.map(|rgb| Pixels::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height()));
+            true
+        });
+        let items: Vec<(PathBuf, f32, Option<Pixels>)> = found.into_iter().zip(thumbs).map(|((path, score), thumb)| (path, score, thumb)).collect();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let paths = SHOWN.with_borrow_mut(|shown| {
                 (shown.similar_generation == generation).then(|| {

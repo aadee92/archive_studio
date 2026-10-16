@@ -8,6 +8,9 @@ export global NavBridge {
     callback navigate(int);
     // Back to the previous view (Details: the back arrow and Esc).
     callback back();
+    // The window's scale factor (physical pixels per logical one) changed: pictures are
+    // loaded as large as they are on screen.
+    callback scale-changed(float);
 }
 
 // Restoring a grid's scroll position after Back: Rust sets the row and the offset into it,

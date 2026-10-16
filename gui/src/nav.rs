@@ -133,6 +133,16 @@ pub fn install(ui: &AppWindow) {
             back(&ui);
         }
     });
+    let weak = ui.as_weak();
+    nav.on_scale_changed(move |scale| {
+        log::debug!("window scale factor {scale}");
+        if let Some(ui) = weak.upgrade() {
+            crate::review::scale_changed();
+            crate::people::scale_changed();
+            crate::trash::scale_changed(&ui);
+            crate::details::scale_changed(&ui);
+        }
+    });
 }
 
 /// Shows `target` on the Details page; Back returns to the view it was opened from.
